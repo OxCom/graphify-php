@@ -490,3 +490,40 @@ def test_class_index_survives_a_cycle_in_the_ancestry():
     index.add(ClassRecord("A", frozenset(), ("B",)))
     index.add(ClassRecord("B", frozenset(), ("A",)))
     assert index.declares("A", "anything") == NOT_DECLARED
+
+
+def test_property_walk_prefers_the_nearest_declaration():
+    from graphify_php.syntax.class_index import ClassIndex, index_from_facts
+
+    index = ClassIndex()
+    index_from_facts(index, scan(r"""<?php
+namespace App;
+class Base { protected Wide $client; protected Only $fromBase; }
+class Child extends Base { protected Narrow $client; }
+"""))
+    assert index.property_fact("App\\Child", "client")[0].fqn == "App\\Narrow"
+    assert index.property_fact("App\\Child", "fromBase")[0].fqn == "App\\Only"
+    assert index.property_fact("App\\Base", "client")[0].fqn == "App\\Wide"
+
+
+def test_property_walk_returns_nothing_for_an_unread_ancestor():
+    from graphify_php.syntax.class_index import ClassIndex, index_from_facts
+
+    index = ClassIndex()
+    index_from_facts(index, scan(r"""<?php
+namespace App;
+class Child extends Unread {}
+"""))
+    assert index.property_fact("App\\Child", "anything") == (None, None)
+
+
+def test_property_walk_reports_an_ancestors_refusal():
+    from graphify_php.syntax.class_index import ClassIndex, index_from_facts
+
+    index = ClassIndex()
+    index_from_facts(index, scan(r"""<?php
+namespace App;
+class Base { protected Alpha|Beta $either; }
+class Child extends Base {}
+"""))
+    assert index.property_fact("App\\Child", "either") == (None, "union-type")

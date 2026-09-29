@@ -1,4 +1,4 @@
-"""Which classes exist in the corpus, and which methods each one declares.
+"""Which classes exist in the corpus, and what each one declares.
 
 The receiver's type is only half of a call target. Resolving `$this->magic` to
 `Eval\\Dynamic\\Magic` and then emitting whatever method name the call site wrote produces an
@@ -45,9 +45,46 @@ class ClassRecord:
 @dataclass
 class ClassIndex:
     classes: dict[str, ClassRecord] = field(default_factory=dict)
+    # The scopes themselves, for the property walk. Kept beside the records rather than folded
+    # into them because a record is a summary and this needs the declarations as parsed.
+    scopes: dict[str, object] = field(default_factory=dict)
 
-    def add(self, record: ClassRecord) -> None:
+    def add(self, record: ClassRecord, scope=None) -> None:
         self.classes[record.fqn] = record
+        if scope is not None:
+            self.scopes[record.fqn] = scope
+
+    def property_fact(self, fqn: str, name: str):
+        """The nearest declaration of `$name` in the ancestry, as (fact, refusal reason).
+
+        Breadth-first so the nearest declaration wins: a subclass that redeclares `$emails`
+        with a narrower type beats the ancestor's, which is the whole reason PHP allows the
+        redeclaration. Within one level the order is `extends`, then `implements`, then traits.
+
+        An ancestor in a file this run never read simply is not here, so its properties are
+        neither found nor disproved and the caller reports the type as unknown. Same principle
+        as the method check: disprove only what was seen.
+        """
+        level = [fqn]
+        seen: set[str] = set()
+        while level:
+            following: list[str] = []
+            for current in level:
+                if current in seen:
+                    continue
+                seen.add(current)
+                scope = self.scopes.get(current)
+                if scope is None:
+                    continue
+                refusal = scope.refusals.get(name)
+                if refusal:
+                    return None, refusal
+                fact = scope.properties.get(name)
+                if fact is not None:
+                    return fact, None
+                following.extend(scope.ancestors)
+            level = following
+        return None, None
 
     def declares(self, fqn: str, method: str) -> str:
         """Walk the ancestry for `method` and report which of the three answers applies."""
@@ -81,4 +118,4 @@ def record_for(scope, methods: frozenset[str]) -> ClassRecord:
 def index_from_facts(index: ClassIndex, facts) -> None:
     """Fold one file's declarations into the index."""
     for scope in facts.classes:
-        index.add(record_for(scope, frozenset(m.name for m in scope.methods if m.name)))
+        index.add(record_for(scope, frozenset(m.name for m in scope.methods if m.name)), scope)

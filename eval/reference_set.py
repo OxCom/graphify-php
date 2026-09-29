@@ -413,7 +413,7 @@ SITES: tuple[LabelledSite, ...] = (
         line=18,
         receiver="$this->maybeMailer",
         method="reminderSubmitWeek",
-        caller="Eval\\Variance\\Mixed::nullableCall",
+        caller="Eval\\Variance\\Variant::nullableCall",
         accepted=(_set(_t(_EMAILS, "reminderSubmitWeek")),),
         why="Nullable on a promoted parameter rather than a declaration: same answer, different parse path.",
     ),
@@ -426,7 +426,7 @@ SITES: tuple[LabelledSite, ...] = (
         line=23,
         receiver="$this->either",
         method="get",
-        caller="Eval\\Variance\\Mixed::unionCall",
+        caller="Eval\\Variance\\Variant::unionCall",
         accepted=(_set(_t(_EMAILS, "get"), _t(_CACHE, "get")),),
         why=(
             "`Emails|Cache` has two real targets. Out of scope because this version cannot "

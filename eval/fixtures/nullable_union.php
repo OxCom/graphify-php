@@ -5,7 +5,7 @@ namespace Eval\Variance;
 use Eval\Mail\Emails;
 use Eval\Traps\Cache;
 
-final class Mixed
+final class Variant
 {
     public function __construct(
         private readonly ?Emails $maybeMailer,

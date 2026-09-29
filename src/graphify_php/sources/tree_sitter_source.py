@@ -21,7 +21,7 @@ from typing import Iterable
 
 from ..ports import CallSite, CallTarget, Confidence, Resolution
 from ..syntax import nodes
-from ..syntax.class_index import MAGIC, NOT_DECLARED, ClassIndex, index_from_facts
+from ..syntax.class_index import DECLARED, MAGIC, NOT_DECLARED, ClassIndex, index_from_facts
 from ..syntax.collectors import REASSIGNED_LOCAL, UNION_TYPE
 from ..syntax.facts import FileFacts
 from ..syntax.names import NameResolver
@@ -156,7 +156,7 @@ class TreeSitterSource:
         if klass is None:
             return None, Reason.UNLOCATABLE_SITE
 
-        resolved, reason = self._receiver_target(site, facts, klass, line, method)
+        resolved, reason = self._receiver_target(site, facts, klass, line, method, index)
         if resolved is None:
             resolved, scoped_reason = self._scoped_target(facts, klass, line, method)
             if resolved is None:
@@ -189,7 +189,7 @@ class TreeSitterSource:
             via=f"{TreeSitterSource.name}:{via}",
         ), ""
 
-    def _receiver_target(self, site, facts, klass, line, method):
+    def _receiver_target(self, site, facts, klass, line, method, index):
         """`$this->prop->m()` and `$local->m()`, as (class, confidence, via) or (None, reason)."""
         receiver, reason = self._receiver(site, facts, line, method)
         if receiver is None:
@@ -199,17 +199,21 @@ class TreeSitterSource:
             return None, reason
 
         if kind == "self":
-            # `$this->m()` is provable only when this class declares `m` itself. When it does
-            # not, the owner is somewhere up a hierarchy whose other files are not read here,
-            # and naming this class anyway would put the wrong class on a real edge.
-            if method in {m.name for m in klass.methods if m.name}:
+            # `$this->m()` is provable when `m` is declared anywhere in an ancestry this run
+            # actually read — the class itself, a trait it uses, a parent in a file with call
+            # sites. When the owner is in an unread file the answer is not known, and naming
+            # this class anyway would put the wrong class on a real edge.
+            verdict = index.declares(klass.fqn, method)
+            if verdict == DECLARED:
                 return (klass.fqn, Confidence.EXTRACTED, "self-receiver"), ""
+            if verdict == MAGIC:
+                return None, Reason.INDIRECT_DISPATCH
             return None, Reason.UNSUPPORTED_RECEIVER
 
         if kind == "property":
-            if key in klass.refusals:
-                return None, klass.refusals[key]
-            fact = klass.properties.get(key)
+            fact, refusal = index.property_fact(klass.fqn, key)
+            if refusal:
+                return None, refusal
         else:
             scope = klass.method_at(line)
             if scope is None:

@@ -998,3 +998,98 @@ class Handler {
     assert (target.class_fqn, target.method) == ("App\\Handler", "process")
     assert target.confidence is Confidence.EXTRACTED
     assert target.via == "tree_sitter:self-receiver"
+
+
+# --- properties declared up the ancestry --------------------------------------------------
+
+
+def test_property_declared_in_a_parent_resolves(tmp_path):
+    declare(tmp_path, "App\\Mail", {"Emails": ["reminderSubmitMonth"]})
+    php = r"""<?php
+namespace App\Notify;
+use App\Mail\Emails;
+abstract class BaseNotifier {
+    protected readonly Emails $emails;
+    public function __construct(Emails $emails) { $this->emails = $emails; }
+}
+final class WeeklyNotifier extends BaseNotifier {
+    public function notify(string $user): void { $this->emails->reminderSubmitMonth($user); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "reminderSubmitMonth", line_with(php, "reminderSubmitMonth($user);")))
+    assert result.unresolved == {}
+    assert result.targets[0].class_fqn == "App\\Mail\\Emails"
+
+
+def test_property_declared_in_a_trait_resolves(tmp_path):
+    declare(tmp_path, "App\\Mail", {"Emails": ["send"]})
+    php = r"""<?php
+namespace App\Notify;
+use App\Mail\Emails;
+trait SendsMail { protected readonly Emails $emails; }
+final class Campaign {
+    use SendsMail;
+    public function run(): void { $this->emails->send(); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "send", line_with(php, "$this->emails->send()")))
+    assert result.targets[0].class_fqn == "App\\Mail\\Emails"
+
+
+def test_the_nearest_declaration_wins_over_the_ancestors(tmp_path):
+    """A subclass narrowing the type must beat the parent's, not depend on walk order."""
+    declare(tmp_path, "App", {"Wide": ["go"], "Narrow": ["go"]})
+    php = r"""<?php
+namespace App;
+class Base { protected Wide $client; }
+class Child extends Base {
+    protected Narrow $client;
+    public function run(): void { $this->client->go(); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "go", line_with(php, "$this->client->go()")))
+    assert result.targets[0].class_fqn == "App\\Narrow"
+
+
+def test_a_parent_in_an_unread_file_leaves_the_type_unknown(tmp_path):
+    """Not read is not disproved, and it is not a licence to guess either."""
+    php = r"""<?php
+namespace App;
+use Outside\Framework\Base;
+class Child extends Base {
+    public function run(): void { $this->inheritedProperty->go(); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "go", line_with(php, "->go()")))
+    assert result.targets == []
+    assert result.unresolved == {Reason.UNKNOWN_RECEIVER_TYPE: 1}
+
+
+def test_a_refusal_declared_in_an_ancestor_is_honoured(tmp_path):
+    """The parent's union is still a union when the subclass reads it."""
+    php = r"""<?php
+namespace App;
+class Base { protected Alpha|Beta $either; }
+class Child extends Base {
+    public function run(): void { $this->either->go(); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "go", line_with(php, "$this->either->go()")))
+    assert result.targets == []
+    assert result.unresolved == {Reason.UNION_TYPE: 1}
+
+
+def test_this_method_from_a_trait_resolves(tmp_path):
+    """`$this->dispatch()` where the trait supplies `dispatch`."""
+    php = r"""<?php
+namespace App;
+trait SendsMail { public function dispatch(string $u): void {} }
+final class Campaign {
+    use SendsMail;
+    public function run(string $u): void { $this->dispatch($u); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "dispatch", line_with(php, "$this->dispatch($u)")))
+    target = result.targets[0]
+    assert (target.class_fqn, target.method) == ("App\\Campaign", "dispatch")
+    assert target.via == "tree_sitter:self-receiver"
