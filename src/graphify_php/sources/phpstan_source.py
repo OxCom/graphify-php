@@ -50,6 +50,19 @@ REASON_RUN_FAILED = "phpstan-run-failed"
 REASON_NO_OUTPUT = "phpstan-no-output"
 REASON_MALFORMED = "phpstan-malformed-record"
 REASON_NOT_TYPED = "phpstan-receiver-not-typed"
+REASON_NOT_WIRED = "phpstan-collector-not-registered"
+
+# The two classes the project's own config must register. Without them PHPStan runs, analyses
+# the whole tree and writes nothing, which is indistinguishable from a project whose receivers
+# are all untyped — the one failure the reason vocabulary could not name.
+_COLLECTOR_CLASS = "CallGraph\\MethodCallCollector"
+_RULE_CLASS = "CallGraph\\CallEdgeRule"
+
+# A config may `includes:` another, so the registration is looked for across the closure rather
+# than in one file. Both bounds are guards, not tuning: a config that needs more than this is
+# not a config this source can read.
+_MAX_INCLUDE_DEPTH = 8
+_MAX_CONFIG_BYTES = 1 << 20
 
 # The one exception, and it is a diagnostic rather than a work item: without the first stderr
 # line an unattended failure is indistinguishable from a project that simply has no calls.
@@ -132,14 +145,30 @@ class EnvironmentProbe:
     """Answers whether PHPStan can run in a given checkout, and nothing else."""
 
     def check(self, repo_root: str) -> tuple[bool, str]:
+        ok, _code, message = self.inspect(repo_root)
+        return ok, message
+
+    def inspect(self, repo_root: str) -> tuple[bool, str, str]:
+        """`check` plus the fixed reason code, so a caller can count what stopped it.
+
+        `check` answers a human; the histogram needs a constant. Splitting them here keeps the
+        `available()` port signature untouched and keeps the two answers from drifting apart.
+        """
         root = Path(repo_root)
         if not (root / _BINARY).is_file():
-            return False, f"no {_BINARY} in {repo_root}"
-        if self.config_path(repo_root) is None:
-            return False, f"no {' or '.join(_CONFIG_NAMES)} in {repo_root}"
+            return False, REASON_UNAVAILABLE, f"no {_BINARY} in {repo_root}"
+        config = self.config_path(repo_root)
+        if config is None:
+            return False, REASON_UNAVAILABLE, f"no {' or '.join(_CONFIG_NAMES)} in {repo_root}"
         if shutil.which("php") is None:
-            return False, "no php executable on PATH"
-        return True, ""
+            return False, REASON_UNAVAILABLE, "no php executable on PATH"
+        missing = self.missing_wiring(config)
+        if missing:
+            return False, REASON_NOT_WIRED, (
+                f"{config.name} does not register {' and '.join(missing)}; "
+                f"add the services block from php/README.md"
+            )
+        return True, "", ""
 
     def config_path(self, repo_root: str) -> Path | None:
         for name in _CONFIG_NAMES:
@@ -147,6 +176,43 @@ class EnvironmentProbe:
             if candidate.is_file():
                 return candidate
         return None
+
+    def missing_wiring(self, config: Path) -> tuple[str, ...]:
+        """Which of the two required classes the config closure never names.
+
+        PHPStan builds its rules from the config alone: `--autoload-file` makes the classes
+        loadable, it does not register them. An unregistered collector produces a clean exit,
+        an empty output file and a full-length run, so this is checked before launching rather
+        than inferred from the silence afterwards.
+        """
+        text = self._config_closure(config)
+        return tuple(name for name in (_COLLECTOR_CLASS, _RULE_CLASS) if name not in text)
+
+    def _config_closure(self, config: Path) -> str:
+        """Every config file reachable from this one through `includes:`, concatenated.
+
+        Registration is often kept in a separate neon that the project's own config pulls in,
+        so looking only at the entry file would report a wired project as unwired.
+        """
+        seen: set[Path] = set()
+        pending: list[tuple[Path, int]] = [(config, 0)]
+        chunks: list[str] = []
+        while pending:
+            current, depth = pending.pop()
+            try:
+                resolved = current.resolve()
+            except OSError:
+                continue
+            if resolved in seen or depth > _MAX_INCLUDE_DEPTH:
+                continue
+            seen.add(resolved)
+            text = _read_config(resolved)
+            if not text:
+                continue
+            chunks.append(text)
+            for include in _includes(text):
+                pending.append(((resolved.parent / include), depth + 1))
+        return "\n".join(chunks)
 
 
 def extension_autoload_file() -> Path | None:
@@ -254,9 +320,9 @@ class PhpStanSource:
 
     def resolve(self, repo_root: str, sites: Iterable[CallSite]) -> Resolution:
         wanted = list(sites)
-        ok, reason = self.available(repo_root)
+        ok, code, _message = self._probe.inspect(repo_root)
         if not ok:
-            return Resolution([], {REASON_UNAVAILABLE: len(wanted)}, 0)
+            return Resolution([], {code or REASON_UNAVAILABLE: len(wanted)}, 0)
         if not wanted:
             return Resolution([], {}, 0)
 
@@ -291,6 +357,55 @@ def _failure_reason(outcome: RunOutcome) -> str:
     if outcome.ok:
         return REASON_NO_OUTPUT
     return outcome.reason or REASON_UNAVAILABLE
+
+
+def _read_config(path: Path) -> str:
+    """A config file's text, or nothing. An unreadable include is a file that registers nothing."""
+    try:
+        if path.stat().st_size > _MAX_CONFIG_BYTES:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _includes(text: str) -> list[str]:
+    """The paths under a top-level `includes:` key.
+
+    Deliberately not a NEON parser: this looks for one key whose values are file paths, and a
+    line it misreads costs at most one unvisited include. An entry carrying a NEON placeholder
+    (`%rootDir%`) is skipped rather than guessed at — expanding it is PHPStan's job.
+    """
+    found: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not inside:
+            if stripped.startswith("includes:"):
+                inside = True
+                inline = stripped[len("includes:"):].strip()
+                found.extend(_include_items(inline))
+            continue
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not line[:1].isspace():
+            inside = False
+            if stripped.startswith("includes:"):
+                inside = True
+            continue
+        if stripped.startswith("-"):
+            found.extend(_include_items(stripped[1:]))
+    return [item for item in found if item and "%" not in item]
+
+
+def _include_items(raw: str) -> list[str]:
+    raw = raw.strip().strip("[]")
+    items = []
+    for part in raw.split(","):
+        part = part.strip().strip("\'\"")
+        if part:
+            items.append(part)
+    return items
 
 
 def _first_line(stderr: str) -> str:

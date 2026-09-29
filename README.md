@@ -88,7 +88,7 @@ to be installed.
 ## Run a build
 
 ```bash
-graphify-php-build -- build .
+graphify-php-build -- update .
 ```
 
 Everything after `--` is passed to graphify unchanged; options before it belong to the wrapper:

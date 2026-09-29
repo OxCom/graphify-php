@@ -17,13 +17,32 @@ from graphify_php.ports import CallSite, Confidence
 from graphify_php.sources import phpstan_source as ps
 
 
-def make_repo(tmp_path: Path, *, binary: bool = True, config: bool = True) -> Path:
+WIRING = """
+services:
+	-
+		class: CallGraph\\JsonLinesWriter
+	-
+		class: CallGraph\\MethodCallCollector
+		tags:
+			- phpstan.collector
+	-
+		class: CallGraph\\CallEdgeRule
+		tags:
+			- phpstan.rules.rule
+"""
+
+
+def make_repo(tmp_path: Path, *, binary: bool = True, config: bool = True,
+              wired: bool = True) -> Path:
     root = tmp_path / "repo"
     (root / "vendor" / "bin").mkdir(parents=True)
     if binary:
         (root / "vendor" / "bin" / "phpstan").write_text("#!/bin/sh\nexit 0\n")
     if config:
-        (root / "phpstan.neon").write_text("parameters:\n\tlevel: 5\n")
+        text = "parameters:\n\tlevel: 5\n"
+        if wired:
+            text += WIRING
+        (root / "phpstan.neon").write_text(text)
     return root
 
 
@@ -81,8 +100,76 @@ class TestAvailability:
     @pytest.mark.parametrize("name", ["phpstan.neon", "phpstan.neon.dist", "phpstan.dist.neon"])
     def test_every_config_name_phpstan_itself_accepts(self, tmp_path, name):
         root = make_repo(tmp_path, config=False)
-        (root / name).write_text("parameters:\n")
+        (root / name).write_text("parameters:\n" + WIRING)
         assert ps.EnvironmentProbe().config_path(str(root)).name == name
+
+
+class TestWiring:
+    """The collector check.
+
+    Without the `services:` block PHPStan exits clean, writes nothing, and the source reported
+    `phpstan-no-output` for every site — a full-length run whose silence looked exactly like a
+    project of untyped receivers. Measured on one Symfony application: 6803 sites counted under
+    that reason, 855 edges instead of 2990.
+    """
+
+    def test_unwired_config_is_a_reason_not_a_run(self, tmp_path):
+        ok, reason = ps.PhpStanSource().available(str(make_repo(tmp_path, wired=False)))
+        assert ok is False
+        assert "MethodCallCollector" in reason
+
+    def test_wired_config_is_available(self, tmp_path):
+        ok, reason = ps.PhpStanSource().available(str(make_repo(tmp_path)))
+        assert (ok, reason) == (True, "")
+
+    def test_rule_without_collector_is_still_unwired(self, tmp_path):
+        root = make_repo(tmp_path, wired=False)
+        (root / "phpstan.neon").write_text(
+            "services:\n\t-\n\t\tclass: CallGraph\\CallEdgeRule\n")
+        missing = ps.EnvironmentProbe().missing_wiring(root / "phpstan.neon")
+        assert missing == ("CallGraph\\MethodCallCollector",)
+
+    def test_registration_in_an_included_file_counts(self, tmp_path):
+        root = make_repo(tmp_path, wired=False)
+        (root / "build").mkdir()
+        (root / "build" / "call-graph.neon").write_text(WIRING)
+        (root / "phpstan.neon").write_text(
+            "includes:\n\t- build/call-graph.neon\n\nparameters:\n\tlevel: 5\n")
+        ok, _reason = ps.PhpStanSource().available(str(root))
+        assert ok is True
+
+    def test_include_cycle_terminates(self, tmp_path):
+        root = make_repo(tmp_path, wired=False)
+        (root / "other.neon").write_text("includes:\n\t- phpstan.neon\n")
+        (root / "phpstan.neon").write_text("includes:\n\t- other.neon\n")
+        ok, _reason = ps.PhpStanSource().available(str(root))
+        assert ok is False
+
+    def test_a_missing_include_does_not_raise(self, tmp_path):
+        root = make_repo(tmp_path, wired=False)
+        (root / "phpstan.neon").write_text(
+            "includes:\n\t- vendor/nothing/here.neon\n" + WIRING)
+        ok, _reason = ps.PhpStanSource().available(str(root))
+        assert ok is True
+
+    def test_placeholder_include_is_skipped_not_guessed(self, tmp_path):
+        root = make_repo(tmp_path, wired=False)
+        (root / "phpstan.neon").write_text("includes:\n\t- %rootDir%/conf/config.neon\n")
+        assert ps._includes((root / "phpstan.neon").read_text()) == []
+
+    def test_unwired_repository_never_launches_phpstan(self, tmp_path):
+        runner = FakeRunner(ps.RunOutcome(True), [json.dumps(record())])
+        source = ps.PhpStanSource(runner=runner)
+        result = source.resolve(str(make_repo(tmp_path, wired=False)), [site()])
+        assert runner.calls == []
+        assert result.targets == []
+        assert result.unresolved == {ps.REASON_NOT_WIRED: 1}
+
+    def test_missing_binary_still_counts_as_unavailable(self, tmp_path):
+        runner = FakeRunner(ps.RunOutcome(True), [])
+        source = ps.PhpStanSource(runner=runner)
+        result = source.resolve(str(make_repo(tmp_path, binary=False)), [site()])
+        assert result.unresolved == {ps.REASON_UNAVAILABLE: 1}
 
 
 class TestRecordParsing:
