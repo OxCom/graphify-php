@@ -60,29 +60,35 @@ class TypeCollector(Protocol):
     def collect(self, node, ctx: ScanContext) -> None: ...
 
 
-def _fact(collector: TypeCollector, fqn: str) -> TypeFact:
+def _fact(collector: TypeCollector, fqn: str, members: tuple = ()) -> TypeFact:
     return TypeFact(
         fqn=fqn,
         confidence=collector.confidence,
         via=collector.via,
         precedence=collector.precedence,
+        members=members,
     )
 
 
-def _declared_type(collector: TypeCollector, node, ctx: ScanContext) -> tuple[str | None, str | None]:
-    """Read a declaration's type annotation as (fqn, refusal reason).
+def _declared_type(collector: TypeCollector, node, ctx: ScanContext) -> tuple[str | None, tuple, str | None]:
+    """Read a declaration's type annotation as (fqn, intersection members, refusal reason).
 
-    Three outcomes, not two. A concrete class is a fact; a union is a refusal that must be
-    counted, because both alternatives are real targets and this version cannot express two;
-    anything else — untyped, `int`, `self` — is neither, because it names no call target at all.
+    Four outcomes. A concrete class is a fact. An intersection `A&B` is a fact with several
+    constituents, resolved at the call site by which one declares the method. A union is a
+    refusal that must be counted, because both alternatives are real targets and this version
+    cannot express two. Anything else — untyped, `int`, `self` — is none of them, because it
+    names no call target at all.
     """
     annotation = nodes.type_node(node)
     if nodes.is_union(annotation):
-        return None, UNION_TYPE
+        return None, (), UNION_TYPE
+    members = nodes.intersection_members(annotation)
+    if members:
+        return None, tuple(ctx.names.resolve(m) for m in members), None
     short = nodes.type_name(annotation)
     if not short:
-        return None, None
-    return ctx.names.resolve(short), None
+        return None, (), None
+    return ctx.names.resolve(short), (), None
 
 
 class PromotedParameterCollector:
@@ -104,11 +110,11 @@ class PromotedParameterCollector:
         prop = nodes.variable_of(node)
         if not prop:
             return
-        fqn, refusal = _declared_type(self, node, ctx)
+        fqn, members, refusal = _declared_type(self, node, ctx)
         if refusal:
             ctx.klass.refuse_property(prop, refusal, self.precedence)
-        elif fqn:
-            ctx.klass.record_property(prop, _fact(self, fqn))
+        elif fqn or members:
+            ctx.klass.record_property(prop, _fact(self, fqn or "", members))
 
 
 class TypedPropertyCollector:
@@ -122,8 +128,8 @@ class TypedPropertyCollector:
     def collect(self, node, ctx: ScanContext) -> None:
         if ctx.klass is None:
             return
-        fqn, refusal = _declared_type(self, node, ctx)
-        if not fqn and not refusal:
+        fqn, members, refusal = _declared_type(self, node, ctx)
+        if not fqn and not members and not refusal:
             return
         for element in nodes.children(node, "property_element"):
             prop = nodes.variable_of(element)
@@ -132,7 +138,7 @@ class TypedPropertyCollector:
             if refusal:
                 ctx.klass.refuse_property(prop, refusal, self.precedence)
             else:
-                ctx.klass.record_property(prop, _fact(self, fqn))
+                ctx.klass.record_property(prop, _fact(self, fqn or "", members))
 
 
 class ConstructorAssignmentCollector:
@@ -162,22 +168,22 @@ class ConstructorAssignmentCollector:
             prop, source_var = self._this_assignment(assignment)
             if not prop or source_var not in params:
                 continue
-            fqn, refusal = params[source_var]
+            fqn, members, refusal = params[source_var]
             if refusal:
                 ctx.klass.refuse_property(prop, refusal, self.precedence)
-            elif fqn:
-                ctx.klass.record_property(prop, _fact(self, fqn))
+            elif fqn or members:
+                ctx.klass.record_property(prop, _fact(self, fqn or "", members))
 
-    def _parameter_types(self, ctor, ctx: ScanContext) -> dict[str, tuple[str | None, str | None]]:
-        out: dict[str, tuple[str | None, str | None]] = {}
+    def _parameter_types(self, ctor, ctx: ScanContext) -> dict[str, tuple]:
+        out: dict[str, tuple] = {}
         params = nodes.child(ctor, "formal_parameters")
         for param in nodes.children(params, "simple_parameter", "property_promotion_parameter"):
             name = nodes.variable_of(param)
             if not name:
                 continue
-            fqn, refusal = _declared_type(self, param, ctx)
-            if fqn or refusal:
-                out[name] = (fqn, refusal)
+            fqn, members, refusal = _declared_type(self, param, ctx)
+            if fqn or members or refusal:
+                out[name] = (fqn, members, refusal)
         return out
 
     def _assignments(self, node):

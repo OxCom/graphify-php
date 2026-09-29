@@ -76,8 +76,30 @@ class CallTargetSource(Protocol):
         failure, and conflating the two is how a missing layer becomes invisible.
         """
 
-    def resolve(self, repo_root: str, sites: Iterable[CallSite]) -> "Resolution":
-        ...
+    def resolve(
+        self,
+        repo_root: str,
+        sites: Iterable[CallSite],
+        corpus: Iterable[str] | None = None,
+    ) -> "Resolution":
+        """Resolve `sites`, optionally with `corpus` as the set of files that may be read.
+
+        `corpus` exists because a source needs declarations from files that hold no call site
+        of their own. A leaf service class has nothing unresolved in it, so it never appears
+        among `sites`, and a source that indexes only the files it was handed cannot tell
+        whether that class declares the method being called on it. Measured on an intersection
+        type: the same call resolves when the constituent's file happens to carry a site and
+        stays `unknown-receiver-type` when it does not, which makes the answer depend on
+        unrelated code.
+
+        The caller passes the files graphify itself parsed, so the set is bounded by the build
+        rather than by a filesystem walk — an earlier version walked to the nearest
+        `composer.json` and cost 4.7 s against 0.16 s for the site files alone, while also
+        reading paths outside the build.
+
+        `None` means "only the files carrying sites", which stays the honest default for a
+        caller that has no corpus to offer.
+        """
 
 
 @dataclass

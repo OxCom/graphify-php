@@ -23,6 +23,7 @@ same artifact.
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 from dataclasses import dataclass
@@ -134,7 +135,21 @@ def collect_scoped_groups(per_file: Sequence[dict], scopes: ScopeIndex) -> list[
     return groups
 
 
-def _php_files(per_file: Sequence[dict]) -> set[str]:
+def collect_corpus(per_file: Sequence[dict]) -> list[str]:
+    """Every PHP file graphify parsed, as the corpus a source may read declarations from.
+
+    A leaf service class has nothing unresolved in it, so it never appears among the sites and
+    a source indexing only those files cannot tell whether it declares the method being called
+    on it. The fixture shows the shape exactly: `Emails.php` contributes nodes but no
+    `raw_calls`, and it is the class every resolved call points at.
+
+    Bounded by what the build already parsed, never by a filesystem walk: a walk to the nearest
+    `composer.json` measured 4.7 s against 0.16 s and read paths outside the build.
+
+    Paths are taken verbatim from the same dicts the sites come from. During a build they are
+    ABSOLUTE and only relativized at publish time, so rebuilding them from a root here would
+    hand the source the same file under two names and make it parse it twice.
+    """
     seen: set[str] = set()
     for result in per_file:
         for group in ("nodes", "raw_calls"):
@@ -142,7 +157,34 @@ def _php_files(per_file: Sequence[dict]) -> set[str]:
                 path = item.get("source_file") or ""
                 if path.endswith(".php"):
                     seen.add(path)
-    return seen
+    return sorted(seen)
+
+
+# Whether a source's `resolve` takes `corpus`, cached per source class. The shim exists because
+# `corpus` was added to `CallTargetSource` after the first sources were written, and a source
+# built against the old signature is still a valid implementation of the protocol. Reading the
+# signature rather than catching `TypeError` on the call: a `TypeError` raised from inside a
+# source's own body would otherwise be misread as "this source is old" and silently retried
+# without the corpus.
+_ACCEPTS_CORPUS: dict[type, bool] = {}
+
+
+def _resolve_with(source: CallTargetSource, repo_root: str,
+                  sites: Sequence[CallSite], corpus: Sequence[str] | None):
+    kind = type(source)
+    accepts = _ACCEPTS_CORPUS.get(kind)
+    if accepts is None:
+        try:
+            params = inspect.signature(source.resolve).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        else:
+            accepts = "corpus" in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+        _ACCEPTS_CORPUS[kind] = accepts
+    if corpus is not None and accepts:
+        return source.resolve(repo_root, sites, corpus)
+    return source.resolve(repo_root, sites)
 
 
 def _ask_sources(
@@ -152,6 +194,7 @@ def _ask_sources(
     record: status.ResolverStatus,
     reason_prefix: str = "",
     count_unclaimed: bool = True,
+    corpus: Sequence[str] | None = None,
 ) -> list[CallTarget]:
     """Offer each site to the sources in order, stopping at the first that proves it."""
     pending: list[CallSite] = list(sites)
@@ -159,7 +202,7 @@ def _ask_sources(
     for source in sources:
         if not pending:
             break
-        resolution = source.resolve(repo_root, pending)
+        resolution = _resolve_with(source, repo_root, pending, corpus)
         record.files_seen = max(record.files_seen, resolution.files_seen)
         for reason, count in (resolution.unresolved or {}).items():
             record.unresolvable(f"{reason_prefix}{source.name}:{reason}", count)
@@ -185,6 +228,7 @@ def _resolve_groups(
     sources: Sequence[CallTargetSource],
     repo_root: str,
     record: status.ResolverStatus,
+    corpus: Sequence[str] | None = None,
 ) -> list[CallTarget]:
     """Turn each group's candidates into at most one target for that call site.
 
@@ -196,7 +240,8 @@ def _resolve_groups(
         return []
     probes = [site for group in groups for site in group.candidates]
     found = {t.site: t for t in _ask_sources(sources, repo_root, probes, record,
-                                             reason_prefix="probe:", count_unclaimed=False)}
+                                             reason_prefix="probe:", count_unclaimed=False,
+                                             corpus=corpus)}
     targets: list[CallTarget] = []
     for group in groups:
         hits = [found[site] for site in group.candidates if site in found]
@@ -268,7 +313,8 @@ def run(
             else:
                 unavailable.append(f"{source.name}: {reason}")
 
-        record.files_seen = len(_php_files(per_file))
+        corpus = collect_corpus(per_file)
+        record.files_seen = len(corpus)
         if not usable:
             # A repository with no PHPStan in `vendor/` is the normal case, not a fault: the
             # build publishes, and the record says which layer was missing.
@@ -279,8 +325,8 @@ def run(
         sites = collect_sites(per_file)
         groups = collect_scoped_groups(per_file, scopes) if scopes is not None else []
         record.eligible_sites = len(sites) + len(groups)
-        targets = _ask_sources(usable, repo_root, sites, record)
-        targets += _resolve_groups(groups, usable, repo_root, record)
+        targets = _ask_sources(usable, repo_root, sites, record, corpus=corpus)
+        targets += _resolve_groups(groups, usable, repo_root, record, corpus=corpus)
         record.resolved_sites = len({t.site for t in targets})
         _write_edges(targets, index, sink, record)
         record.edges_added = getattr(sink, "added", record.resolved_sites)

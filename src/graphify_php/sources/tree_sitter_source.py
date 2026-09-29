@@ -50,6 +50,7 @@ class Reason:
     AMBIGUOUS_SITE = "ambiguous-call-site"
     CALL_SITE_NOT_FOUND = "call-site-not-found"
     METHOD_NOT_DECLARED = "method-not-declared"
+    AMBIGUOUS_INTERSECTION = "ambiguous-intersection"
     DYNAMIC_SCOPE = "dynamic-scope"
     UNRESOLVABLE_SCOPE = "unresolvable-scope"
 
@@ -88,8 +89,15 @@ class TreeSitterSource:
         """True wherever the parser imports. No `vendor/`, so no repository can be too bare."""
         return nodes.tree_sitter_available()
 
-    def resolve(self, repo_root: str, sites: Iterable[CallSite]) -> Resolution:
+    def resolve(
+        self,
+        repo_root: str,
+        sites: Iterable[CallSite],
+        corpus: Iterable[str] | None = None,
+    ) -> Resolution:
         resolution = Resolution(targets=[], unresolved={})
+        # One cache for the whole call, keyed by real path, so a file that is both a corpus
+        # entry and a site file is parsed once.
         cache: dict[str, FileFacts | None] = {}
         # Built before any site is answered, because "this class declares no such method" is
         # only honest once the files that could have declared it have been read. The same
@@ -97,7 +105,7 @@ class TreeSitterSource:
         by_file: dict[str, list[CallSite]] = {}
         for site in sites:
             by_file.setdefault(site.source_file, []).append(site)
-        index = self._corpus_index(repo_root, list(by_file), cache)
+        index = self._corpus_index(repo_root, list(by_file), corpus, cache)
 
         for path, file_sites in by_file.items():
             facts = self._facts(repo_root, path, cache)
@@ -113,15 +121,30 @@ class TreeSitterSource:
                     _count(resolution, reason, 1)
         return resolution
 
-    def _corpus_index(self, repo_root: str, site_paths, cache: dict[str, FileFacts | None]) -> ClassIndex:
-        """Declarations from the files this run parses, which is what it can disprove with.
+    def _corpus_index(
+        self,
+        repo_root: str,
+        site_paths,
+        corpus: Iterable[str] | None,
+        cache: dict[str, FileFacts | None],
+    ) -> ClassIndex:
+        """Declarations from every file this run may read, which is what it can disprove with.
 
-        Only the files holding call sites, not a walk of the repository: a class the walk
-        would have found is emitted rather than refused anyway, so the walk bought nothing and
-        cost a parse of every PHP file in the project.
+        `corpus` is what the caller parsed for the build; without it only the files carrying
+        call sites are read. The difference is not cosmetic: a leaf service class holds no
+        unresolved call of its own, so it never appears among the sites, and without a corpus
+        whether its methods are known depends on whether some unrelated file happens to have a
+        site in it. The site files are always included, because a site file is readable by
+        definition and a caller may pass a corpus that does not list it.
+
+        Never a filesystem walk. The set is bounded by what the build already parsed, so this
+        reads nothing the build did not.
         """
         index = ClassIndex()
-        for path in site_paths:
+        paths = list(site_paths)
+        if corpus is not None:
+            paths.extend(corpus)
+        for path in paths:
             facts = self._facts(repo_root, path, cache)
             if facts is not None:
                 index_from_facts(index, facts)
@@ -181,6 +204,12 @@ class TreeSitterSource:
         if verdict == NOT_DECLARED:
             return None, Reason.METHOD_NOT_DECLARED
 
+        # First-class callable syntax, `$this->emails->reminderSubmitWeek(...)`, produces a
+        # Closure rather than invoking anything, so this edge is arguably a reference and not a
+        # call. It is emitted as a call deliberately: the question the graph is built to answer
+        # is "what breaks if I change this method", and for that the edge is worth more than
+        # its absence. The grammar makes no distinction here, so nothing downstream can tell
+        # the two apart — which is the cost of the choice, recorded rather than hidden.
         return CallTarget(
             site=site,
             class_fqn=class_fqn,
@@ -227,7 +256,32 @@ class TreeSitterSource:
             # by a container, or simply untyped — and any of those could be a class with this
             # short name anywhere in the corpus, which is precisely the match not to make.
             return None, Reason.UNKNOWN_RECEIVER_TYPE
+        if fact.is_intersection:
+            return self._intersection_target(fact, method, index)
         return (fact.fqn, fact.confidence, fact.via), ""
+
+    def _intersection_target(self, fact, method: str, index: ClassIndex):
+        """`A&B`: one object that is both, so the constituent declaring the method is the target.
+
+        This is why an intersection is not a union. With `A|B` the object is one of two things
+        and there are two candidate targets, so there is nothing to choose between. With `A&B`
+        there is one object, and a method declared in only one constituent names it without
+        ambiguity.
+        """
+        verdicts = {member: index.declares(member, method) for member in fact.members}
+        declaring = [m for m, v in verdicts.items() if v == DECLARED]
+        if len(declaring) == 1:
+            return (declaring[0], Confidence.EXTRACTED, f"{fact.via}+intersection"), ""
+        if len(declaring) > 1:
+            # One call, one object, two declarations. Which body runs depends on the concrete
+            # class, which the type does not name, so the graph cannot say.
+            return None, Reason.AMBIGUOUS_INTERSECTION
+        if any(v == MAGIC for v in verdicts.values()):
+            return None, Reason.INDIRECT_DISPATCH
+        if all(v == NOT_DECLARED for v in verdicts.values()):
+            return None, Reason.METHOD_NOT_DECLARED
+        # A constituent sits in a file this run never read, so the method may well be there.
+        return None, Reason.UNKNOWN_RECEIVER_TYPE
 
     def _scoped_target(self, facts, klass, line, method):
         """`self::`, `parent::`, `static::` and `Class::`, each on its own terms.

@@ -217,3 +217,94 @@ def test_only_php_member_calls_are_eligible():
     assert [s.caller_nid for s in sites] == ["a"]
     # graphify's PHP extractor never sets `receiver`; the field is carried as empty, not faked.
     assert sites[0].receiver == ""
+
+
+class CorpusSource(FakeSource):
+    """A source written against the current port, which takes `corpus`."""
+
+    def resolve(self, repo_root, sites, corpus=None):
+        self.corpus = list(corpus) if corpus is not None else None
+        return super().resolve(repo_root, sites)
+
+
+def per_file_with_leaf():
+    """Two files: one carrying a call site, one a leaf class carrying only declarations."""
+    caller, leaf = "src/Controller/C.php", "src/Service/Leaf.php"
+    return [
+        {"nodes": [{"source_file": caller}],
+         "raw_calls": [{"caller_nid": "caller_send", "callee": "send", "is_member_call": True,
+                        "source_file": caller, "source_location": "L10"}]},
+        {"nodes": [{"source_file": leaf}], "raw_calls": []},
+    ]
+
+
+def test_corpus_is_every_php_file_graphify_parsed_not_just_the_ones_with_sites():
+    corpus = resolver.collect_corpus(per_file_with_leaf())
+
+    # The leaf file holds no call site, so it never reaches a source through `sites`. It is
+    # also the file declaring the method being called, which is the whole reason for `corpus`.
+    assert corpus == ["src/Controller/C.php", "src/Service/Leaf.php"]
+
+
+def test_corpus_excludes_non_php_files():
+    corpus = resolver.collect_corpus([{"nodes": [{"source_file": "app/main.ts"},
+                                                 {"source_file": "src/A.php"}],
+                                       "raw_calls": []}])
+
+    assert corpus == ["src/A.php"]
+
+
+def test_corpus_paths_are_verbatim_so_a_file_is_never_parsed_under_two_names():
+    absolute = "/build/repo/src/A.php"
+    corpus = resolver.collect_corpus([{
+        "nodes": [{"source_file": absolute}],
+        "raw_calls": [{"caller_nid": "a", "callee": "send", "is_member_call": True,
+                       "source_file": absolute, "source_location": "L1"}],
+    }])
+    sites = resolver.collect_sites([{
+        "raw_calls": [{"caller_nid": "a", "callee": "send", "is_member_call": True,
+                       "source_file": absolute, "source_location": "L1"}],
+    }])
+
+    assert corpus == [absolute] == [sites[0].source_file]
+
+
+def test_a_source_that_takes_corpus_is_given_it():
+    source = CorpusSource("parser", claims={"send"})
+
+    resolver.run(per_file_with_leaf(), [], [], sources=[source],
+                 index=FakeIndex({("App\\SendService", "send"): "n_send"}), sink=FakeSink())
+
+    assert source.corpus == ["src/Controller/C.php", "src/Service/Leaf.php"]
+
+
+def test_a_source_predating_the_parameter_is_called_without_it():
+    # `FakeSource.resolve` has the two-argument signature. Passing a corpus to it would raise
+    # TypeError and, because graphify swallows what escapes, lose the whole pass silently.
+    old = FakeSource("parser", claims={"send"})
+    sink = FakeSink()
+
+    record = resolver.run(per_file_with_leaf(), [], [], sources=[old],
+                          index=FakeIndex({("App\\SendService", "send"): "n_send"}), sink=sink)
+
+    assert record.state == "completed"
+    assert sink.added == 1
+
+
+def test_mixed_vintage_sources_both_run():
+    old = FakeSource("phpstan", claims=())
+    new = CorpusSource("parser", claims={"send"})
+    sink = FakeSink()
+
+    resolver.run(per_file_with_leaf(), [], [], sources=[old, new],
+                 index=FakeIndex({("App\\SendService", "send"): "n_send"}), sink=sink)
+
+    assert new.corpus is not None
+    assert sink.added == 1
+
+
+def test_files_seen_counts_the_corpus_not_only_the_files_with_sites():
+    record = resolver.run(per_file_with_leaf(), [], [], sources=[CorpusSource("parser")],
+                          index=FakeIndex(), sink=FakeSink())
+
+    assert record.files_seen == 2

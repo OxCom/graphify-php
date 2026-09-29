@@ -31,6 +31,14 @@ class TypeFact:
     confidence: Confidence
     via: str
     precedence: int
+    # `A&B`: every class the object is at once. Empty for an ordinary single type. The one
+    # that owns the called method is chosen at the call site, not here, because which
+    # constituent is the target depends on the method being called.
+    members: tuple[str, ...] = ()
+
+    @property
+    def is_intersection(self) -> bool:
+        return bool(self.members)
 
 
 @dataclass

@@ -1093,3 +1093,346 @@ final class Campaign {
     target = result.targets[0]
     assert (target.class_fqn, target.method) == ("App\\Campaign", "dispatch")
     assert target.via == "tree_sitter:self-receiver"
+
+
+# --- intersection types -------------------------------------------------------------------
+
+# `A&B` is not `A|B`. A union is one of two objects and so two candidate targets, which is why
+# it is refused. An intersection is one object that is both, so a method declared in only one
+# constituent names its target without ambiguity.
+
+INTERSECTION = r"""<?php
+namespace App;
+
+class Emails
+{
+    public function reminderSubmitWeek(string $u): void {}
+}
+
+class Loggable
+{
+    public function log(string $u): void {}
+}
+
+class Caller
+{
+    public function __construct(private readonly Emails&Loggable $both) {}
+
+    public function run(string $u): void
+    {
+        $this->both->reminderSubmitWeek($u);
+    }
+}
+"""
+
+# One file on purpose. A constituent is only weighed when its declaration was actually read,
+# and the index covers the files this run parses for call sites — so a constituent living in a
+# file with no call sites is unread, and the last test in this group pins that outcome.
+
+
+def test_intersection_resolves_to_the_constituent_that_declares_the_method(tmp_path):
+    result = resolve(tmp_path, INTERSECTION,
+                     call("", "reminderSubmitWeek", line_with(INTERSECTION, "reminderSubmitWeek($u);")))
+    assert result.unresolved == {}
+    target = result.targets[0]
+    assert (target.class_fqn, target.method) == ("App\\Emails", "reminderSubmitWeek")
+    assert target.confidence is Confidence.EXTRACTED
+    assert "intersection" in target.via
+
+
+def test_intersection_picks_the_other_constituent_for_its_own_method(tmp_path):
+    """The choice follows the method, so it cannot be a fixed preference for the first name."""
+    php = INTERSECTION.replace("$this->both->reminderSubmitWeek($u);", "$this->both->log($u);")
+    result = resolve(tmp_path, php, call("", "log", line_with(php, "$this->both->log($u);")))
+    assert result.targets[0].class_fqn == "App\\Loggable"
+
+
+def test_intersection_refuses_when_both_constituents_declare_it(tmp_path):
+    """One object, two declarations: the type does not say which body runs."""
+    php = INTERSECTION.replace("public function log(string $u): void {}",
+                               "public function reminderSubmitWeek(string $u): void {}")
+    result = resolve(tmp_path, php,
+                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+    assert result.targets == []
+    assert result.unresolved == {Reason.AMBIGUOUS_INTERSECTION: 1}
+
+
+def test_intersection_refuses_a_method_neither_constituent_declares(tmp_path):
+    php = INTERSECTION.replace("$this->both->reminderSubmitWeek($u);", "$this->both->typoed($u);")
+    result = resolve(tmp_path, php, call("", "typoed", line_with(php, "$this->both->typoed($u);")))
+    assert result.targets == []
+    assert result.unresolved == {Reason.METHOD_NOT_DECLARED: 1}
+
+
+def test_intersection_resolves_when_only_the_read_constituent_declares_it(tmp_path):
+    """The second constituent is in a file this run never read; the read one settles it."""
+    php = INTERSECTION.replace("""class Loggable
+{
+    public function log(string $u): void {}
+}
+
+""", "").replace("Emails&Loggable", "Emails&\\Vendor\\Loggable")
+    result = resolve(tmp_path, php,
+                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+    assert result.unresolved == {}
+    assert result.targets[0].class_fqn == "App\\Emails"
+
+
+def test_intersection_stays_unresolved_when_no_read_constituent_declares_it(tmp_path):
+    """Neither read nor disproved: leave it rather than pick a constituent."""
+    php = INTERSECTION.replace("Emails&Loggable", "\\Vendor\\A&\\Vendor\\B")
+    result = resolve(tmp_path, php,
+                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+    assert result.targets == []
+    assert result.unresolved == {Reason.UNKNOWN_RECEIVER_TYPE: 1}
+
+
+def test_a_union_is_still_refused_and_not_treated_as_an_intersection(tmp_path):
+    php = INTERSECTION.replace("Emails&Loggable", "Emails|Loggable")
+    result = resolve(tmp_path, php,
+                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+    assert result.targets == []
+    assert result.unresolved == {Reason.UNION_TYPE: 1}
+
+
+def test_disjunctive_normal_form_type_is_refused_as_a_union(tmp_path):
+    """`(A&B)|C` is an alternation at the top, whatever its branches are."""
+    php = INTERSECTION.replace("Emails&Loggable", "(Emails&Loggable)|Other")
+    result = resolve(tmp_path, php,
+                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+    assert result.targets == []
+    assert result.unresolved == {Reason.UNION_TYPE: 1}
+
+
+# --- PHP 8.x shapes that already work, pinned so a later change cannot break them silently --
+
+
+def test_nullsafe_call_resolves(tmp_path):
+    declare(tmp_path, "App\\Service", {"Emails": ["reminderSubmitWeek"]})
+    php = r"""<?php
+namespace App;
+use App\Service\Emails;
+class C {
+    public function __construct(private readonly ?Emails $emails) {}
+    public function run(string $u): void { $this->emails?->reminderSubmitWeek($u); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "reminderSubmitWeek", line_with(php, "?->reminderSubmitWeek")))
+    target = result.targets[0]
+    assert (target.class_fqn, target.method) == ("App\\Service\\Emails", "reminderSubmitWeek")
+    assert target.confidence is Confidence.EXTRACTED
+
+
+def test_enum_method_call_resolves(tmp_path):
+    php = r"""<?php
+namespace App;
+enum Status: string {
+    case Draft = 'draft';
+    public function label(): string { return 'x'; }
+}
+class C {
+    public function __construct(private readonly Status $status) {}
+    public function run(): void { $this->status->label(); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "label", line_with(php, "$this->status->label()")))
+    target = result.targets[0]
+    assert (target.class_fqn, target.method) == ("App\\Status", "label")
+    assert target.confidence is Confidence.EXTRACTED
+
+
+def test_extension_class_keeps_its_root_namespace(tmp_path):
+    """`\\PDO` is PDO, never `App\\PDO`. The graph drops it later for want of a node."""
+    php = r"""<?php
+namespace App;
+class C {
+    public function __construct(private readonly \PDO $db) {}
+    public function run(string $sql): void { $this->db->prepare($sql); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "prepare", line_with(php, "$this->db->prepare($sql)")))
+    target = result.targets[0]
+    assert target.class_fqn == "PDO"
+    assert "App" not in target.class_fqn
+    assert target.confidence is Confidence.EXTRACTED
+
+
+def test_first_class_callable_syntax_resolves(tmp_path):
+    """`$x->m(...)` makes a Closure; the edge is emitted as a call by choice, see the source."""
+    declare(tmp_path, "App\\Service", {"Emails": ["reminderSubmitWeek"]})
+    php = r"""<?php
+namespace App;
+use App\Service\Emails;
+class C {
+    public function __construct(private readonly Emails $emails) {}
+    public function run(): callable { return $this->emails->reminderSubmitWeek(...); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "reminderSubmitWeek", line_with(php, "(...)")))
+    assert (result.targets[0].class_fqn, result.targets[0].method) == (
+        "App\\Service\\Emails", "reminderSubmitWeek")
+
+
+def test_named_arguments_resolve(tmp_path):
+    declare(tmp_path, "App\\Service", {"Emails": ["reminderSubmitWeek"]})
+    php = r"""<?php
+namespace App;
+use App\Service\Emails;
+class C {
+    public function __construct(private readonly Emails $emails) {}
+    public function run($u, $d): void { $this->emails->reminderSubmitWeek(user: $u, date: $d); }
+}
+"""
+    result = resolve(tmp_path, php, call("", "reminderSubmitWeek", line_with(php, "user: $u")))
+    assert (result.targets[0].class_fqn, result.targets[0].method) == (
+        "App\\Service\\Emails", "reminderSubmitWeek")
+
+
+# --- the corpus: declarations from files that hold no call site ----------------------------
+
+# A leaf service class has nothing unresolved in it, so it never appears among `sites`. Without
+# a corpus, whether its methods are known depends on whether some unrelated file happens to
+# carry a site — which is what made the same intersection resolve or not in the coordinator's
+# probe. `corpus` is the files the build already parsed; it is never a filesystem walk.
+
+
+def write_file(tmp_path: Path, name: str, php: str) -> str:
+    (tmp_path / name).write_text(php, encoding="utf-8")
+    return name
+
+
+CONSTITUENT_EMAILS = """<?php
+
+namespace App\\Service;
+
+class Emails
+{
+    public function reminderSubmitWeek(string $u): void {}
+}
+"""
+
+CONSTITUENT_LOGGABLE = """<?php
+
+namespace App\\Log;
+
+interface Loggable
+{
+    public function log(string $m): void;
+}
+"""
+
+CALLER_WITH_INTERSECTION = """<?php
+
+namespace App;
+
+use App\\Service\\Emails;
+use App\\Log\\Loggable;
+
+class Caller
+{
+    public function __construct(private readonly Emails&Loggable $both) {}
+
+    public function run(string $u): void
+    {
+        $this->both->reminderSubmitWeek($u);
+    }
+}
+"""
+
+
+def intersection_site(tmp_path: Path):
+    write_file(tmp_path, "Emails.php", CONSTITUENT_EMAILS)
+    write_file(tmp_path, "Loggable.php", CONSTITUENT_LOGGABLE)
+    write_file(tmp_path, "Caller.php", CALLER_WITH_INTERSECTION)
+    line = line_with(CALLER_WITH_INTERSECTION, "$this->both->reminderSubmitWeek($u);")
+    return CallSite("nid:1", "", "reminderSubmitWeek", "Caller.php", f"L{line}")
+
+
+def test_intersection_in_declaration_only_files_resolves_with_a_corpus(tmp_path):
+    """The shape that failed the probe: constituents in files with no call sites of their own."""
+    site = intersection_site(tmp_path)
+    result = SOURCE.resolve(str(tmp_path), [site], corpus=["Emails.php", "Loggable.php"])
+    assert result.unresolved == {}
+    target = result.targets[0]
+    assert (target.class_fqn, target.method) == ("App\\Service\\Emails", "reminderSubmitWeek")
+    assert target.confidence is Confidence.EXTRACTED
+    assert "intersection" in target.via
+
+
+def test_the_same_intersection_is_unresolved_without_a_corpus(tmp_path):
+    """Pins the difference the corpus makes, so it cannot regress unnoticed."""
+    site = intersection_site(tmp_path)
+    result = SOURCE.resolve(str(tmp_path), [site])
+    assert result.targets == []
+    assert result.unresolved == {Reason.UNKNOWN_RECEIVER_TYPE: 1}
+
+
+def test_corpus_turns_an_unknown_owner_into_a_disproof(tmp_path):
+    """A wider corpus means more classes are read, so absence becomes provable."""
+    write_file(tmp_path, "Plain.php", "<?php\nnamespace App;\nclass Plain { public function actual(): void {} }\n")
+    php = r"""<?php
+namespace App;
+class C {
+    public function __construct(private Plain $p) {}
+    public function run(): void { $this->p->typoed(); }
+}
+"""
+    write_file(tmp_path, "Subject.php", php)
+    site = CallSite("nid:1", "", "typoed", "Subject.php", f"L{line_with(php, '->typoed()')}")
+
+    without = SOURCE.resolve(str(tmp_path), [site])
+    assert [t.class_fqn for t in without.targets] == ["App\\Plain"], "unread class is emitted"
+
+    with_corpus = SOURCE.resolve(str(tmp_path), [site], corpus=["Plain.php"])
+    assert with_corpus.targets == []
+    assert with_corpus.unresolved == {Reason.METHOD_NOT_DECLARED: 1}
+
+
+def test_corpus_never_makes_it_refuse_a_class_it_did_not_read(tmp_path):
+    """The disproof rule is unchanged: a corpus that omits the owner still emits."""
+    write_file(tmp_path, "Plain.php", "<?php\nnamespace App;\nclass Plain { public function actual(): void {} }\n")
+    php = r"""<?php
+namespace App;
+use Elsewhere\Thing;
+class C {
+    public function __construct(private Thing $t) {}
+    public function run(): void { $this->t->whatever(); }
+}
+"""
+    write_file(tmp_path, "Subject.php", php)
+    site = CallSite("nid:1", "", "whatever", "Subject.php", f"L{line_with(php, '->whatever()')}")
+    result = SOURCE.resolve(str(tmp_path), [site], corpus=["Plain.php"])
+    assert result.unresolved == {}
+    assert result.targets[0].class_fqn == "Elsewhere\\Thing"
+
+
+def test_a_file_in_both_the_corpus_and_the_sites_is_parsed_once(tmp_path, monkeypatch):
+    import graphify_php.sources.tree_sitter_source as module
+
+    parsed: list[str] = []
+    original = module.scan_source
+
+    def counting(path, source, *args, **kwargs):
+        parsed.append(path)
+        return original(path, source, *args, **kwargs)
+
+    monkeypatch.setattr(module, "scan_source", counting)
+
+    site = intersection_site(tmp_path)
+    module.TreeSitterSource().resolve(
+        str(tmp_path), [site], corpus=["Emails.php", "Loggable.php", "Caller.php"]
+    )
+    assert sorted(parsed) == ["Caller.php", "Emails.php", "Loggable.php"]
+
+
+def test_a_corpus_entry_that_cannot_be_read_is_skipped_not_fatal(tmp_path):
+    site = intersection_site(tmp_path)
+    result = SOURCE.resolve(str(tmp_path), [site], corpus=["Emails.php", "Gone.php", "Loggable.php"])
+    assert result.targets[0].class_fqn == "App\\Service\\Emails"
+    # The missing file is not a site, so it is not counted as an unreadable one either.
+    assert result.unresolved == {}
+
+
+def test_an_empty_corpus_behaves_like_no_corpus(tmp_path):
+    site = intersection_site(tmp_path)
+    assert SOURCE.resolve(str(tmp_path), [site], corpus=[]).unresolved == {Reason.UNKNOWN_RECEIVER_TYPE: 1}

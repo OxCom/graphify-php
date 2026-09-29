@@ -29,12 +29,16 @@ that quarter.
 The pass runs inside graphify's build, after extraction:
 
 1. collects every member call graphify left unresolved, from `per_file[*]["raw_calls"]`;
-2. asks each configured **call target source** in precedence order for the receiver's class —
+2. hands the sources the PHP files graphify parsed as the `corpus` they may read declarations
+   from. A leaf service class has nothing unresolved in it, so it never appears among the sites,
+   and a source indexing only those files cannot tell whether it declares the method being
+   called on it. The set is bounded by the build, never by a filesystem walk;
+3. asks each configured **call target source** in precedence order for the receiver's class —
    the precise source (a PHP type engine that already knows the project's types) first, the
    tree-sitter parser second. A site the first source proves is never offered to the second, so
    a weaker source can add reach but can never overwrite a stronger source's answer;
-3. maps each `(class FQN, method)` to a graphify node id;
-4. appends `calls` edges carrying the target's confidence (`EXTRACTED` when the type was read
+4. maps each `(class FQN, method)` to a graphify node id;
+5. appends `calls` edges carrying the target's confidence (`EXTRACTED` when the type was read
    from source, `INFERRED` when it was derived) and `_resolver: "graphify-php"`, which is how a
    reader tells our edges from graphify's own and can drop them without a rebuild. `_via` names
    the technique that proved each one (`tree_sitter:promoted-parameter`, `tree_sitter:self-scope`,

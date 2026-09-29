@@ -20,7 +20,14 @@ except ImportError:  # pragma: no cover - exercised only on a broken install
 
 # Type positions in the grammar. A declaration carries exactly one of these as a child, so the
 # collectors name the set once here instead of repeating it at every declaration site.
-TYPE_KINDS = ("named_type", "union_type", "optional_type", "primitive_type", "intersection_type")
+TYPE_KINDS = (
+    "named_type",
+    "union_type",
+    "optional_type",
+    "primitive_type",
+    "intersection_type",
+    "disjunctive_normal_form_type",   # `(A&B)|C`, a disjunction whose branches are intersections
+)
 
 CLASS_KINDS = (
     "class_declaration",
@@ -110,19 +117,44 @@ def type_node(node):
 
 
 def is_union(node) -> bool:
-    """Is this type position more than one class?
+    """Is this type position an alternation — the object is ONE OF several classes?
 
-    Its own predicate because `type_name` collapses "no type here" and "two types here" into
-    None, and those two need different answers: a union is a refusal with a reason, an `int`
-    is simply not a call target.
+    `A|B` and `(A&B)|C` both are: there are two candidate targets and nothing in the type says
+    which. An intersection is deliberately not here. `A&B` is one object that is both things
+    at once, so a method declared in only one constituent is an unambiguous target, and
+    `intersection_members` handles it instead.
     """
     if node is None:
         return False
-    if node.type in ("union_type", "intersection_type"):
+    if node.type in ("union_type", "disjunctive_normal_form_type"):
         return True
     if node.type == "optional_type":
         return any(is_union(c) for c in node.children)
     return False
+
+
+def intersection_members(node) -> list[str]:
+    """The class names of an `A&B` type, or [] when this is not an intersection.
+
+    Only class names are returned: `A&int` is not expressible in PHP, so a member that reads
+    as a keyword is a parse this code does not understand and is dropped rather than guessed.
+    """
+    if node is None:
+        return []
+    if node.type == "optional_type":
+        for child in node.children:
+            found = intersection_members(child)
+            if found:
+                return found
+        return []
+    if node.type != "intersection_type":
+        return []
+    names = []
+    for child in node.children:
+        name = type_name(child)
+        if name:
+            names.append(name)
+    return names
 
 
 def type_name(node) -> str | None:
@@ -138,7 +170,7 @@ def type_name(node) -> str | None:
     """
     if node is None:
         return None
-    if node.type in ("union_type", "intersection_type", "primitive_type"):
+    if node.type in ("union_type", "disjunctive_normal_form_type", "intersection_type", "primitive_type"):
         return None
     if node.type in ("optional_type", "nullable_type"):
         for candidate in node.children:
