@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from ..ports import Confidence
 from .call_sites import CallSiteIndex
+from .routes import RouteDeclaration
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,9 @@ class FileFacts:
     classes: list[ClassScope] = field(default_factory=list)
     # The receivers graphify does not send: see `call_sites` for why they are read here.
     calls: CallSiteIndex = field(default_factory=CallSiteIndex)
+    # Route attributes declared in this file. Not a type fact, carried here because the file
+    # is what owns them and one parse should answer every question about it.
+    routes: list[RouteDeclaration] = field(default_factory=list)
 
     def class_at(self, line: int) -> ClassScope | None:
         """The innermost class whose body covers `line`.

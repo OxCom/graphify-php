@@ -14,6 +14,7 @@ from .call_sites import index_calls
 from .collectors import COLLECTORS, ScanContext, by_node_kind
 from .facts import ClassScope, FileFacts, MethodScope
 from .names import NameResolver
+from .routes import collect_routes
 
 
 def scan_source(path: str, source: bytes, collectors=None) -> FileFacts:
@@ -27,6 +28,7 @@ def scan_source(path: str, source: bytes, collectors=None) -> FileFacts:
     # A second pass rather than a hook in `_walk`: locating calls is not scope work, and
     # keeping it out means the walker still has one reason to change.
     facts.calls = index_calls(tree.root_node)
+    facts.routes = collect_routes(tree.root_node, names, path)
     return facts
 
 

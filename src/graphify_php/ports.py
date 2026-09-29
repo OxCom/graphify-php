@@ -130,3 +130,44 @@ class EdgeSink(Protocol):
 
     def add_call(self, caller_nid: str, callee_nid: str, target: CallTarget) -> None:
         ...
+
+
+@runtime_checkable
+class ScopeIndex(Protocol):
+    """What a scoped call needs from the graph, beside `NodeIndex`.
+
+    `Helper::format()` reaches graphify as a call to `Helper` with the method name dropped
+    (`extractors/engine.py`, the `scoped_call_expression` arm), so the site arrives without the
+    one field it exists to carry. The graph knows which methods a class declares, and a type
+    source can check each candidate against the line it came from — so the name is recoverable
+    without the integration layer parsing PHP. A class with ten methods costs ten lookups and
+    yields at most one edge.
+
+    Kept apart from `NodeIndex` because the two answer different questions and an index that
+    can do one need not do the other.
+    """
+
+    def scope_methods(self, caller_nid: str, scope: str) -> list[str]:
+        """Methods the named scope declares, for `self`, `parent`, `static` or a class name."""
+
+
+@runtime_checkable
+class RouteDeclarationSource(Protocol):
+    """Anything that can find route declarations in a codebase.
+
+    Same contract as `CallTargetSource`: a declaration is returned only when it was read, and a
+    route whose path could not be composed is counted under a fixed reason rather than guessed
+    into existence. It is a separate port because a route has no call site — forcing it through
+    `CallTargetSource` would mean inventing a `caller_nid`, and this package never invents node
+    identity.
+    """
+
+    name: str
+
+    def available(self, repo_root: str) -> tuple[bool, str]:
+        ...
+
+    def declarations(self, repo_root: str, files: Iterable[str]) -> object:
+        """Route declarations found in `files`. The concrete result type lives with the source,
+        because the shape of a declaration is the source's business and this port only needs to
+        name the call."""

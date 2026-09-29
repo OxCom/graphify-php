@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Protocol, Sequence, runtime_checkable
 
 from . import status
-from .ports import CallSite, CallTarget, CallTargetSource, EdgeSink, NodeIndex
+from .ports import CallSite, CallTarget, CallTargetSource, EdgeSink, NodeIndex, ScopeIndex
 
 RESOLVER_NAME = "php_member_calls"
 PHP_SUFFIXES = frozenset({".php"})
@@ -47,22 +47,6 @@ REASON_SCOPE_AMBIGUOUS = "scoped_method_ambiguous"
 _IDENTIFIER = re.compile(r"^[A-Za-z_\\][A-Za-z0-9_\\]*$")
 
 
-@runtime_checkable
-class ScopeIndex(Protocol):
-    """What a scoped call needs from the graph, kept apart from `ports.NodeIndex`.
-
-    `Helper::format()` reaches graphify as callee `Helper` with the method name dropped
-    (extractors/engine.py, the `scoped_call_expression` arm), so a scoped site arrives without
-    the one field `CallSite` exists to carry. The graph knows which methods a class declares,
-    and a type source can check a candidate against the line it came from, so the name is
-    recoverable without this module parsing PHP.
-
-    Declared here rather than added to `ports.NodeIndex` because `ports` is another author's
-    file; it belongs there, and the note in the report says so.
-    """
-
-    def scope_methods(self, caller_nid: str, scope: str) -> list[str]:
-        ...
 
 
 @dataclass
