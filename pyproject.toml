@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "graphify-php"
+version = "0.1.0"
+description = "PHP member-call resolution for graphify: binds $this->service->method() to the method node it calls."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Andrii Afanasiev" }]
+keywords = ["graphify", "php", "code-graph", "static-analysis", "call-graph"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+# No runtime dependencies on purpose. graphify and tree-sitter are supplied by the environment
+# that runs the build: this package is loaded into graphify's own process and pinning either of
+# them here would fight graphify's pins and could install a second, unused copy alongside the
+# one actually doing the work.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+graphify-php-build = "graphify_php.cli:_console_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/graphify_php"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

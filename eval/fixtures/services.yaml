@@ -1,0 +1,10 @@
+# Planted fake, same contract as the PHP literals: the key `mailer_password` may be indexed as
+# an identifier, its value must never leave the repository in an artifact.
+parameters:
+    mailer_password: 'CANARY-yaml-value-9f24e6b8d0'
+    mailer_host: 'mail.invalid'
+
+services:
+    Eval\Secrets\Mailer:
+        arguments:
+            $emails: '@Eval\Mail\Emails'

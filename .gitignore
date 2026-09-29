@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Written by the resolver during a build and read by the wrapper's publish gate.
+# It is per-build state, not source: committing it would let yesterday's record
+# satisfy today's gate, which is the failure the gate exists to catch.
+.graphify-php-status.json
+php-call-graph.jsonl
+graphify-out
+graphify-out/
+/var/www/knowledge-base/graphify/agentscopex/graphify-php/
+docs/kb
+.serena
+CLAUDE.md
