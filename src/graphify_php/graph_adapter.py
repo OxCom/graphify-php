@@ -18,6 +18,7 @@ from `.php` files):
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 from .ports import CallTarget, Confidence
@@ -187,6 +188,24 @@ class GraphNodeIndex:
                 return True
         return class_nid in self._with_ancestors([caller_class])
 
+    def method_node_in_file(self, source_file: str, class_fqn: str, method: str) -> str | None:
+        """`method_node`, resolved against a class declared in a known file.
+
+        A route attribute sits ON the controller class, so the file it was read from names the
+        class exactly — stronger evidence than any namespace-to-path guess, and it is what makes
+        the lookup work for the many real projects whose directory layout does not mirror their
+        namespace. Falls back to the namespace match when the file holds no such class.
+        """
+        parts = _fqn_parts(class_fqn)
+        if not parts:
+            return None
+        in_file = [c for c in self._classes_by_name.get(_key(parts[-1]), [])
+                   if c.get("source_file") == source_file]
+        chosen = in_file[0] if len(in_file) == 1 else self._class_node(class_fqn)
+        if chosen is None:
+            return None
+        return self._methods.get((chosen["id"], _key(method)))
+
     def owner_class(self, method_nid: str) -> str | None:
         """The class node a method node hangs off, by its `method` edge."""
         return self._owner_of.get(method_nid)
@@ -313,3 +332,87 @@ class GraphEdgeSink:
             edge["_refines"] = owner
         self._all_edges.append(edge)
         self.added += 1
+
+
+# A route declaration is not a call, so it needs a relation of its own. `routed_to` is already
+# taken by messenger transport routing (config/messaging.py:22) and means something else
+# entirely; reusing it would merge HTTP paths and message transports into one query.
+ROUTE_RELATION = "handled_by"
+ROUTE_NODE_KIND = "http_route"
+
+
+def _route_nid(node_key: str) -> str:
+    """A stable, readable id for a route declaration.
+
+    The slug is for a human reading the graph; the digest is what guarantees identity, because
+    two declarations differing only in punctuation (`/a-b` and `/a_b`) slug to the same string.
+    `hashlib`, not `hash()`, so the id is the same in every process and every build.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", node_key).strip("_").lower()[:80]
+    digest = hashlib.blake2b(node_key.encode("utf-8"), digest_size=4).hexdigest()
+    return f"route_{slug}_{digest}"
+
+
+class GraphRouteSink:
+    """Publishes one node and one edge per route declaration.
+
+    Separate from `GraphEdgeSink` because it adds NODES, which no call-target path ever does:
+    a route is a thing the graph did not previously contain, not a connection between two
+    things it already had. That is also why it is worth a status record of its own — a layer
+    that adds nothing looks exactly like a codebase with no routes.
+    """
+
+    def __init__(self, all_nodes: list[dict], all_edges: list[dict]) -> None:
+        self._all_nodes = all_nodes
+        self._all_edges = all_edges
+        self._by_id = {n.get("id") for n in all_nodes}
+        self._pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+        self.nodes_added = 0
+        self.edges_added = 0
+
+    def add_route(self, declaration, controller_nid: str | None) -> str | None:
+        """Emit the declaration's node, and its edge when the controller method is in the graph.
+
+        Returns the node id, or None when the declaration carries no path at all and so has
+        nothing to label a node with.
+        """
+        path = declaration.path or declaration.method_path
+        if not path:
+            return None
+
+        nid = _route_nid(declaration.node_key)
+        if nid not in self._by_id:
+            self._by_id.add(nid)
+            self._all_nodes.append({
+                "id": nid,
+                "label": path,
+                "source_file": declaration.source_file,
+                "source_location": f"L{declaration.line}",
+                "file_type": "code",
+                EDGE_MARKER: EDGE_ORIGIN,
+                "_kind": ROUTE_NODE_KIND,
+                "route_name": declaration.name or "",
+                "http_methods": list(declaration.methods),
+                # A path composed from only one half is a usable partial, not a whole answer,
+                # and a reader ranking routes needs to know which it is looking at.
+                "route_complete": declaration.path is not None,
+            })
+            self.nodes_added += 1
+
+        if controller_nid and (nid, controller_nid) not in self._pairs:
+            self._pairs.add((nid, controller_nid))
+            self._all_edges.append({
+                "source": nid,
+                "target": controller_nid,
+                "relation": ROUTE_RELATION,
+                "context": "route",
+                "confidence": Confidence.EXTRACTED.value,
+                "confidence_score": 1.0,
+                "source_file": declaration.source_file,
+                "source_location": f"L{declaration.line}",
+                "weight": 1.0,
+                EDGE_MARKER: EDGE_ORIGIN,
+                "_via": "attribute",
+            })
+            self.edges_added += 1
+        return nid

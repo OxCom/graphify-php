@@ -21,9 +21,11 @@ from importlib import import_module
 from typing import Sequence
 
 from .ports import CallTargetSource
-from .resolver import PHP_SUFFIXES, RESOLVER_NAME, make_resolver
+from .resolver import (PHP_SUFFIXES, RESOLVER_NAME, RESOLVER_NAME_ROUTES,
+                       make_resolver, make_route_resolver)
 
-__all__ = ["RESOLVER_NAME", "default_sources", "register"]
+__all__ = ["RESOLVER_NAME", "RESOLVER_NAME_ROUTES", "default_route_sources",
+           "default_sources", "register"]
 
 _registered = False
 
@@ -69,7 +71,23 @@ def default_sources(repo_root: str = ".") -> Sequence[CallTargetSource]:
     return tuple(assembled)
 
 
-def register(sources_factory=default_sources, repo_root: str = ".") -> bool:
+def default_route_sources(repo_root: str = "."):
+    """The shipped `RouteDeclarationSource` list.
+
+    Separate from `default_sources` because the two ports answer different questions and a
+    source implements one or the other. Same tolerance: a missing `sources` package means an
+    empty list and a recorded skip, not an import error inside graphify's swallowing driver.
+    """
+    try:
+        module = import_module(f"{__name__}.sources.route_source")
+    except ImportError:
+        return ()
+    source = getattr(module, "TreeSitterRouteSource", None)
+    return (source(),) if source is not None else ()
+
+
+def register(sources_factory=default_sources, repo_root: str = ".",
+             route_sources_factory=default_route_sources) -> bool:
     """Register the PHP resolver with graphify. Returns whether this call did the registering.
 
     Idempotent by name rather than by a flag alone: a process that imported this package twice
@@ -89,6 +107,13 @@ def register(sources_factory=default_sources, repo_root: str = ".") -> bool:
         name=RESOLVER_NAME,
         suffixes=PHP_SUFFIXES,
         resolve=make_resolver(sources_factory, repo_root),
+    ))
+    # A second pass, not a stage of the first: routes add nodes rather than connect existing
+    # ones, and a separate registration gives them a status record the build gate can require.
+    resolver_registry.register(resolver_registry.LanguageResolver(
+        name=RESOLVER_NAME_ROUTES,
+        suffixes=PHP_SUFFIXES,
+        resolve=make_route_resolver(route_sources_factory, repo_root),
     ))
     _registered = True
     return True

@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from . import status
-from .resolver import RESOLVER_NAME
+from .resolver import RESOLVER_NAME, RESOLVER_NAME_ROUTES
 
 EXIT_OK = 0
 EXIT_RESOLVER_FAILED = 2
@@ -119,9 +119,10 @@ def main(argv: Sequence[str] | None = None,
                         help="graph artifact to protect (default: $GRAPHIFY_OUT/graph.json)")
     parser.add_argument("--expect", action="append", dest="expect", default=None,
                         metavar="RESOLVER",
-                        help=f"resolver that must report (repeatable, default {RESOLVER_NAME})")
+                        help="resolver that must report (repeatable, default: every resolver "
+                             "this package registers)")
     opts = parser.parse_args(ours)
-    expected = opts.expect or [RESOLVER_NAME]
+    expected = opts.expect or [RESOLVER_NAME, RESOLVER_NAME_ROUTES]
     graph = opts.graph or default_graph_path()
 
     # A record from an earlier build would satisfy this build's gate, which is the one failure

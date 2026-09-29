@@ -143,6 +143,24 @@ The record path defaults to `graphify-out/.graphify-php-status.json` and is over
 `GRAPHIFY_PHP_STATUS`, so one machine can index many repositories without their builds sharing
 a file.
 
+## Routes
+
+A second registered pass publishes what `#[Route]` attributes declare. Each declaration becomes
+one node — labelled with the path template, carrying the route name, the HTTP methods and
+whether the path was composed whole — and one `handled_by` edge to the controller method that
+serves it. On the reference Symfony application: **156 route nodes, 156 edges, no refusals**.
+
+The node key is `Class::method#path`, so two controller methods declaring the same path stay two
+nodes. That is not hypothetical: the reference application declares 156 routes over 135 distinct
+path templates, the repeats being different HTTP verbs on one path.
+
+The relation is `handled_by`, not `routed_to` — the latter already means messenger transport
+routing, and merging the two would put HTTP paths and message transports in one query.
+
+A declaration whose controller method is missing from the graph still gets its node; only the
+edge is withheld, and the omission is counted under `controller_not_in_graph`. The path is a
+fact about the codebase either way.
+
 ## Verifying it works
 
 ```bash

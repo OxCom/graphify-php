@@ -27,7 +27,13 @@ def runner_writing(state, *, name=cli.RESOLVER_NAME, reason="", graph=None):
         if graph is not None:
             graph.write_text(json.dumps({"nodes": ["fresh"], "links": []}))
         if state is not None:
-            status.write([status.ResolverStatus(name=name, state=state, reason=reason)])
+            records = [status.ResolverStatus(name=name, state=state, reason=reason)]
+            if name != cli.RESOLVER_NAME_ROUTES:
+                # Every resolver this package registers must report, so a test about one of
+                # them still has to satisfy the other or it is testing the wrong refusal.
+                records.append(status.ResolverStatus(name=cli.RESOLVER_NAME_ROUTES,
+                                                     state="completed"))
+            status.write(records)
         return 0
     return run
 
@@ -136,6 +142,17 @@ def test_extra_expected_resolver_must_also_report(build):
                     run_graphify=runner_writing("completed", graph=build))
 
     assert code == cli.EXIT_RESOLVER_MISSING
+
+
+def test_the_default_gate_requires_every_resolver_this_package_registers(build, capsys):
+    def only_member_calls(args):
+        status.write([status.ResolverStatus(name=cli.RESOLVER_NAME, state="completed")])
+        return 0
+
+    code = cli.main([], run_graphify=only_member_calls)
+
+    assert code == cli.EXIT_RESOLVER_MISSING
+    assert cli.RESOLVER_NAME_ROUTES in capsys.readouterr().err
 
 
 def test_check_is_pure_and_needs_no_build():

@@ -340,3 +340,108 @@ def make_resolver(sources_factory: Callable[[str], Sequence[CallTargetSource]],
 
     resolve.__name__ = RESOLVER_NAME
     return resolve
+
+
+RESOLVER_NAME_ROUTES = "php_routes"
+
+# Reasons the route pass owns. A source's own reasons arrive prefixed with its name.
+REASON_ROUTE_NO_CONTROLLER = "controller_not_in_graph"
+REASON_ROUTE_NO_PATH = "route_had_no_path"
+
+
+def run_routes(
+    per_file: Sequence[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+    *,
+    sources: Sequence[object],
+    repo_root: str = ".",
+    index: NodeIndex | None = None,
+    sink=None,
+) -> status.ResolverStatus:
+    """Publish route declarations as nodes, each edged to the controller method that serves it.
+
+    A pass of its own rather than a stage of the member-call one, and with its own record, for
+    the reason this package exists: a layer that silently adds nothing is indistinguishable from
+    a codebase that has none of what it looks for. Routes were extracted and measured for a
+    while before anything connected them to the graph, and every test stayed green throughout,
+    because the tests checked extraction and nothing checked publication.
+    """
+    record = status.ResolverStatus(name=RESOLVER_NAME_ROUTES)
+    try:
+        if index is None or sink is None:
+            from .graph_adapter import GraphNodeIndex, GraphRouteSink
+            index = index or GraphNodeIndex(all_nodes, all_edges)
+            sink = sink or GraphRouteSink(all_nodes, all_edges)
+
+        unavailable: list[str] = []
+        usable: list[object] = []
+        for source in sources:
+            ok, reason = source.available(repo_root)
+            if ok:
+                usable.append(source)
+            else:
+                unavailable.append(f"{source.name}: {reason}")
+
+        # The same corpus the call sources get. A route lives in a controller file, which in
+        # practice always carries call sites too — but "in practice" is not a reason to hand a
+        # source a narrower set than the build parsed.
+        corpus = collect_corpus(per_file)
+        record.files_seen = len(corpus)
+        if not usable:
+            record.state = "skipped"
+            record.reason = "; ".join(unavailable) or "no route sources configured"
+            return record
+
+        declarations = []
+        for source in usable:
+            resolution = source.declarations(repo_root, corpus)
+            record.files_seen = max(record.files_seen, resolution.files_seen)
+            for reason, count in (resolution.unresolved or {}).items():
+                record.unresolvable(f"{source.name}:{reason}", count)
+            declarations.extend(resolution.declarations)
+
+        record.eligible_sites = len(declarations)
+        # The declaration names the file it was read from, and the controller class is declared
+        # in that same file. An index that can use it does; `ports.NodeIndex` cannot express it
+        # yet, so the narrow call stays the fallback.
+        in_file = getattr(index, "method_node_in_file", None)
+        for declaration in declarations:
+            controller_nid = (
+                in_file(declaration.source_file, declaration.controller_class,
+                        declaration.controller_method)
+                if callable(in_file)
+                else index.method_node(declaration.controller_class,
+                                       declaration.controller_method))
+            if controller_nid is None:
+                # The node still goes in: the declaration is a fact about this codebase whether
+                # or not the controller method survived extraction, and dropping it would hide
+                # the path. Only the edge is withheld.
+                record.unresolvable(REASON_ROUTE_NO_CONTROLLER)
+            if sink.add_route(declaration, controller_nid) is None:
+                record.unresolvable(REASON_ROUTE_NO_PATH)
+
+        record.resolved_sites = sink.nodes_added
+        record.edges_added = sink.edges_added
+        record.state = "completed"
+        if unavailable:
+            record.reason = "; ".join(unavailable)
+        return record
+    except Exception as exc:
+        record.state = "failed"
+        record.reason = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        record.finished_at = time.time()
+        status.write([record])
+
+
+def make_route_resolver(sources_factory: Callable[[str], Sequence[object]],
+                        repo_root: str = "."):
+    """Wrap `run_routes` in the shape graphify's registry calls."""
+    def resolve(per_file, all_nodes, all_edges) -> None:
+        run_routes(per_file, all_nodes, all_edges,
+                   sources=sources_factory(repo_root), repo_root=repo_root)
+
+    resolve.__name__ = RESOLVER_NAME_ROUTES
+    return resolve
