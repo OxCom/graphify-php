@@ -8,7 +8,7 @@ hangs off its file node by `contains`.
 
 from __future__ import annotations
 
-from graphify_php.graph_adapter import EDGE_ORIGIN, GraphEdgeSink, GraphNodeIndex
+from graphify_php.graph_adapter import EDGE_MARKER, EDGE_ORIGIN, GraphEdgeSink, GraphNodeIndex
 from graphify_php.ports import CallSite, CallTarget, Confidence
 
 
@@ -111,7 +111,7 @@ def test_sink_appends_a_marked_calls_edge():
 
     edge = all_edges[0]
     assert edge["relation"] == "calls"
-    assert edge["_origin"] == EDGE_ORIGIN
+    assert edge[EDGE_MARKER] == EDGE_ORIGIN
     assert edge["_via"] == "parser"
     assert edge["confidence"] == "EXTRACTED"
     assert edge["confidence_score"] == 1.0

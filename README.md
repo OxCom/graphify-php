@@ -35,9 +35,27 @@ The pass runs inside graphify's build, after extraction:
    a weaker source can add reach but can never overwrite a stronger source's answer;
 3. maps each `(class FQN, method)` to a graphify node id;
 4. appends `calls` edges carrying the target's confidence (`EXTRACTED` when the type was read
-   from source, `INFERRED` when it was derived) and `_origin: "graphify-php"`, which is how a
-   reader tells our edges from graphify's own `ast` and `semantic` ones and can drop them
-   without a rebuild.
+   from source, `INFERRED` when it was derived) and `_resolver: "graphify-php"`, which is how a
+   reader tells our edges from graphify's own and can drop them without a rebuild. `_via` names
+   the technique that proved each one (`tree_sitter:promoted-parameter`, `tree_sitter:self-scope`,
+   ...).
+
+The marker is not `_origin`: graphify overwrites that on every edge with `"ast"` after the
+resolvers run (`extract.py:8285-8289`), where it means the eviction tier rather than the author.
+
+### Scoped calls
+
+`self::`, `parent::`, `static::` and `Class::method()` reach graphify with `is_member_call`
+false and the **scope** as the callee — the method name is dropped
+(`extractors/engine.py:6147-6152`). The resolver recovers it without parsing PHP: it asks the
+graph which methods that class declares and offers each as a candidate, and the type source
+refuses every name not actually written on that line. A class with ten methods costs ten
+lookups and yields at most one edge.
+
+`Class::method()` additionally already has a coarse `caller -> Class` edge, because graphify
+resolves the scope name to the class node. Our method-level edge is a **second** edge between
+different endpoints, so both are published. The narrow one carries `_refines` naming the coarse
+one, so a consumer can collapse the pair instead of counting the call twice.
 
 A source returns a target only when it can prove it. Chained calls, dynamic names, `static::`
 and anything through `__call` are counted by reason, not guessed at: a wrong call edge is worse
@@ -85,6 +103,11 @@ Exit codes:
 | 3 | an expected resolver never reported at all |
 | other | graphify's own exit code, when graphify itself failed |
 
+The wrapper sets `PYTHONHASHSEED=0` before calling graphify. graphify re-execs itself to pin
+that seed for `update`, `extract`, `cluster-only` and `label` (`__main__.py:486-525`), and the
+re-exec would replace the process — losing both the registration and the gate. Setting the seed
+graphify would have set skips the re-exec and keeps its determinism guarantee.
+
 ## Why the wrapper exists
 
 graphify runs registered resolvers like this:
@@ -115,6 +138,17 @@ and silence, are not.
 The record path defaults to `graphify-out/.graphify-php-status.json` and is overridable with
 `GRAPHIFY_PHP_STATUS`, so one machine can index many repositories without their builds sharing
 a file.
+
+## Verifying it works
+
+```bash
+PYTHONPATH=src python -m pytest tests/test_cli_end_to_end.py -q
+```
+
+That test generates a small PHP project in a temporary directory, runs graphify over it twice —
+once plain, once with `register()` called first — and asserts the difference. On the generated
+fixture the plain build produces **1** `calls` edge and the registered build **5**. It needs no
+reference application and writes nothing outside `tmp_path`.
 
 ## Extending
 

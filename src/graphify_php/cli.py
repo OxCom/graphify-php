@@ -76,6 +76,13 @@ def check(record: dict, expected: Sequence[str]) -> tuple[int, str]:
 def _run_graphify(args: Sequence[str]) -> int:
     from graphify.__main__ import main as graphify_main
 
+    # graphify re-execs itself with PYTHONHASHSEED=0 for `update`, `extract`, `cluster-only` and
+    # `label` (__main__.py:486-525), which would replace this process — losing the registration
+    # made a moment ago and the gate that runs after. It skips the re-exec when the caller has
+    # already chosen a seed, so choosing the same one it would have keeps us in-process and
+    # keeps graphify's determinism guarantee intact.
+    os.environ.setdefault("PYTHONHASHSEED", "0")
+
     argv = sys.argv
     sys.argv = ["graphify", *args]
     try:
@@ -154,10 +161,23 @@ def main(argv: Sequence[str] | None = None,
             backup.unlink(missing_ok=True)
 
 
+def repo_root_from(args: Sequence[str]) -> str:
+    """The repository graphify was pointed at, which is what the type sources resolve against.
+
+    graphify takes it as a positional path (`graphify update <path>`), so the cwd is not it: a
+    build launched from anywhere else would hand the sources a root with no PHP under it.
+    """
+    for arg in args[1:]:
+        if not arg.startswith("-") and Path(arg).is_dir():
+            return arg
+    return "."
+
+
 def _console_main() -> None:
     from . import register
 
-    register()
+    _, passthrough = _split_argv(sys.argv[1:])
+    register(repo_root=repo_root_from(passthrough))
     sys.exit(main())
 
 
