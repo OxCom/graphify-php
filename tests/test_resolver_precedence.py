@@ -17,7 +17,10 @@ class FakeSource:
 
     def __init__(self, name, claims=(), available=(True, ""), unresolved=None, raises=None):
         self.name = name
-        self.claims = set(claims)
+        # A set of method names, or a map from method name to the `(class, method)` targets a
+        # site of that name receives, so one site can answer with the arms of a union.
+        self.claims = (dict(claims) if isinstance(claims, dict)
+                       else {m: [(f"App\\{m.capitalize()}Service", m)] for m in claims})
         self._available = available
         self._unresolved = dict(unresolved or {})
         self._raises = raises
@@ -32,9 +35,9 @@ class FakeSource:
         if self._raises:
             raise self._raises
         targets = [
-            CallTarget(site=s, class_fqn=f"App\\{s.method.capitalize()}Service",
-                       method=s.method, confidence=Confidence.EXTRACTED, via=self.name)
-            for s in sites if s.method in self.claims
+            CallTarget(site=s, class_fqn=cls, method=method,
+                       confidence=Confidence.EXTRACTED, via=self.name)
+            for s in sites for cls, method in self.claims.get(s.method, ())
         ]
         return Resolution(targets=targets, unresolved=dict(self._unresolved), files_seen=len(sites))
 
@@ -93,6 +96,57 @@ def test_first_source_wins_and_its_sites_are_not_offered_again():
     offered_to_parser = [s.method for s in parser.offered[0]]
     assert offered_to_parser == ["store"]
     assert {c[2].via for c in sink.calls} == {"precise", "parser"}
+
+
+@pytest.mark.parametrize("arms", [
+    [("App\\Emails", "get"), ("App\\Cache", "get"), ("App\\Emails", "get")],
+    [("App\\Cache", "get"), ("App\\Emails", "get"), ("App\\Cache", "get")],
+])
+def test_every_arm_of_a_union_site_becomes_an_edge_and_the_site_stays_claimed(arms):
+    precise = FakeSource("precise", claims={"get": arms})
+    parser = FakeSource("parser", claims={"get", "store"})
+    index = FakeIndex({("App\\Emails", "get"): "n_emails_get",
+                       ("App\\Cache", "get"): "n_cache_get",
+                       ("App\\StoreService", "store"): "n_store"})
+    sink = FakeSink()
+
+    record = resolver.run(per_file("get", "store"), [], [],
+                          sources=[precise, parser], index=index, sink=sink)
+
+    union_edges = {c[1] for c in sink.calls if c[0] == "caller_get"}
+    assert union_edges == {"n_emails_get", "n_cache_get"}
+    assert sink.added == 3
+    assert record.resolved_sites == 2
+    assert [s.method for s in parser.offered[0]] == ["store"]
+    assert "multiple_targets_for_site" not in record.unresolved
+    assert not hasattr(resolver, "REASON_DUPLICATE_TARGET")
+
+
+class FakeScopes:
+    """A `ScopeIndex` that declares the given methods for every scope it is asked about."""
+
+    def __init__(self, methods):
+        self.methods = list(methods)
+
+    def scope_methods(self, caller_nid, scope):
+        return self.methods
+
+
+def test_a_scoped_candidate_with_two_targets_is_ambiguous_and_emits_nothing():
+    source = FakeSource("precise", claims={"format": [("App\\A", "format"), ("App\\B", "format")]})
+    sink = FakeSink()
+    scoped = [{"nodes": [], "edges": [], "raw_calls": [
+        {"caller_nid": "caller_x", "callee": "Helper", "is_member_call": False,
+         "source_file": "src/Service/Thing.php", "source_location": "L10"},
+    ]}]
+
+    record = resolver.run(scoped, [], [], sources=[source],
+                          index=FakeIndex({("App\\A", "format"): "n_a", ("App\\B", "format"): "n_b"}),
+                          sink=sink, scopes=FakeScopes(["format"]))
+
+    assert sink.calls == []
+    assert record.eligible_sites == 1
+    assert record.unresolved[resolver.REASON_SCOPE_AMBIGUOUS] == 1
 
 
 def test_second_source_is_skipped_entirely_when_the_first_resolves_everything():

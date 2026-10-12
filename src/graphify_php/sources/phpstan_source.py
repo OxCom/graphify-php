@@ -28,7 +28,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable
 
 from graphify_php.ports import CallSite, CallTarget, Confidence, Resolution
 
@@ -50,7 +50,13 @@ REASON_RUN_FAILED = "phpstan-run-failed"
 REASON_NO_OUTPUT = "phpstan-no-output"
 REASON_MALFORMED = "phpstan-malformed-record"
 REASON_NOT_TYPED = "phpstan-receiver-not-typed"
-REASON_NOT_WIRED = "phpstan-collector-not-registered"
+# Two calls of one method on one line share a site key. Without `callPos` their records look
+# like the arms of a union receiver; with it, calls that prove different targets are refused.
+REASON_SAME_LINE_COLLISION = "same-line-collision"
+# The wrapper is written into the run's own temporary directory, so this fires only when that
+# directory is unwritable or the project config vanished mid-build — never for an ordinary
+# project that simply does not register the collector itself.
+REASON_NO_CONFIG = "phpstan-config-unavailable"
 
 # The two classes the project's own config must register. Without them PHPStan runs, analyses
 # the whole tree and writes nothing, which is indistinguishable from a project whose receivers
@@ -63,6 +69,28 @@ _RULE_CLASS = "CallGraph\\CallEdgeRule"
 # not a config this source can read.
 _MAX_INCLUDE_DEPTH = 8
 _MAX_CONFIG_BYTES = 1 << 20
+
+# The registration this source needs, as a config of its own. It is written to a temporary file
+# that `includes:` the project's config, so an adopting repository keeps its phpstan.neon exactly
+# as its CI runs it: the block cannot be committed there anyway, because the CallGraph classes
+# reach PHPStan only through our `--autoload-file` and a plain `vendor/bin/phpstan` would die on
+# "Class 'CallGraph\\JsonLinesWriter' not found" before analysing anything.
+_WRAPPER_NAME = "graphify-php-callgraph.neon"
+_WRAPPER_TEMPLATE = """includes:
+    - %s
+
+services:
+    -
+        class: CallGraph\\JsonLinesWriter
+    -
+        class: CallGraph\\MethodCallCollector
+        tags:
+            - phpstan.collector
+    -
+        class: CallGraph\\CallEdgeRule
+        tags:
+            - phpstan.rules.rule
+"""
 
 # The one exception, and it is a diagnostic rather than a work item: without the first stderr
 # line an unattended failure is indistinguishable from a project that simply has no calls.
@@ -89,6 +117,7 @@ class PhpStanCall:
     callee_is_interface: bool
     file: str
     line: int
+    call_pos: int | None = None
 
     @staticmethod
     def from_json(raw: object) -> "PhpStanCall | None":
@@ -109,6 +138,9 @@ class PhpStanCall:
             return None
         if not callee_class or not callee_method:
             return None
+        call_pos = raw.get("callPos")
+        if isinstance(call_pos, bool) or not isinstance(call_pos, int):
+            call_pos = None
         return PhpStanCall(
             caller_class=str(raw.get("callerClass", "")),
             caller_method=str(raw.get("callerMethod", "")),
@@ -117,6 +149,7 @@ class PhpStanCall:
             callee_is_interface=raw.get("calleeKind") == "interface",
             file=file,
             line=line,
+            call_pos=call_pos,
         )
 
     @property
@@ -162,12 +195,6 @@ class EnvironmentProbe:
             return False, REASON_UNAVAILABLE, f"no {' or '.join(_CONFIG_NAMES)} in {repo_root}"
         if shutil.which("php") is None:
             return False, REASON_UNAVAILABLE, "no php executable on PATH"
-        missing = self.missing_wiring(config)
-        if missing:
-            return False, REASON_NOT_WIRED, (
-                f"{config.name} does not register {' and '.join(missing)}; "
-                f"add the services block from php/README.md"
-            )
         return True, "", ""
 
     def config_path(self, repo_root: str) -> Path | None:
@@ -182,8 +209,12 @@ class EnvironmentProbe:
 
         PHPStan builds its rules from the config alone: `--autoload-file` makes the classes
         loadable, it does not register them. An unregistered collector produces a clean exit,
-        an empty output file and a full-length run, so this is checked before launching rather
+        an empty output file and a full-length run, so this is answered before launching rather
         than inferred from the silence afterwards.
+
+        A project that registers them itself is run on its own config untouched. Everything else
+        is run on a generated wrapper, so the answer here picks a path and never refuses one:
+        registering twice would attach two collectors and duplicate every record.
         """
         text = self._config_closure(config)
         return tuple(name for name in (_COLLECTOR_CLASS, _RULE_CLASS) if name not in text)
@@ -244,6 +275,26 @@ class PhpStanRunner:
         except ValueError:
             return _DEFAULT_TIMEOUT_S
 
+    def config_for(self, repo_root: str, workdir: Path) -> Path | None:
+        """The config PHPStan is launched with: the project's own, or a wrapper including it.
+
+        The wrapper lives in the run's temporary directory rather than in the repository, so a
+        build leaves no file behind and two builds cannot race over one. PHPStan resolves the
+        relative paths inside an included config against THAT config's directory, so the
+        project's `paths:`, `excludePaths:` and its own `includes:` keep pointing where they did.
+        """
+        project = self._probe.config_path(repo_root)
+        if project is None:
+            return None
+        if not self._probe.missing_wiring(project):
+            return project
+        wrapper = workdir / _WRAPPER_NAME
+        try:
+            wrapper.write_text(_WRAPPER_TEMPLATE % project.resolve(), encoding="utf-8")
+        except OSError:
+            return None
+        return wrapper
+
     def command(self, repo_root: str, config: Path) -> list[str]:
         argv = [
             str(Path(repo_root) / _BINARY),
@@ -263,9 +314,9 @@ class PhpStanRunner:
         return argv
 
     def run(self, repo_root: str, output_path: Path) -> RunOutcome:
-        config = self._probe.config_path(repo_root)
+        config = self.config_for(repo_root, output_path.parent)
         if config is None:
-            return RunOutcome(False, REASON_UNAVAILABLE)
+            return RunOutcome(False, REASON_NO_CONFIG)
 
         env = dict(os.environ)
         env["PHP_CALL_GRAPH_OUT"] = str(output_path)
@@ -343,10 +394,12 @@ class PhpStanSource:
             unresolved[_failure_reason(outcome)] = len(wanted)
             return Resolution([], unresolved, 0)
 
-        targets = list(_match(wanted, calls, repo_root))
+        targets, collisions = _match(wanted, calls, repo_root)
+        if collisions:
+            unresolved[REASON_SAME_LINE_COLLISION] = collisions
         # CallSite is frozen and hashable, so the set counts distinct sites that got at
         # least one target; a site with two targets is one site, not two.
-        missed = len(wanted) - len({target.site for target in targets})
+        missed = len(wanted) - len({target.site for target in targets}) - collisions
         if missed > 0:
             unresolved[REASON_NOT_TYPED] = missed
 
@@ -469,18 +522,43 @@ def _line_of(source_location: str) -> int:
     return int(found.group())
 
 
-def _match(sites: list[CallSite], calls: list[PhpStanCall], repo_root: str) -> Iterator[CallTarget]:
+def _match(sites: list[CallSite], calls: list[PhpStanCall],
+           repo_root: str) -> tuple[list[CallTarget], int]:
+    """Targets for each site, and how many sites were refused as same-line collisions.
+
+    A site key is file, line and method, so `$a->get(); $b->get();` on one line lands in one
+    bucket together with the arms of a `Emails|Cache` receiver. The arms share the call's token
+    position and the two calls do not. The site is one of the calls and nothing says which, so
+    it is emitted only when every call in the bucket proves the same target set: the common
+    `$a->getId() === $b->getId()` keeps its edge, and two calls proving different targets are
+    refused rather than merged into a union that is not in the code.
+    """
     by_key: dict[tuple[str, int, str], list[PhpStanCall]] = {}
     for call in calls:
         by_key.setdefault(_site_key(call.file, call.line, call.callee_method, repo_root), []).append(call)
 
+    targets: list[CallTarget] = []
+    collisions = 0
     for site in sites:
         key = _site_key(site.source_file, _line_of(site.source_location), site.method, repo_root)
-        for call in by_key.get(key, ()):
-            yield CallTarget(
+        matched = by_key.get(key, ())
+        arms_by_call: dict[int | None, set[tuple[str, str]]] = {}
+        for call in matched:
+            arms_by_call.setdefault(call.call_pos, set()).add((call.callee_class, call.callee_method))
+        if len({frozenset(arms) for arms in arms_by_call.values()}) > 1:
+            collisions += 1
+            continue
+        seen: set[tuple[str, str]] = set()
+        for call in matched:
+            arm = (call.callee_class, call.callee_method)
+            if arm in seen:
+                continue
+            seen.add(arm)
+            targets.append(CallTarget(
                 site=site,
                 class_fqn=call.callee_class,
                 method=call.callee_method,
                 confidence=Confidence.EXTRACTED,
                 via=call.via,
-            )
+            ))
+    return targets, collisions

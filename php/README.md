@@ -38,8 +38,14 @@ PHP_CALL_GRAPH_OUT=/tmp/calls.jsonl \
 A project that would rather own the autoloading can add `"CallGraph\\": "php/src/CallGraph/"`
 to its composer `autoload-dev` and drop the option.
 
-`graphify-php`'s `phpstan` source passes `--autoload-file` itself, so an adopter using it only
-needs the `services:` block above.
+`graphify-php`'s `phpstan` source needs neither step from the adopter: it passes
+`--autoload-file` itself and writes the `services:` block into a wrapper config in its own
+temporary directory that `includes:` the project's `phpstan.neon`. The block is deliberately not
+committed to the project, because the `CallGraph\` classes arrive only through that option and
+a plain `vendor/bin/phpstan` — the one CI runs — would fail on
+`Class 'CallGraph\JsonLinesWriter' not found` before analysing anything. A project that adds
+the block to its own config anyway is run on that config untouched; registering the collector
+twice duplicates every record.
 
 Verified against PHPStan 2.2.8 on PHP 8.4.
 
@@ -49,8 +55,12 @@ Verified against PHPStan 2.2.8 on PHP 8.4.
 in the working directory. One JSON object per line:
 
 ```json
-{"callerClass":"App\\Controller","callerMethod":"run","calleeClass":"App\\Mailer","calleeMethod":"send","calleeKind":"interface","line":21,"file":"/srv/app/src/Controller.php"}
+{"callerClass":"App\\Controller","callerMethod":"run","calleeClass":"App\\Mailer","calleeMethod":"send","calleeKind":"interface","line":21,"file":"/srv/app/src/Controller.php","callPos":148}
 ```
+
+`callPos` is the token offset of the called method's name, `-1` when the parser did not record
+one. A union receiver (`Emails|Cache`) yields one record per arm with the same `callPos`; two
+calls of one method on one line yield different values, so a consumer can tell the two apart.
 
 `calleeKind` is `interface` when the method is declared on an interface. That edge names a
 contract, not a body: there is no code behind `App\Mailer::send`, and a consumer that treats it

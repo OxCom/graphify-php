@@ -52,7 +52,10 @@ class ResolverStatus:
     eligible_sites: int = 0         # member calls this resolver could have resolved
     resolved_sites: int = 0         # ... and did
     edges_added: int = 0
-    unresolved: dict = field(default_factory=dict)   # reason -> count
+    # reason -> count. The unit differs by reason: source reasons count sites, `probe:` reasons
+    # count candidate names, `scoped_method_*` count scoped groups, and the graph-lookup reasons
+    # (`target_not_in_graph`, `self_call`) count target records, so a two-arm site can appear twice.
+    unresolved: dict = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
 

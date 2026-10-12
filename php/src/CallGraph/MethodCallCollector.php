@@ -101,6 +101,10 @@ final class MethodCallCollector implements Collector
             $methodName,
             $declaring->isInterface(),
             $node->getStartLine(),
+            '',
+            // The method name's token, not the expression's: in a chain `$a->get()->get()` every
+            // link starts at `$a`, and the name is the one token each call owns alone.
+            $node->name->getStartTokenPos(),
         );
     }
 }

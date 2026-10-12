@@ -421,7 +421,7 @@ SITES: tuple[LabelledSite, ...] = (
         site_id="nullable_union.php:23:$this->either->get",
         stratum=Stratum.UNION_TYPE,
         expectation=Expectation.RESOLVE,
-        in_scope=False,
+        in_scope=True,
         path="nullable_union.php",
         line=23,
         receiver="$this->either",
@@ -429,9 +429,10 @@ SITES: tuple[LabelledSite, ...] = (
         caller="Eval\\Variance\\Variant::unionCall",
         accepted=(_set(_t(_EMAILS, "get"), _t(_CACHE, "get")),),
         why=(
-            "`Emails|Cache` has two real targets. Out of scope because this version cannot "
-            "express two; a resolver that picks one alternative is wrong, not partly right, "
-            "and exact target-set accuracy is the number that says so."
+            "`Emails|Cache` has two real targets and the resolver emits both arms: PHPStan "
+            "reports one record per arm under one call position, and every target a source "
+            "proves for a site is kept. One arm alone is wrong, not partly right, and exact "
+            "target-set accuracy is the number that says so."
         ),
         trap=True,
     ),

@@ -40,7 +40,6 @@ PHP_SUFFIXES = frozenset({".php"})
 REASON_NO_SOURCE = "no_source_resolved"
 REASON_NOT_IN_GRAPH = "target_not_in_graph"
 REASON_SELF_CALL = "self_call"
-REASON_DUPLICATE_TARGET = "multiple_targets_for_site"
 REASON_SCOPE_NOT_RECOVERED = "scoped_method_not_recovered"
 REASON_SCOPE_AMBIGUOUS = "scoped_method_ambiguous"
 
@@ -191,13 +190,15 @@ def _ask_sources(
         for reason, count in (resolution.unresolved or {}).items():
             record.unresolvable(f"{reason_prefix}{source.name}:{reason}", count)
 
+        # A site keeps every target a source proved for it: a `Emails|Cache` receiver has two
+        # real arms, and one arm alone is a wrong answer. Only an exact repeat is dropped.
         claimed: set[CallSite] = set()
+        seen: set[tuple[CallSite, str, str]] = set()
         for target in resolution.targets:
-            if target.site in claimed:
-                # Two answers for one site from one source. Keeping the first is arbitrary,
-                # so the extra is counted rather than quietly dropped.
-                record.unresolvable(REASON_DUPLICATE_TARGET)
+            key = (target.site, target.class_fqn, target.method)
+            if key in seen:
                 continue
+            seen.add(key)
             claimed.add(target.site)
             targets.append(target)
         pending = [site for site in pending if site not in claimed]
@@ -223,19 +224,20 @@ def _resolve_groups(
     if not groups:
         return []
     probes = [site for group in groups for site in group.candidates]
-    found = {t.site: t for t in _ask_sources(sources, repo_root, probes, record,
-                                             reason_prefix="probe:", count_unclaimed=False,
-                                             corpus=corpus)}
+    found: dict[CallSite, list[CallTarget]] = {}
+    for target in _ask_sources(sources, repo_root, probes, record, reason_prefix="probe:",
+                               count_unclaimed=False, corpus=corpus):
+        found.setdefault(target.site, []).append(target)
     targets: list[CallTarget] = []
     for group in groups:
-        hits = [found[site] for site in group.candidates if site in found]
+        hits = [target for site in group.candidates for target in found.get(site, ())]
         if len(hits) == 1:
             targets.append(hits[0])
         elif not hits:
             record.unresolvable(REASON_SCOPE_NOT_RECOVERED)
         else:
-            # Two candidate names both verified against the same line. One of them is wrong and
-            # nothing here says which, so the site gets no edge.
+            # Two candidate names verified against one line, or one name with two targets.
+            # Either way nothing here says which body is called, so the site gets no edge.
             record.unresolvable(REASON_SCOPE_AMBIGUOUS)
     return targets
 
@@ -250,6 +252,8 @@ def _write_edges(
     # offers a wider call and is used when present. The report asks for the caller to be added
     # to the port; until then this keeps `ports` untouched and fake indexes in tests working.
     origin_aware = getattr(index, "method_node_for", None)
+    # Counted per target record, not per site: a union site with one arm missing from the graph
+    # still gets its other arm, and the histogram says how many records were lost.
     for target in targets:
         callee_nid = (origin_aware(target.site.caller_nid, target.class_fqn, target.method)
                       if callable(origin_aware)

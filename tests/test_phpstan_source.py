@@ -105,24 +105,46 @@ class TestAvailability:
 
 
 class TestWiring:
-    """The collector check.
+    """Where the collector registration comes from.
 
-    Without the `services:` block PHPStan exits clean, writes nothing, and the source reported
-    `phpstan-no-output` for every site — a full-length run whose silence looked exactly like a
-    project of untyped receivers. Measured on one Symfony application: 6803 sites counted under
-    that reason, 855 edges instead of 2990.
+    PHPStan builds its rules from the config alone, and the `CallGraph` classes reach it only
+    through our `--autoload-file` — so the block cannot live in the project's committed config:
+    a plain `vendor/bin/phpstan` would die on "Class 'CallGraph\\JsonLinesWriter' not found"
+    before analysing anything. The source therefore supplies the registration itself, through a
+    wrapper config that `includes:` the project's own.
     """
 
-    def test_unwired_config_is_a_reason_not_a_run(self, tmp_path):
+    def test_unwired_project_is_still_available(self, tmp_path):
         ok, reason = ps.PhpStanSource().available(str(make_repo(tmp_path, wired=False)))
-        assert ok is False
-        assert "MethodCallCollector" in reason
-
-    def test_wired_config_is_available(self, tmp_path):
-        ok, reason = ps.PhpStanSource().available(str(make_repo(tmp_path)))
         assert (ok, reason) == (True, "")
 
-    def test_rule_without_collector_is_still_unwired(self, tmp_path):
+    def test_unwired_project_gets_a_generated_wrapper(self, tmp_path):
+        root = make_repo(tmp_path, wired=False)
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        config = ps.PhpStanRunner().config_for(str(root), workdir)
+        assert config.parent == workdir
+        text = config.read_text()
+        assert str((root / "phpstan.neon").resolve()) in text
+        assert "CallGraph\\MethodCallCollector" in text
+        assert "CallGraph\\CallEdgeRule" in text
+
+    def test_wrapper_never_lands_in_the_repository(self, tmp_path):
+        root = make_repo(tmp_path, wired=False)
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        ps.PhpStanRunner().config_for(str(root), workdir)
+        assert list(root.glob("*.neon")) == [root / "phpstan.neon"]
+
+    def test_a_project_that_registers_them_itself_runs_on_its_own_config(self, tmp_path):
+        root = make_repo(tmp_path)
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        config = ps.PhpStanRunner().config_for(str(root), workdir)
+        # Registering twice would attach two collectors and duplicate every record.
+        assert config == root / "phpstan.neon"
+
+    def test_rule_without_collector_still_counts_as_unwired(self, tmp_path):
         root = make_repo(tmp_path, wired=False)
         (root / "phpstan.neon").write_text(
             "services:\n\t-\n\t\tclass: CallGraph\\CallEdgeRule\n")
@@ -135,35 +157,30 @@ class TestWiring:
         (root / "build" / "call-graph.neon").write_text(WIRING)
         (root / "phpstan.neon").write_text(
             "includes:\n\t- build/call-graph.neon\n\nparameters:\n\tlevel: 5\n")
-        ok, _reason = ps.PhpStanSource().available(str(root))
-        assert ok is True
+        assert ps.EnvironmentProbe().missing_wiring(root / "phpstan.neon") == ()
 
     def test_include_cycle_terminates(self, tmp_path):
         root = make_repo(tmp_path, wired=False)
         (root / "other.neon").write_text("includes:\n\t- phpstan.neon\n")
         (root / "phpstan.neon").write_text("includes:\n\t- other.neon\n")
-        ok, _reason = ps.PhpStanSource().available(str(root))
-        assert ok is False
+        assert len(ps.EnvironmentProbe().missing_wiring(root / "phpstan.neon")) == 2
 
     def test_a_missing_include_does_not_raise(self, tmp_path):
         root = make_repo(tmp_path, wired=False)
         (root / "phpstan.neon").write_text(
             "includes:\n\t- vendor/nothing/here.neon\n" + WIRING)
-        ok, _reason = ps.PhpStanSource().available(str(root))
-        assert ok is True
+        assert ps.EnvironmentProbe().missing_wiring(root / "phpstan.neon") == ()
 
     def test_placeholder_include_is_skipped_not_guessed(self, tmp_path):
         root = make_repo(tmp_path, wired=False)
         (root / "phpstan.neon").write_text("includes:\n\t- %rootDir%/conf/config.neon\n")
         assert ps._includes((root / "phpstan.neon").read_text()) == []
 
-    def test_unwired_repository_never_launches_phpstan(self, tmp_path):
-        runner = FakeRunner(ps.RunOutcome(True), [json.dumps(record())])
-        source = ps.PhpStanSource(runner=runner)
-        result = source.resolve(str(make_repo(tmp_path, wired=False)), [site()])
-        assert runner.calls == []
-        assert result.targets == []
-        assert result.unresolved == {ps.REASON_NOT_WIRED: 1}
+    def test_a_repository_without_a_config_cannot_be_wrapped(self, tmp_path):
+        root = make_repo(tmp_path, config=False)
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        assert ps.PhpStanRunner().config_for(str(root), workdir) is None
 
     def test_missing_binary_still_counts_as_unavailable(self, tmp_path):
         runner = FakeRunner(ps.RunOutcome(True), [])
@@ -183,6 +200,13 @@ class TestRecordParsing:
         call = ps.PhpStanCall.from_json(record(calleeClass="App\\Mailer", calleeKind="interface"))
         assert call.callee_is_interface is True
         assert call.via == ps.VIA_INTERFACE
+
+    def test_call_position_is_read_when_present(self):
+        assert ps.PhpStanCall.from_json(record(callPos=412)).call_pos == 412
+
+    @pytest.mark.parametrize("over", [{}, {"callPos": None}, {"callPos": "412"}])
+    def test_call_position_is_none_when_absent_or_not_an_int(self, over):
+        assert ps.PhpStanCall.from_json(record(**over)).call_pos is None
 
     @pytest.mark.parametrize(
         "raw",
@@ -283,6 +307,61 @@ class TestResolve:
 
         by_method = {t.method: t.class_fqn for t in result.targets}
         assert by_method == {"factory": "App\\Controller", "send": "App\\Emails"}
+
+    def test_union_arms_of_one_call_are_all_emitted(self, tmp_path):
+        root = make_repo(tmp_path)
+        path = str(root / "src/App.php")
+        lines = [
+            json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Emails", callPos=40)),
+            json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Cache", callPos=40)),
+        ]
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(str(root), [site(method="get")])
+
+        assert {t.class_fqn for t in result.targets} == {"App\\Emails", "App\\Cache"}
+        assert ps.REASON_SAME_LINE_COLLISION not in result.unresolved
+        assert ps.REASON_NOT_TYPED not in result.unresolved
+
+    def test_two_calls_of_one_method_on_one_line_are_refused_not_merged(self, tmp_path):
+        root = make_repo(tmp_path)
+        path = str(root / "src/App.php")
+        lines = [
+            json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Emails", callPos=40)),
+            json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Cache", callPos=58)),
+        ]
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(str(root), [site(method="get")])
+
+        assert result.targets == []
+        assert result.unresolved[ps.REASON_SAME_LINE_COLLISION] == 1
+
+    def test_two_calls_on_one_line_proving_the_same_target_keep_it(self, tmp_path):
+        root = make_repo(tmp_path)
+        path = str(root / "src/App.php")
+        lines = [
+            json.dumps(record(file=path, calleeMethod="getId", calleeClass="App\\User", callPos=40)),
+            json.dumps(record(file=path, calleeMethod="getId", calleeClass="App\\User", callPos=58)),
+        ]
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(str(root), [site(method="getId")])
+
+        assert [t.class_fqn for t in result.targets] == ["App\\User"]
+        assert ps.REASON_SAME_LINE_COLLISION not in result.unresolved
+
+    def test_records_without_call_position_still_yield_every_distinct_target(self, tmp_path):
+        root = make_repo(tmp_path)
+        path = str(root / "src/App.php")
+        lines = [
+            json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Emails")),
+            json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Cache")),
+        ]
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(str(root), [site(method="get")])
+
+        assert {t.class_fqn for t in result.targets} == {"App\\Emails", "App\\Cache"}
+
+    def test_identical_duplicate_records_yield_one_target(self, tmp_path):
+        root = make_repo(tmp_path)
+        line = json.dumps(record(file=str(root / "src/App.php"), callPos=40))
+        result = source_with(FakeRunner(ps.RunOutcome(True), [line, line])).resolve(str(root), [site()])
+
+        assert len(result.targets) == 1
 
     def test_relative_and_absolute_site_paths_agree(self, tmp_path):
         root = make_repo(tmp_path)

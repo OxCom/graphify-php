@@ -25,6 +25,7 @@ final class CallEdge
         private readonly string $calleeKind,
         private readonly int $line,
         private readonly string $file,
+        private readonly int $callPos,
     ) {
     }
 
@@ -36,13 +37,14 @@ final class CallEdge
         bool $calleeIsInterface,
         int $line,
         string $file = '',
+        int $callPos = -1,
     ): self {
         $kind = match ($calleeIsInterface) {
             true => self::RECEIVER_INTERFACE,
             false => self::RECEIVER_CLASS,
         };
 
-        return new self($callerClass, $callerMethod, $calleeClass, $calleeMethod, $kind, $line, $file);
+        return new self($callerClass, $callerMethod, $calleeClass, $calleeMethod, $kind, $line, $file, $callPos);
     }
 
     /**
@@ -58,6 +60,7 @@ final class CallEdge
             (string) ($raw['calleeKind'] ?? self::RECEIVER_CLASS),
             (int) ($raw['line'] ?? 0),
             $file,
+            (int) ($raw['callPos'] ?? -1),
         );
     }
 
@@ -74,6 +77,9 @@ final class CallEdge
             'calleeKind' => $this->calleeKind,
             'line' => $this->line,
             'file' => $this->file,
+            // Token offset of the called method's name. Two arms of one union receiver share it;
+            // two calls of the same method on one line do not, and the Python half tells them apart.
+            'callPos' => $this->callPos,
         ];
     }
 }
