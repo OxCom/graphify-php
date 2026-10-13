@@ -35,6 +35,7 @@ lint = ["ruff>=0.15"]
 
 [project.scripts]
 graphify-php-build = "graphify_php.cli:_console_main"
+graphify-shrink-check = "graphify_php.shrink_cli:_console_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/graphify_php"]

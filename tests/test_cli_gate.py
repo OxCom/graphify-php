@@ -21,6 +21,9 @@ def build(tmp_path, monkeypatch):
     graph.write_text(json.dumps({"nodes": ["previous"], "links": []}))
     monkeypatch.setenv(status.STATUS_PATH_ENV, str(out / ".graphify-php-status.json"))
     monkeypatch.setenv("GRAPHIFY_PHP_GRAPH", str(graph))
+    # These stub graphs swap one bare node for another, which the shrink guard rightly refuses.
+    # The shrink guard has its own tests (test_cli_shrink_gate.py); these cover the resolver gate.
+    monkeypatch.setenv("GRAPHIFY_SHRINK_POLICY", "off")
     return graph
 
 
