@@ -147,6 +147,21 @@ def _pairs(edges: list[dict]) -> set[tuple[str, str]]:
     return {(e["source"], e["target"]) for e in edges}
 
 
+# The four calls in the fixture this package can bind, and the type source that proves each.
+# Which of them graphify binds itself depends on its version, so the tests below check that
+# every one ends up bound exactly once, by either side, rather than who bound it.
+FIXTURE_TARGETS = {
+    ".reminderSubmitWeek()": "tree_sitter:promoted-parameter",
+    ".tidy()": "tree_sitter:self-scope",
+    ".boot()": "tree_sitter:parent-scope",
+    ".format()": "tree_sitter:class-scope",
+}
+
+
+def _ours(graph: dict) -> list[dict]:
+    return [e for e in _calls(graph) if e.get("_via")]
+
+
 @pytest.fixture(scope="module")
 def builds(tmp_path_factory):
     root = tmp_path_factory.mktemp("e2e")
@@ -155,12 +170,11 @@ def builds(tmp_path_factory):
 
 def test_registering_adds_call_edges(builds):
     (plain, _), (registered, _) = builds
-    plain_label = {n["id"]: n["label"] for n in plain["nodes"]}
-    ours = [e for e in _calls(registered) if e.get("_via")]
+    ours = _ours(registered)
 
-    # graphify >= 0.9.87 binds the three `::` calls to their methods itself; older versions
-    # record one coarse edge to the Helper class. No version resolves the property-typed call.
-    assert ".reminderSubmitWeek()" not in {plain_label[e["target"]] for e in _calls(plain)}
+    # graphify >= 0.9.87 binds the three `::` calls to their methods itself, and 0.9.89 also
+    # binds the property-typed call; this package skips a pair graphify already connected.
+    assert ours, "registering added no call edge at all"
 
     pairs = [(e["source"], e["target"]) for e in _calls(registered)]
     assert len(pairs) == len(set(pairs)), "a pair graphify already connected got a second edge"
@@ -170,13 +184,14 @@ def test_registering_adds_call_edges(builds):
 def test_every_pattern_in_the_fixture_resolves(builds):
     (_, _), (registered, _) = builds
     label = {n["id"]: n["label"] for n in registered["nodes"]}
-    ours = {label[e["target"]]: e for e in _calls(registered) if e.get("_via")}
+    ours = {label[e["target"]]: e for e in _ours(registered)}
+    bound = [label[e["target"]] for e in _calls(registered)]
 
-    assert set(ours) == {".reminderSubmitWeek()", ".tidy()", ".boot()", ".format()"}
-    assert ours[".reminderSubmitWeek()"]["_via"] == "tree_sitter:promoted-parameter"
-    assert ours[".tidy()"]["_via"] == "tree_sitter:self-scope"
-    assert ours[".boot()"]["_via"] == "tree_sitter:parent-scope"
-    assert ours[".format()"]["_via"] == "tree_sitter:class-scope"
+    # Every pattern is bound exactly once, whichever side bound it.
+    assert all(bound.count(target) == 1 for target in FIXTURE_TARGETS), bound
+    assert ours and set(ours) <= set(FIXTURE_TARGETS)
+    for target, edge in ours.items():
+        assert edge["_via"] == FIXTURE_TARGETS[target]
     assert all(e["confidence"] == "EXTRACTED" for e in ours.values())
 
 
@@ -186,7 +201,7 @@ def test_our_edges_are_marked_and_graphify_s_are_not(builds):
     (_, _), (registered, _) = builds
     marked = [e for e in _calls(registered) if e.get(EDGE_MARKER) == EDGE_ORIGIN]
 
-    assert len(marked) == 4
+    assert marked and _pairs(marked) == _pairs(_ours(registered))
     # graphify resets `_origin` on every edge after the resolvers run, so the marker must not
     # live there; this is the assertion that catches it if the marker is ever moved back.
     assert all(e["_origin"] == "ast" for e in _calls(registered))
@@ -216,7 +231,7 @@ def test_the_unresolvable_call_stays_unresolved_and_is_counted(builds):
     entry = record["resolvers"][0]
     assert entry["state"] == "completed"
     assert entry["eligible_sites"] == 7
-    assert entry["edges_added"] == 4
+    assert entry["edges_added"] == len(_ours(registered))
     assert entry["unresolved"]["tree_sitter:chained-call"] == 1
     assert entry["unresolved"]["tree_sitter:dynamic-name"] == 1
 

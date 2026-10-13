@@ -187,6 +187,60 @@ def test_unchanged_file_emptied_refuses_even_within_tolerance(root):
     assert report.reasons == ["unchanged file a.py lost all 1 of its nodes"]
 
 
+def test_unchanged_file_dropped_by_a_new_extractor_is_explained(root):
+    a_nodes, a_links, b_nodes, b_links = baseline()
+    old = graph(a_nodes + b_nodes, a_links + b_links)
+    new = graph(b_nodes, b_links)
+    m = manifest(a__py="1", b__py="2")
+
+    report = classify_loss(old, new, m, m, root, producer_changed=True)
+
+    assert report.verdict == "accept", report.reasons
+    assert files_by_name(report)["a.py"]["class"] == "dropped_by_extractor"
+    assert report.nodes["unexplained"] == 0 and report.nodes["explained"] == 3
+    assert report.edges["unexplained"] == 0 and report.edges["explained"] == 2
+
+
+def test_unchanged_file_emptied_without_a_producer_change_still_refuses(root):
+    a_nodes, a_links, b_nodes, b_links = baseline()
+    old = graph(a_nodes + b_nodes, a_links + b_links)
+    new = graph(b_nodes, b_links)
+    m = manifest(a__py="1", b__py="2")
+
+    report = classify_loss(old, new, m, m, root)
+
+    assert report.verdict == "refuse"
+    assert files_by_name(report)["a.py"]["class"] == "unchanged"
+    assert "unchanged file a.py lost all 3 of its nodes" in report.reasons
+
+
+def test_dropped_file_with_a_cross_file_edge_refuses(root):
+    a_nodes, a_links, b_nodes, b_links = baseline()
+    old = graph(a_nodes + b_nodes, a_links + b_links + [edge("a0", "b0", file="a.py")])
+    new = graph(b_nodes, b_links)
+    m = manifest(a__py="1", b__py="2")
+
+    report = classify_loss(old, new, m, m, root, producer_changed=True)
+
+    assert report.verdict == "refuse"
+    assert files_by_name(report)["a.py"]["class"] == "unchanged"
+    assert report.nodes["unexplained"] == 3
+    assert "unchanged file a.py lost all 3 of its nodes" in report.reasons
+
+
+def test_unchanged_file_partial_drop_stays_unexplained_with_a_producer_change(root):
+    a_nodes, a_links, b_nodes, b_links = baseline()
+    old = graph(a_nodes + b_nodes, a_links + b_links)
+    new = graph(a_nodes[:2] + b_nodes, a_links[:1] + b_links)
+    m = manifest(a__py="1", b__py="2")
+
+    report = classify_loss(old, new, m, m, root, producer_changed=True)
+
+    assert files_by_name(report)["a.py"]["class"] == "unchanged"
+    assert report.nodes["unexplained"] == 1 and report.nodes["explained"] == 0
+    assert report.edges["unexplained"] == 1
+
+
 def test_out_of_corpus_needs_a_producer_change(root):
     a_nodes, a_links, b_nodes, b_links = baseline()
     old = graph(a_nodes + b_nodes, a_links + b_links)

@@ -36,6 +36,8 @@ CLASS_DELETED = "deleted"
 CLASS_CHANGED = "changed"
 CLASS_OUT_OF_CORPUS = "out_of_corpus"
 CLASS_UNCHANGED = "unchanged"
+# An unchanged file the new producer no longer indexes at all; see classify_loss.
+CLASS_DROPPED_BY_EXTRACTOR = "dropped_by_extractor"
 CLASS_NONE = "none"
 
 
@@ -160,7 +162,9 @@ def classify_loss(
 
     `producer_changed` is true when graphify or its configuration changed between the builds, so a
     file still on disk may legitimately have left the corpus (a new ignore rule, a dropped file
-    type). Without it, such a file losing its nodes is unexplained.
+    type). Without it, such a file losing its nodes is unexplained. It also lets an unchanged file
+    lose every node, as when graphify stops indexing data JSON, but only if no old edge left that
+    file: a vanished cross-file relation is real knowledge loss whatever the extractor did.
 
     Edge figures: `lost = explained + unexplained + resolver_lost`, where `resolver_lost` counts
     lost `_resolver` edges whose endpoints both survived and whose files did not change. An edit
@@ -207,6 +211,16 @@ def classify_loss(
             classes[rel] = _classify_file(rel, root, old_manifest, new_manifest)
         return classes[rel]
 
+    def self_contained(rel: str, ids: list[str]) -> bool:
+        lost = set(ids)
+        for edge in old_edges:
+            source, target = edge.get("source"), edge.get("target")
+            if source in lost or target in lost:
+                other = target if source in lost else source
+                if file_of(old_nodes.get(other) or {}) != rel:
+                    return False
+        return True
+
     explained = unexplained = 0
     explained_ids: set[str] = set(orphans)
     reasons: list[str] = []
@@ -214,7 +228,16 @@ def classify_loss(
     for rel, ids in lost_per_file.items():
         cls = class_of(rel)
         old_n, new_n = old_per_file[rel], new_per_file[rel]
-        if cls in (CLASS_DELETED, CLASS_CHANGED) or (
+        # The new producer stopped indexing this file outright: explained if nothing linked out.
+        if (
+            cls == CLASS_UNCHANGED
+            and producer_changed
+            and old_n >= 1
+            and new_n == 0
+            and self_contained(rel, ids)
+        ):
+            cls = classes[rel] = CLASS_DROPPED_BY_EXTRACTOR
+        if cls in (CLASS_DELETED, CLASS_CHANGED, CLASS_DROPPED_BY_EXTRACTOR) or (
             cls == CLASS_OUT_OF_CORPUS and producer_changed
         ):
             file_loss, file_unexplained = len(ids), 0
@@ -251,7 +274,7 @@ def classify_loss(
 
     def edited(rel: str) -> bool:
         cls = class_of(rel)
-        return cls in (CLASS_DELETED, CLASS_CHANGED) or (
+        return cls in (CLASS_DELETED, CLASS_CHANGED, CLASS_DROPPED_BY_EXTRACTOR) or (
             cls == CLASS_OUT_OF_CORPUS and producer_changed
         )
 
@@ -310,7 +333,7 @@ def _attribute_edges(
         elif (
             source in explained_ids
             or target in explained_ids
-            or class_of(edge) in (CLASS_DELETED, CLASS_CHANGED)
+            or class_of(edge) in (CLASS_DELETED, CLASS_CHANGED, CLASS_DROPPED_BY_EXTRACTOR)
         ):
             explained += 1
         else:
