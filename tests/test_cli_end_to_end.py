@@ -143,6 +143,10 @@ def _calls(graph: dict) -> list[dict]:
     return [e for e in graph["links"] if e["relation"] == "calls"]
 
 
+def _pairs(edges: list[dict]) -> set[tuple[str, str]]:
+    return {(e["source"], e["target"]) for e in edges}
+
+
 @pytest.fixture(scope="module")
 def builds(tmp_path_factory):
     root = tmp_path_factory.mktemp("e2e")
@@ -151,9 +155,16 @@ def builds(tmp_path_factory):
 
 def test_registering_adds_call_edges(builds):
     (plain, _), (registered, _) = builds
+    plain_label = {n["id"]: n["label"] for n in plain["nodes"]}
+    ours = [e for e in _calls(registered) if e.get("_via")]
 
-    assert len(_calls(plain)) == 1, "graphify alone resolves only the coarse Class:: edge"
-    assert len(_calls(registered)) == 5
+    # graphify >= 0.9.87 binds the three `::` calls to their methods itself; older versions
+    # record one coarse edge to the Helper class. No version resolves the property-typed call.
+    assert ".reminderSubmitWeek()" not in {plain_label[e["target"]] for e in _calls(plain)}
+
+    pairs = [(e["source"], e["target"]) for e in _calls(registered)]
+    assert len(pairs) == len(set(pairs)), "a pair graphify already connected got a second edge"
+    assert set(pairs) == _pairs(_calls(plain)) | _pairs(ours)
 
 
 def test_every_pattern_in_the_fixture_resolves(builds):
@@ -185,11 +196,16 @@ def test_the_method_level_edge_names_the_coarse_edge_it_refines(builds):
     (_, _), (registered, _) = builds
     label = {n["id"]: n["label"] for n in registered["nodes"]}
     fine = next(e for e in _calls(registered) if label[e["target"]] == ".format()")
-    coarse = next(e for e in _calls(registered) if label[e["target"]] == "Helper")
+    coarse = [e for e in _calls(registered) if label[e["target"]] == "Helper"]
 
+    # graphify >= 0.9.87 binds `Helper::format()` to the method and emits no class edge, so
+    # there is nothing to refine and the key must stay off.
+    if not coarse:
+        assert "_refines" not in fine
+        return
     # Both edges are published: different endpoints, so neither dedup nor removal applies.
     # `_refines` is what lets a consumer collapse the pair instead of counting the call twice.
-    assert fine["_refines"] == coarse["target"]
+    assert fine["_refines"] == coarse[0]["target"]
 
 
 def test_the_unresolvable_call_stays_unresolved_and_is_counted(builds):

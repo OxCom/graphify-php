@@ -155,6 +155,7 @@ reason. Feed artifacts in as text:
 
 ```python
 from eval import canaries
+
 canaries.assert_no_leaks(canaries.collect_artifacts([Path("graphify-out")]))
 ```
 
