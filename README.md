@@ -68,12 +68,17 @@ than a missing one, and every counted reason is a line on the next version's wor
 
 ## Install and register
 
+graphify-php is not on PyPI. Install a clone in editable mode into graphify's own environment;
+the PHPStan source needs the `php/` directory of the checkout, which the wheel does not ship:
+
 ```bash
-pip install graphify-php
+git clone https://github.com/OxCom/graphify-php.git ~/src/graphify-php
+pipx inject --editable --include-apps graphifyy ~/src/graphify-php
 ```
 
-No runtime dependencies. graphify and tree-sitter come from the environment that runs the build;
-pinning them here would fight graphify's own pins.
+The one runtime dependency is pyyaml. graphify and tree-sitter come from the environment that
+runs the build; pinning them here would fight graphify's own pins. Virtual environments,
+PHPStan, verification and troubleshooting: [docs/install.md](docs/install.md).
 
 Registration is one call, made before graphify builds:
 
