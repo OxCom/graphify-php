@@ -1,0 +1,19 @@
+# Paths the pull-request trufflehog scan must not read. One Go regex per line,
+# matched against the file path relative to the repository root. Only the
+# pull-request scan uses this file; the full-history scan reports verified
+# results from every path, these two included.
+#
+# eval/fixtures/secrets.php plants fake credentials — an API token constant, a
+# DSN with an inline password, an environment-variable fallback and an
+# attribute argument — and eval/canaries.py lists the same values so that
+# tests/test_eval_canaries.py can prove none of them ever reaches a graph, a
+# status record or a log. Every value carries the marker CANARY, points at a
+# host that does not exist and opens nothing. Without this exclusion trufflehog
+# reports them as unknown-class results and fails the job on a repository that
+# leaks nothing. The values are deliberately not repeated here, so that
+# excluding them does not turn this file into the next finding.
+#
+# Only these two paths are excluded, and only for the unknown class. Every
+# other file in a pull request keeps both the verified and the unknown class.
+(^|/)eval/fixtures/secrets\.php$
+(^|/)eval/canaries\.py$

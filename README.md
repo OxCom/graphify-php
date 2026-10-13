@@ -11,7 +11,8 @@ and Rust, and none for PHP. Its PHP extractor marks `$obj->method()` as a member
 shared cross-file pass then drops it, because a bare `method` collides across the corpus and a
 name-only match is not evidence.
 
-On the reference Symfony application, measured from the published graph:
+On a reference Symfony application (584 PHP files, not shipped with this package), measured
+from the published graph:
 
 | | |
 |---|---|
@@ -177,6 +178,14 @@ reference application and writes nothing outside `tmp_path`.
 Adding a third source — a language server, an LSIF index — means implementing one protocol,
 `CallTargetSource` in `ports.py`, and adding it to the factory in `__init__.py`. `resolver.py`
 depends on the protocols and nothing else, and does not change.
+
+## CI
+
+GitHub Actions runs three stages in order: **security** (gitleaks, trufflehog, pip-audit,
+`php -l` over `php/`), **tests** (ruff lint and format check, pytest on Python 3.10–3.14) and
+**build** (`python -m build`, then import and `graphify-php-build --help` from the installed
+wheel). The same checks locally: `pip install -e ".[test,lint]"`, then `ruff check .`,
+`ruff format --check .`, `python -m pytest`, and `for f in php/autoload.php php/src/CallGraph/*.php; do php -l "$f"; done`.
 
 ## License
 

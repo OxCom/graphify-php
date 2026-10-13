@@ -24,11 +24,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 from graphify_php.ports import CallSite, CallTarget, Confidence, Resolution
 
@@ -96,6 +97,12 @@ services:
 # line an unattended failure is indistinguishable from a project that simply has no calls.
 STDERR_PREFIX = "phpstan-stderr: "
 
+# That line ends up in the status record, which is committed with the graph. PHPStan runs the
+# project's bootstrap, so a fatal error there can print a DSN or a credential; the value after
+# a secret-looking key and the userinfo of a URL are cut before the line is kept.
+_SECRET_VALUE_RE = re.compile(r"(password|passwd|secret|token|key|dsn)\s*[=:]\s*\S+", re.IGNORECASE)
+_URL_USERINFO_RE = re.compile(r"://[^/@\s]+@")
+
 _LINE_RE = re.compile(r"\d+")
 
 VIA_CLASS = "phpstan"
@@ -118,9 +125,10 @@ class PhpStanCall:
     file: str
     line: int
     call_pos: int | None = None
+    callee_file: str = ""
 
     @staticmethod
-    def from_json(raw: object) -> "PhpStanCall | None":
+    def from_json(raw: object) -> PhpStanCall | None:
         """Return the call, or None when the record is not one.
 
         None rather than an exception: the output is line-delimited precisely so that a run
@@ -150,6 +158,7 @@ class PhpStanCall:
             file=file,
             line=line,
             call_pos=call_pos,
+            callee_file=str(raw.get("calleeFile") or ""),
         )
 
     @property
@@ -216,7 +225,7 @@ class EnvironmentProbe:
         is run on a generated wrapper, so the answer here picks a path and never refuses one:
         registering twice would attach two collectors and duplicate every record.
         """
-        text = self._config_closure(config)
+        text = _without_comments(self._config_closure(config))
         return tuple(name for name in (_COLLECTOR_CLASS, _RULE_CLASS) if name not in text)
 
     def _config_closure(self, config: Path) -> str:
@@ -290,7 +299,9 @@ class PhpStanRunner:
             return project
         wrapper = workdir / _WRAPPER_NAME
         try:
-            wrapper.write_text(_WRAPPER_TEMPLATE % project.resolve(), encoding="utf-8")
+            wrapper.write_text(
+                _WRAPPER_TEMPLATE % _neon_string(str(project.resolve())), encoding="utf-8"
+            )
         except OSError:
             return None
         return wrapper
@@ -326,24 +337,31 @@ class PhpStanRunner:
         # initialisers, and anything a bootstrap or bootstrapFiles entry does. It is not a pure
         # read of the source tree, so it runs with a timeout and captured output and is never
         # given a terminal to prompt at.
+        #
+        # Its own session, because the phar re-executes itself and forks parallel workers: a
+        # timeout that killed only the direct child left those running to completion, orphaned,
+        # on the reference application. The group id is the child's pid, so the whole tree goes.
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(  # noqa: S603 - list argv, no shell, path from config
                 self.command(repo_root, config),
                 cwd=repo_root,
                 env=env,
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.timeout_s(),
-                check=False,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            return RunOutcome(False, REASON_TIMEOUT)
         except OSError as exc:
             return RunOutcome(False, REASON_UNAVAILABLE, str(exc).splitlines()[0])
+        try:
+            _stdout, stderr = process.communicate(timeout=self.timeout_s())
+        except subprocess.TimeoutExpired:
+            _kill_group(process)
+            return RunOutcome(False, REASON_TIMEOUT)
 
-        stderr_line = _first_line(completed.stderr)
-        if completed.returncode == 0:
+        stderr_line = _first_line(stderr)
+        if process.returncode == 0:
             return RunOutcome(True, "", stderr_line)
 
         # A non-zero exit is the normal outcome on any project that has analysis errors of its
@@ -362,7 +380,9 @@ class PhpStanSource:
 
     name = "phpstan"
 
-    def __init__(self, probe: EnvironmentProbe | None = None, runner: PhpStanRunner | None = None) -> None:
+    def __init__(
+        self, probe: EnvironmentProbe | None = None, runner: PhpStanRunner | None = None
+    ) -> None:
         self._probe = probe or EnvironmentProbe()
         self._runner = runner or PhpStanRunner(self._probe)
 
@@ -412,6 +432,33 @@ def _failure_reason(outcome: RunOutcome) -> str:
     return outcome.reason or REASON_UNAVAILABLE
 
 
+def _kill_group(process: subprocess.Popen) -> None:
+    """End the session `run` started, then reap.
+
+    Already gone is the outcome wanted, not an error.
+    """
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    process.communicate()
+
+
+def _neon_string(value: str) -> str:
+    """`value` as a double-quoted NEON string that means exactly `value`.
+
+    Unquoted, a `%` in the path is parameter syntax (`%rootDir%`) and a `"` ends nothing it
+    should; a doubled `%` is NEON's own escape for a literal one.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
+
+
+def _without_comments(text: str) -> str:
+    """The config with every `#` comment cut, so a commented-out registration registers nothing."""
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
 def _read_config(path: Path) -> str:
     """A config file's text, or nothing. An unreadable include is a file that registers nothing."""
     try:
@@ -436,7 +483,7 @@ def _includes(text: str) -> list[str]:
         if not inside:
             if stripped.startswith("includes:"):
                 inside = True
-                inline = stripped[len("includes:"):].strip()
+                inline = stripped[len("includes:") :].strip()
                 found.extend(_include_items(inline))
             continue
         if not stripped or stripped.startswith("#"):
@@ -455,7 +502,7 @@ def _include_items(raw: str) -> list[str]:
     raw = raw.strip().strip("[]")
     items = []
     for part in raw.split(","):
-        part = part.strip().strip("\'\"")
+        part = part.strip().strip("'\"")
         if part:
             items.append(part)
     return items
@@ -465,8 +512,13 @@ def _first_line(stderr: str) -> str:
     for line in (stderr or "").splitlines():
         stripped = line.strip()
         if stripped:
-            return stripped[:200]
+            return _redact(stripped)[:200]
     return ""
+
+
+def _redact(line: str) -> str:
+    line = _SECRET_VALUE_RE.sub(r"\1=<redacted>", line)
+    return _URL_USERINFO_RE.sub("://<redacted>@", line)
 
 
 def _read(path: Path) -> str:
@@ -522,8 +574,9 @@ def _line_of(source_location: str) -> int:
     return int(found.group())
 
 
-def _match(sites: list[CallSite], calls: list[PhpStanCall],
-           repo_root: str) -> tuple[list[CallTarget], int]:
+def _match(
+    sites: list[CallSite], calls: list[PhpStanCall], repo_root: str
+) -> tuple[list[CallTarget], int]:
     """Targets for each site, and how many sites were refused as same-line collisions.
 
     A site key is file, line and method, so `$a->get(); $b->get();` on one line lands in one
@@ -535,17 +588,33 @@ def _match(sites: list[CallSite], calls: list[PhpStanCall],
     """
     by_key: dict[tuple[str, int, str], list[PhpStanCall]] = {}
     for call in calls:
-        by_key.setdefault(_site_key(call.file, call.line, call.callee_method, repo_root), []).append(call)
+        by_key.setdefault(
+            _site_key(call.file, call.line, call.callee_method, repo_root), []
+        ).append(call)
+
+    # How many sites share a key. `$a->get() ?? $b->get()` with `$b` untyped yields one call
+    # position for two sites, and the one record cannot say which of them it belongs to.
+    site_keys = [
+        _site_key(site.source_file, _line_of(site.source_location), site.method, repo_root)
+        for site in sites
+    ]
+    sites_per_key: dict[tuple[str, int, str], int] = {}
+    for key in site_keys:
+        sites_per_key[key] = sites_per_key.get(key, 0) + 1
 
     targets: list[CallTarget] = []
     collisions = 0
-    for site in sites:
-        key = _site_key(site.source_file, _line_of(site.source_location), site.method, repo_root)
+    for site, key in zip(sites, site_keys, strict=True):
         matched = by_key.get(key, ())
         arms_by_call: dict[int | None, set[tuple[str, str]]] = {}
         for call in matched:
-            arms_by_call.setdefault(call.call_pos, set()).add((call.callee_class, call.callee_method))
+            arms_by_call.setdefault(call.call_pos, set()).add(
+                (call.callee_class, call.callee_method)
+            )
         if len({frozenset(arms) for arms in arms_by_call.values()}) > 1:
+            collisions += 1
+            continue
+        if matched and len(arms_by_call) < sites_per_key[key]:
             collisions += 1
             continue
         seen: set[tuple[str, str]] = set()
@@ -554,11 +623,14 @@ def _match(sites: list[CallSite], calls: list[PhpStanCall],
             if arm in seen:
                 continue
             seen.add(arm)
-            targets.append(CallTarget(
-                site=site,
-                class_fqn=call.callee_class,
-                method=call.callee_method,
-                confidence=Confidence.EXTRACTED,
-                via=call.via,
-            ))
+            targets.append(
+                CallTarget(
+                    site=site,
+                    class_fqn=call.callee_class,
+                    method=call.callee_method,
+                    confidence=Confidence.EXTRACTED,
+                    via=call.via,
+                    declaring_file=call.callee_file,
+                )
+            )
     return targets, collisions

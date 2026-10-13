@@ -67,7 +67,9 @@ def test_repository_without_composer_json_is_a_skip(tmp_path: Path) -> None:
 
 
 def test_malformed_xml_is_a_counted_skip(tmp_path: Path) -> None:
-    record = ContainerOverlayLayer().run(symfony_repo(tmp_path, xml="<container><servi"), tmp_path / "out")
+    record = ContainerOverlayLayer().run(
+        symfony_repo(tmp_path, xml="<container><servi"), tmp_path / "out"
+    )
     assert (record.state, record.reason) == ("skipped", "container-xml-malformed")
     assert record.files_seen == 1
 
@@ -82,3 +84,15 @@ def test_dev_cache_is_preferred_over_an_unconventional_environment(tmp_path: Pat
     path, reason = SymfonyCacheLocator().locate(tmp_path)
     assert reason == ""
     assert path.parent.name == "dev"
+
+
+def test_a_symlinked_container_file_is_not_followed(tmp_path: Path) -> None:
+    symfony_repo(tmp_path, xml=None)
+    (tmp_path / "outside.xml").write_text(CONTAINER)
+    cache = tmp_path / "var" / "cache" / "dev"
+    cache.mkdir(parents=True)
+    (cache / "App_KernelDevDebugContainer.xml").symlink_to(tmp_path / "outside.xml")
+    from graphify_php.container import SymfonyCacheLocator, reasons
+
+    path, reason = SymfonyCacheLocator().locate(tmp_path)
+    assert (path, reason) == (None, reasons.SKIP_XML_ABSENT)

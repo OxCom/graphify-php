@@ -23,7 +23,7 @@ class NameResolver:
     """
 
     namespace: str = ""
-    imports: dict[str, str] = field(default_factory=dict)   # alias -> FQN
+    imports: dict[str, str] = field(default_factory=dict)  # alias -> FQN
 
     def resolve(self, name: str) -> str:
         """PHP's own order: absolute, then alias, then relative to the file's namespace."""

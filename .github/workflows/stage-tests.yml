@@ -1,0 +1,65 @@
+name: stage-tests
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install graphify-php with lint extras
+        run: pip install -e ".[lint]"
+
+      - name: ruff — lint
+        run: ruff check .
+
+      - name: ruff — format check
+        run: ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      # One Python version failing must not hide the state of the others.
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install graphify-php with test extras
+        # graphifyy brings tree-sitter and tree-sitter-php with it; without
+        # them syntax/nodes.py sets the parser modules to None and the
+        # tree-sitter tests fail rather than skip.
+        run: pip install -e ".[test]"
+
+      - name: Run the test suite
+        # Two files skip themselves here because GRAPHIFY_PHP_REFERENCE_PROJECT
+        # is unset: tests/test_phpstan_integration.py needs
+        # <project>/vendor/bin/phpstan plus php on PATH, and
+        # tests/test_container_integration.py needs that project's compiled
+        # container at <project>/var/cache/dev/App_KernelDevDebugContainer.xml.
+        # Running them in CI would need a checked-out Symfony project with a
+        # composer-installed PHPStan to point the variable at.
+        run: python -m pytest -rs

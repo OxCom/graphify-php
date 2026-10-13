@@ -14,8 +14,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from graphify_php.ports import CallSite, CallTargetSource, Confidence   # noqa: E402
-from graphify_php.sources.tree_sitter_source import (                   # noqa: E402
+from graphify_php.ports import CallSite, CallTargetSource, Confidence  # noqa: E402
+from graphify_php.sources.tree_sitter_source import (  # noqa: E402
     Reason,
     TreeSitterSource,
     classify_receiver,
@@ -56,14 +56,14 @@ def declare(tmp_path: Path, namespace: str, classes: dict, name: str | None = No
     does not exist, which is the failure this check was added to stop.
     """
     body = "\n\n".join(
-        "class %s\n{\n%s\n}" % (
+        "class {}\n{{\n{}\n}}".format(
             cls,
-            "\n".join("    public function %s() {}" % m for m in methods) or "",
+            "\n".join(f"    public function {m}() {{}}" for m in methods) or "",
         )
         for cls, methods in classes.items()
     )
     target = tmp_path / (name or (namespace.replace("\\", "_") + ".php"))
-    target.write_text("<?php\n\nnamespace %s;\n\n%s\n" % (namespace, body), encoding="utf-8")
+    target.write_text(f"<?php\n\nnamespace {namespace};\n\n{body}\n", encoding="utf-8")
 
 
 def line_with(php: str, needle: str) -> int:
@@ -88,7 +88,9 @@ def call(receiver: str, method: str, line: int, source_file: str = "Subject.php"
     )
 
 
-def site(php: str, needle: str, receiver: str, method: str, source_file: str = "Subject.php") -> CallSite:
+def site(
+    php: str, needle: str, receiver: str, method: str, source_file: str = "Subject.php"
+) -> CallSite:
     """Build a call site whose location is the line `needle` appears on.
 
     The line is searched for rather than written down so that editing the fixture above a call
@@ -139,7 +141,11 @@ class SubmitWeek extends AbstractReminderCronJob {
 
 
 def test_reference_application_case(tmp_path):
-    declare(tmp_path, "App\\Service\\Messages", {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]})
+    declare(
+        tmp_path,
+        "App\\Service\\Messages",
+        {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]},
+    )
     subject = site(REFERENCE, "reminderSubmitWeek", "$this->emails", "reminderSubmitWeek")
     result = resolve(tmp_path, REFERENCE, subject)
 
@@ -156,8 +162,16 @@ def test_reference_application_case(tmp_path):
 
 def test_reference_case_does_not_fall_back_to_the_files_own_namespace(tmp_path):
     """`App\\Cron\\...\\Emails` is the answer the import exists to prevent."""
-    declare(tmp_path, "App\\Service\\Messages", {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]})
-    result = resolve(tmp_path, REFERENCE, site(REFERENCE, "reminderSubmitWeek", "$this->emails", "reminderSubmitWeek"))
+    declare(
+        tmp_path,
+        "App\\Service\\Messages",
+        {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]},
+    )
+    result = resolve(
+        tmp_path,
+        REFERENCE,
+        site(REFERENCE, "reminderSubmitWeek", "$this->emails", "reminderSubmitWeek"),
+    )
     assert "Cron" not in result.targets[0].class_fqn
 
 
@@ -177,7 +191,9 @@ class C {
     result = resolve(tmp_path, php, site(php, "->touch()", "$this->legacy", "touch"))
     target = result.targets[0]
     assert (target.class_fqn, target.confidence, target.via) == (
-        "App\\Service\\Legacy", Confidence.EXTRACTED, "tree_sitter:typed-property",
+        "App\\Service\\Legacy",
+        Confidence.EXTRACTED,
+        "tree_sitter:typed-property",
     )
 
 
@@ -195,12 +211,18 @@ class C {
     result = resolve(tmp_path, php, site(php, "->touch()", "$this->legacy", "touch"))
     target = result.targets[0]
     assert (target.class_fqn, target.confidence, target.via) == (
-        "App\\Service\\Legacy", Confidence.INFERRED, "tree_sitter:constructor-assignment",
+        "App\\Service\\Legacy",
+        Confidence.INFERRED,
+        "tree_sitter:constructor-assignment",
     )
 
 
 def test_new_binding_resolves_inferred(tmp_path):
-    declare(tmp_path, "App\\Service\\Messages", {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]})
+    declare(
+        tmp_path,
+        "App\\Service\\Messages",
+        {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]},
+    )
     php = r"""<?php
 namespace App;
 use App\Service\Messages\Emails;
@@ -214,7 +236,9 @@ class C {
     result = resolve(tmp_path, php, site(php, "$mailer->send()", "$mailer", "send"))
     target = result.targets[0]
     assert (target.class_fqn, target.confidence, target.via) == (
-        "App\\Service\\Messages\\Emails", Confidence.INFERRED, "tree_sitter:new-binding",
+        "App\\Service\\Messages\\Emails",
+        Confidence.INFERRED,
+        "tree_sitter:new-binding",
     )
 
 
@@ -237,7 +261,8 @@ class B {
     lines = php.splitlines()
     calls = [
         call("$this->repo", "find", i + 1)
-        for i, text in enumerate(lines) if "$this->repo->find()" in text
+        for i, text in enumerate(lines)
+        if "$this->repo->find()" in text
     ]
     assert len(calls) == 2
     result = resolve(tmp_path, php, *calls)
@@ -261,8 +286,7 @@ class C {
 """
     lines = php.splitlines()
     calls = [
-        call("$service", "go", i + 1)
-        for i, text in enumerate(lines) if "$service->go()" in text
+        call("$service", "go", i + 1) for i, text in enumerate(lines) if "$service->go()" in text
     ]
     assert len(calls) == 2
     result = resolve(tmp_path, php, *calls)
@@ -278,7 +302,8 @@ class C {
 }
 """
     refuses(
-        tmp_path, php,
+        tmp_path,
+        php,
         site(php, "$service->go()", "$service", "go"),
         Reason.UNKNOWN_RECEIVER_TYPE,
     )
@@ -296,7 +321,12 @@ class C {
 
 
 def test_refuses_dynamic_property_name(tmp_path):
-    refuses(tmp_path, DYNAMIC, site(DYNAMIC, "$this->$name", "$this->$name", "send"), Reason.DYNAMIC_NAME)
+    refuses(
+        tmp_path,
+        DYNAMIC,
+        site(DYNAMIC, "$this->$name", "$this->$name", "send"),
+        Reason.DYNAMIC_NAME,
+    )
 
 
 def test_refuses_dynamic_method_name(tmp_path):
@@ -307,7 +337,9 @@ class C {
     public function run(): void { $this->emails->$method(); }
 }
 """
-    refuses(tmp_path, php, site(php, "->$method()", "$this->emails", "$method"), Reason.DYNAMIC_NAME)
+    refuses(
+        tmp_path, php, site(php, "->$method()", "$this->emails", "$method"), Reason.DYNAMIC_NAME
+    )
 
 
 def test_refuses_a_chained_call(tmp_path):
@@ -353,7 +385,12 @@ class C {
     public function run(): void { $this->container->get('mailer'); }
 }
 """
-    refuses(tmp_path, php, site(php, "->get('mailer')", "$this->container", "get"), Reason.INDIRECT_DISPATCH)
+    refuses(
+        tmp_path,
+        php,
+        site(php, "->get('mailer')", "$this->container", "get"),
+        Reason.INDIRECT_DISPATCH,
+    )
 
 
 def test_refuses_reflection(tmp_path):
@@ -366,7 +403,9 @@ class C {
     }
 }
 """
-    refuses(tmp_path, php, site(php, "$r->newInstance()", "$r", "newInstance"), Reason.INDIRECT_DISPATCH)
+    refuses(
+        tmp_path, php, site(php, "$r->newInstance()", "$r", "newInstance"), Reason.INDIRECT_DISPATCH
+    )
 
 
 def test_refuses_a_local_reassigned_after_its_binding(tmp_path):
@@ -401,7 +440,12 @@ class C extends Base {
     public function run(): void { $this->inherited(); }
 }
 """
-    refuses(tmp_path, php, site(php, "$this->inherited()", "$this", "inherited"), Reason.UNSUPPORTED_RECEIVER)
+    refuses(
+        tmp_path,
+        php,
+        site(php, "$this->inherited()", "$this", "inherited"),
+        Reason.UNSUPPORTED_RECEIVER,
+    )
 
 
 def test_refuses_a_property_inherited_from_another_file(tmp_path):
@@ -412,7 +456,9 @@ class C extends Base {
     public function run(): void { $this->emails->send(); }
 }
 """
-    refuses(tmp_path, php, site(php, "->send()", "$this->emails", "send"), Reason.UNKNOWN_RECEIVER_TYPE)
+    refuses(
+        tmp_path, php, site(php, "->send()", "$this->emails", "send"), Reason.UNKNOWN_RECEIVER_TYPE
+    )
 
 
 def test_refuses_a_site_it_cannot_place_in_a_class(tmp_path):
@@ -456,7 +502,8 @@ class C extends Base {
     lines = php.splitlines()
     calls = [
         call(text.strip().split("->go")[0], "go", i + 1)
-        for i, text in enumerate(lines) if "->go();" in text
+        for i, text in enumerate(lines)
+        if "->go();" in text
     ]
     assert len(calls) == 2
     result = resolve(tmp_path, php, *calls)
@@ -532,7 +579,11 @@ def test_the_shape_graphify_actually_sends(tmp_path):
     never assigns `member_receiver`, so `engine.py:6403` writes `receiver` as None and
     `engine.py:6402` writes the location as `L<line>`. This is that exact record.
     """
-    declare(tmp_path, "App\\Service\\Messages", {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]})
+    declare(
+        tmp_path,
+        "App\\Service\\Messages",
+        {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]},
+    )
     write(tmp_path, REFERENCE)
     raw = CallSite(
         caller_nid="n1",
@@ -553,7 +604,11 @@ def test_the_shape_graphify_actually_sends(tmp_path):
 
 
 def test_recovered_receiver_reads_a_nullsafe_call(tmp_path):
-    declare(tmp_path, "App\\Service\\Messages", {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]})
+    declare(
+        tmp_path,
+        "App\\Service\\Messages",
+        {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]},
+    )
     php = r"""<?php
 namespace App;
 use App\Service\Messages\Emails;
@@ -580,7 +635,8 @@ class C {
     line = line_with(php, "$this->a->one()")
     result = resolve(tmp_path, php, call("", "one", line), call("", "two", line))
     assert sorted((t.method, t.class_fqn) for t in result.targets) == [
-        ("one", "App\\Alpha"), ("two", "App\\Beta"),
+        ("one", "App\\Alpha"),
+        ("two", "App\\Beta"),
     ]
 
 
@@ -644,7 +700,9 @@ class C {
 """
     line = line_with(php, "$this->a->go()")
     write(tmp_path, php)
-    result = SOURCE.resolve(str(tmp_path), [CallSite("n1", "$this->b", "go", "Subject.php", f"L{line}")])
+    result = SOURCE.resolve(
+        str(tmp_path), [CallSite("n1", "$this->b", "go", "Subject.php", f"L{line}")]
+    )
     assert result.targets[0].class_fqn == "App\\Beta"
 
 
@@ -699,18 +757,27 @@ final class Caller
 
 def test_refuses_a_method_reached_through_magic_call(tmp_path):
     """dynamic.php:39 — right class, no such member. The edge must not be emitted."""
-    result = resolve(tmp_path, MAGIC_FIXTURE,
-                     call("", "anythingAtAll", line_with(MAGIC_FIXTURE, "anythingAtAll($user);")))
+    result = resolve(
+        tmp_path,
+        MAGIC_FIXTURE,
+        call("", "anythingAtAll", line_with(MAGIC_FIXTURE, "anythingAtAll($user);")),
+    )
     assert result.targets == []
     assert result.unresolved == {Reason.INDIRECT_DISPATCH: 1}
 
 
 def test_positive_control_on_the_same_fixture_still_resolves(tmp_path):
     """The check must not pass by refusing everything."""
-    result = resolve(tmp_path, MAGIC_FIXTURE,
-                     call("", "knownMethod", line_with(MAGIC_FIXTURE, "knownMethod($user);")))
+    result = resolve(
+        tmp_path,
+        MAGIC_FIXTURE,
+        call("", "knownMethod", line_with(MAGIC_FIXTURE, "knownMethod($user);")),
+    )
     assert result.unresolved == {}
-    assert (result.targets[0].class_fqn, result.targets[0].method) == ("Eval\\Dynamic\\Real", "knownMethod")
+    assert (result.targets[0].class_fqn, result.targets[0].method) == (
+        "Eval\\Dynamic\\Real",
+        "knownMethod",
+    )
     assert result.targets[0].confidence is Confidence.EXTRACTED
 
 
@@ -748,7 +815,10 @@ class C {
 """
     result = resolve(tmp_path, php, call("", "whatever", line_with(php, "->whatever()")))
     assert result.unresolved == {}
-    assert (result.targets[0].class_fqn, result.targets[0].method) == ("Outside\\Vendor\\Thing", "whatever")
+    assert (result.targets[0].class_fqn, result.targets[0].method) == (
+        "Outside\\Vendor\\Thing",
+        "whatever",
+    )
 
 
 def test_method_inherited_from_a_parent_resolves(tmp_path):
@@ -804,7 +874,9 @@ class C {
     public function run(): void { $this->c->fromTheFramework(); }
 }
 """
-    result = resolve(tmp_path, php, call("", "fromTheFramework", line_with(php, "->fromTheFramework()")))
+    result = resolve(
+        tmp_path, php, call("", "fromTheFramework", line_with(php, "->fromTheFramework()"))
+    )
     assert result.unresolved == {}
     assert result.targets[0].class_fqn == "App\\Child"
 
@@ -856,7 +928,9 @@ def test_self_scope_resolves_to_the_enclosing_class(tmp_path):
 
 
 def test_parent_scope_resolves_to_the_extended_class(tmp_path):
-    result = resolve(tmp_path, SCOPES, scoped("inherited", line_with(SCOPES, "parent::inherited()")))
+    result = resolve(
+        tmp_path, SCOPES, scoped("inherited", line_with(SCOPES, "parent::inherited()"))
+    )
     target = result.targets[0]
     assert (target.class_fqn, target.method) == ("App\\Jobs\\Base", "inherited")
     assert target.confidence is Confidence.EXTRACTED
@@ -980,7 +1054,8 @@ class C {
     line = line_with(php, "$this->a->one()")
     result = resolve(tmp_path, php, call("", "one", line), scoped("two", line))
     assert sorted((t.method, t.class_fqn) for t in result.targets) == [
-        ("one", "App\\Alpha"), ("two", "App\\Helper"),
+        ("one", "App\\Alpha"),
+        ("two", "App\\Helper"),
     ]
 
 
@@ -1016,7 +1091,11 @@ final class WeeklyNotifier extends BaseNotifier {
     public function notify(string $user): void { $this->emails->reminderSubmitMonth($user); }
 }
 """
-    result = resolve(tmp_path, php, call("", "reminderSubmitMonth", line_with(php, "reminderSubmitMonth($user);")))
+    result = resolve(
+        tmp_path,
+        php,
+        call("", "reminderSubmitMonth", line_with(php, "reminderSubmitMonth($user);")),
+    )
     assert result.unresolved == {}
     assert result.targets[0].class_fqn == "App\\Mail\\Emails"
 
@@ -1131,8 +1210,11 @@ class Caller
 
 
 def test_intersection_resolves_to_the_constituent_that_declares_the_method(tmp_path):
-    result = resolve(tmp_path, INTERSECTION,
-                     call("", "reminderSubmitWeek", line_with(INTERSECTION, "reminderSubmitWeek($u);")))
+    result = resolve(
+        tmp_path,
+        INTERSECTION,
+        call("", "reminderSubmitWeek", line_with(INTERSECTION, "reminderSubmitWeek($u);")),
+    )
     assert result.unresolved == {}
     target = result.targets[0]
     assert (target.class_fqn, target.method) == ("App\\Emails", "reminderSubmitWeek")
@@ -1149,10 +1231,15 @@ def test_intersection_picks_the_other_constituent_for_its_own_method(tmp_path):
 
 def test_intersection_refuses_when_both_constituents_declare_it(tmp_path):
     """One object, two declarations: the type does not say which body runs."""
-    php = INTERSECTION.replace("public function log(string $u): void {}",
-                               "public function reminderSubmitWeek(string $u): void {}")
-    result = resolve(tmp_path, php,
-                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+    php = INTERSECTION.replace(
+        "public function log(string $u): void {}",
+        "public function reminderSubmitWeek(string $u): void {}",
+    )
+    result = resolve(
+        tmp_path,
+        php,
+        call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")),
+    )
     assert result.targets == []
     assert result.unresolved == {Reason.AMBIGUOUS_INTERSECTION: 1}
 
@@ -1166,14 +1253,20 @@ def test_intersection_refuses_a_method_neither_constituent_declares(tmp_path):
 
 def test_intersection_resolves_when_only_the_read_constituent_declares_it(tmp_path):
     """The second constituent is in a file this run never read; the read one settles it."""
-    php = INTERSECTION.replace("""class Loggable
+    php = INTERSECTION.replace(
+        """class Loggable
 {
     public function log(string $u): void {}
 }
 
-""", "").replace("Emails&Loggable", "Emails&\\Vendor\\Loggable")
-    result = resolve(tmp_path, php,
-                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+""",
+        "",
+    ).replace("Emails&Loggable", "Emails&\\Vendor\\Loggable")
+    result = resolve(
+        tmp_path,
+        php,
+        call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")),
+    )
     assert result.unresolved == {}
     assert result.targets[0].class_fqn == "App\\Emails"
 
@@ -1181,16 +1274,22 @@ def test_intersection_resolves_when_only_the_read_constituent_declares_it(tmp_pa
 def test_intersection_stays_unresolved_when_no_read_constituent_declares_it(tmp_path):
     """Neither read nor disproved: leave it rather than pick a constituent."""
     php = INTERSECTION.replace("Emails&Loggable", "\\Vendor\\A&\\Vendor\\B")
-    result = resolve(tmp_path, php,
-                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+    result = resolve(
+        tmp_path,
+        php,
+        call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")),
+    )
     assert result.targets == []
     assert result.unresolved == {Reason.UNKNOWN_RECEIVER_TYPE: 1}
 
 
 def test_a_union_is_still_refused_and_not_treated_as_an_intersection(tmp_path):
     php = INTERSECTION.replace("Emails&Loggable", "Emails|Loggable")
-    result = resolve(tmp_path, php,
-                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+    result = resolve(
+        tmp_path,
+        php,
+        call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")),
+    )
     assert result.targets == []
     assert result.unresolved == {Reason.UNION_TYPE: 1}
 
@@ -1198,8 +1297,11 @@ def test_a_union_is_still_refused_and_not_treated_as_an_intersection(tmp_path):
 def test_disjunctive_normal_form_type_is_refused_as_a_union(tmp_path):
     """`(A&B)|C` is an alternation at the top, whatever its branches are."""
     php = INTERSECTION.replace("Emails&Loggable", "(Emails&Loggable)|Other")
-    result = resolve(tmp_path, php,
-                     call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")))
+    result = resolve(
+        tmp_path,
+        php,
+        call("", "reminderSubmitWeek", line_with(php, "$this->both->reminderSubmitWeek($u);")),
+    )
     assert result.targets == []
     assert result.unresolved == {Reason.UNION_TYPE: 1}
 
@@ -1217,7 +1319,9 @@ class C {
     public function run(string $u): void { $this->emails?->reminderSubmitWeek($u); }
 }
 """
-    result = resolve(tmp_path, php, call("", "reminderSubmitWeek", line_with(php, "?->reminderSubmitWeek")))
+    result = resolve(
+        tmp_path, php, call("", "reminderSubmitWeek", line_with(php, "?->reminderSubmitWeek"))
+    )
     target = result.targets[0]
     assert (target.class_fqn, target.method) == ("App\\Service\\Emails", "reminderSubmitWeek")
     assert target.confidence is Confidence.EXTRACTED
@@ -1270,7 +1374,9 @@ class C {
 """
     result = resolve(tmp_path, php, call("", "reminderSubmitWeek", line_with(php, "(...)")))
     assert (result.targets[0].class_fqn, result.targets[0].method) == (
-        "App\\Service\\Emails", "reminderSubmitWeek")
+        "App\\Service\\Emails",
+        "reminderSubmitWeek",
+    )
 
 
 def test_named_arguments_resolve(tmp_path):
@@ -1285,7 +1391,9 @@ class C {
 """
     result = resolve(tmp_path, php, call("", "reminderSubmitWeek", line_with(php, "user: $u")))
     assert (result.targets[0].class_fqn, result.targets[0].method) == (
-        "App\\Service\\Emails", "reminderSubmitWeek")
+        "App\\Service\\Emails",
+        "reminderSubmitWeek",
+    )
 
 
 # --- the corpus: declarations from files that hold no call site ----------------------------
@@ -1369,7 +1477,11 @@ def test_the_same_intersection_is_unresolved_without_a_corpus(tmp_path):
 
 def test_corpus_turns_an_unknown_owner_into_a_disproof(tmp_path):
     """A wider corpus means more classes are read, so absence becomes provable."""
-    write_file(tmp_path, "Plain.php", "<?php\nnamespace App;\nclass Plain { public function actual(): void {} }\n")
+    write_file(
+        tmp_path,
+        "Plain.php",
+        "<?php\nnamespace App;\nclass Plain { public function actual(): void {} }\n",
+    )
     php = r"""<?php
 namespace App;
 class C {
@@ -1390,7 +1502,11 @@ class C {
 
 def test_corpus_never_makes_it_refuse_a_class_it_did_not_read(tmp_path):
     """The disproof rule is unchanged: a corpus that omits the owner still emits."""
-    write_file(tmp_path, "Plain.php", "<?php\nnamespace App;\nclass Plain { public function actual(): void {} }\n")
+    write_file(
+        tmp_path,
+        "Plain.php",
+        "<?php\nnamespace App;\nclass Plain { public function actual(): void {} }\n",
+    )
     php = r"""<?php
 namespace App;
 use Elsewhere\Thing;
@@ -1427,7 +1543,9 @@ def test_a_file_in_both_the_corpus_and_the_sites_is_parsed_once(tmp_path, monkey
 
 def test_a_corpus_entry_that_cannot_be_read_is_skipped_not_fatal(tmp_path):
     site = intersection_site(tmp_path)
-    result = SOURCE.resolve(str(tmp_path), [site], corpus=["Emails.php", "Gone.php", "Loggable.php"])
+    result = SOURCE.resolve(
+        str(tmp_path), [site], corpus=["Emails.php", "Gone.php", "Loggable.php"]
+    )
     assert result.targets[0].class_fqn == "App\\Service\\Emails"
     # The missing file is not a site, so it is not counted as an unreadable one either.
     assert result.unresolved == {}
@@ -1435,4 +1553,152 @@ def test_a_corpus_entry_that_cannot_be_read_is_skipped_not_fatal(tmp_path):
 
 def test_an_empty_corpus_behaves_like_no_corpus(tmp_path):
     site = intersection_site(tmp_path)
-    assert SOURCE.resolve(str(tmp_path), [site], corpus=[]).unresolved == {Reason.UNKNOWN_RECEIVER_TYPE: 1}
+    assert SOURCE.resolve(str(tmp_path), [site], corpus=[]).unresolved == {
+        Reason.UNKNOWN_RECEIVER_TYPE: 1
+    }
+
+
+# --- rebinding forms that are not an assignment expression ---------------------------------
+
+# A `new` binding is revoked by a second write to the same name. The second write is not
+# always an `=`: a `foreach` target, a closure parameter, a `catch` variable, a destructuring
+# target and the method's own parameter all bind the name too, and a binding that survives
+# any of them resolves a call on a different object to the class of the first one.
+
+REBOUND = r"""<?php
+namespace App;
+class C {
+    public function run(array $caches, Cache $param): void {
+        BODY
+    }
+}
+"""
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "$m = new Emails(); foreach ($caches as $m) { $m->get(); }",
+        "$m = new Emails(); foreach ($caches as $k => $m) { $m->get(); }",
+        "$m = new Emails(); foreach ($caches as [$m]) { $m->get(); }",
+        "$m = new Emails(); $f = function (Cache $m) { $m->get(); };",
+        "$m = new Emails(); $f = function () use ($m) { $m->get(); };",
+        "$m = new Emails(); $f = fn (Cache $m) => $m->get();",
+        "$m = new Emails(); try { } catch (\\Throwable $m) { $m->get(); }",
+        "$m = new Emails(); [$m] = $caches; $m->get();",
+        "$m = new Emails(); ['k' => $m] = $caches; $m->get();",
+        "$m = new Emails(); list($m) = $caches; $m->get();",
+    ],
+    ids=[
+        "foreach",
+        "foreach-key-value",
+        "foreach-list",
+        "closure-param",
+        "closure-use",
+        "arrow-param",
+        "catch",
+        "destructuring",
+        "keyed-destructuring",
+        "list",
+    ],
+)
+def test_a_rebinding_that_is_not_an_assignment_still_revokes_the_new_binding(tmp_path, body):
+    php = REBOUND.replace("BODY", body)
+    refuses(tmp_path, php, site(php, "$m->get()", "$m", "get"), Reason.REASSIGNED_LOCAL)
+
+
+def test_a_method_parameter_counts_as_the_first_write(tmp_path):
+    php = REBOUND.replace("Cache $param", "Cache $m").replace(
+        "BODY", "$m = new Emails(); $m->get();"
+    )
+    refuses(tmp_path, php, site(php, "$m->get()", "$m", "get"), Reason.REASSIGNED_LOCAL)
+
+
+def test_a_closure_parameter_does_not_borrow_an_outer_local_of_another_name(tmp_path):
+    """The control: a rebinding of `$x` leaves `$m` alone, so the real binding still resolves."""
+    php = REBOUND.replace(
+        "BODY", "$m = new Emails(); $f = function (Cache $x) { $x->get(); };\n        $m->get();"
+    )
+    declare(tmp_path, "App", {"Emails": ["get"]})
+    result = resolve(tmp_path, php, site(php, "$m->get();", "$m", "get"))
+    assert [t.class_fqn for t in result.targets] == ["App\\Emails"]
+
+
+# --- anonymous classes ---------------------------------------------------------------------
+
+
+def test_a_site_inside_an_anonymous_class_is_refused_not_read_against_the_outer_class(tmp_path):
+    """`$this->emails` inside `new class` is the anonymous class's property, not the outer one's."""
+    php = r"""<?php
+namespace App;
+class Outer {
+    public function __construct(private Emails $emails) {}
+    public function make(): object {
+        return new class(new Cache()) {
+            public function __construct(private Cache $emails) {}
+            public function run(): void { $this->emails->get(); }
+        };
+    }
+}
+"""
+    declare(tmp_path, "App", {"Emails": ["get"], "Cache": ["get"]})
+    refuses(
+        tmp_path,
+        php,
+        site(php, "$this->emails->get()", "$this->emails", "get"),
+        Reason.ANONYMOUS_CLASS_SCOPE,
+    )
+
+
+# --- a member call is never answered by a scoped call on the same line ---------------------
+
+
+def test_an_untyped_member_receiver_is_not_answered_by_a_scoped_call_in_its_arguments(tmp_path):
+    """`$x->foo(Other::foo())`: the site is the member call, and `Other::foo` is its argument."""
+    php = r"""<?php
+namespace App;
+class C {
+    public function run($x): void {
+        $x->foo(Other::foo());
+    }
+}
+"""
+    declare(tmp_path, "App", {"Other": ["foo"]})
+    refuses(tmp_path, php, site(php, "$x->foo(", "$x", "foo"), Reason.UNKNOWN_RECEIVER_TYPE)
+
+
+@pytest.mark.parametrize(
+    ("written", "expected_fqn", "via"),
+    [
+        ("self::tidy($u)", "App\\C", "self-scope"),
+        ("parent::tidy($u)", "App\\Base", "parent-scope"),
+        ("static::tidy($u)", "App\\C", "static-binding"),
+        ("Helper::tidy($u)", "App\\Helper", "class-scope"),
+    ],
+)
+def test_a_scoped_site_arriving_with_its_scope_text_as_receiver_still_resolves(
+    tmp_path, written, expected_fqn, via
+):
+    """`resolver.py` sends a scoped call with the scope as its receiver, not a `$` expression.
+
+    That receiver is not a member receiver and the member path refuses it; the scoped path
+    must still be reached, or every `self::`, `parent::` and `Class::` edge is lost.
+    """
+    php = r"""<?php
+namespace App;
+class C extends Base {
+    public function run($u): void {
+        CALL;
+    }
+    private static function tidy($u): void {}
+}
+""".replace("CALL", written)
+    declare(tmp_path, "App", {"Helper": ["tidy"], "Base": ["tidy"]})
+    scope_text = written.split("::", 1)[0]
+    result = resolve(
+        tmp_path,
+        php,
+        CallSite("nid:1", scope_text, "tidy", "Subject.php", f"L{line_with(php, written)}"),
+    )
+    assert result.unresolved == {}
+    assert [(t.class_fqn, t.via) for t in result.targets] == [(expected_fqn, f"tree_sitter:{via}")]

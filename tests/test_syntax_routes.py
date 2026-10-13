@@ -21,12 +21,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from graphify_php.sources.route_source import (              # noqa: E402
+from graphify_php.sources.route_source import (  # noqa: E402
     RouteDeclarationSource,
     TreeSitterRouteSource,
 )
-from graphify_php.syntax import routes as routes_module      # noqa: E402
-from graphify_php.syntax.file_scan import scan_source        # noqa: E402
+from graphify_php.syntax import routes as routes_module  # noqa: E402
+from graphify_php.syntax.file_scan import scan_source  # noqa: E402
 
 SOURCE = TreeSitterRouteSource()
 
@@ -37,7 +37,9 @@ def scan(php: str, path: str = "Controller.php"):
 
 def one(php: str):
     found = scan(php)
-    assert len(found) == 1, f"expected one route, got {[(r.path, r.controller_method) for r in found]}"
+    assert len(found) == 1, (
+        f"expected one route, got {[(r.path, r.controller_method) for r in found]}"
+    )
     return found[0]
 
 
@@ -51,7 +53,7 @@ class C {
     #[Route('/api/v1/storage/upload/small/{id}', name: 'api-storage-upload-small', methods: ['POST'])]
     public function upload() {}
 }
-""")
+""")  # noqa: E501
     assert route.path == "/api/v1/storage/upload/small/{id}"
     assert route.name == "api-storage-upload-small"
     assert route.methods == ("POST",)
@@ -76,20 +78,22 @@ class C {
     "written, expected",
     [
         ("methods: ['GET', 'POST']", ("GET", "POST")),
-        ("methods: 'GET'", ("GET",)),        # a bare string, as written in this codebase
+        ("methods: 'GET'", ("GET",)),  # a bare string, as written in this codebase
         ('methods: ["PATCH"]', ("PATCH",)),
-        ("", ()),                             # absent: every method, and nothing to record
+        ("", ()),  # absent: every method, and nothing to record
     ],
 )
 def test_methods_forms(written, expected):
     extra = ", " + written if written else ""
-    route = one("""<?php
+    route = one(
+        f"""<?php
 namespace App\\Controller;
-class C {
-    #[Route('/x', name: 'x'%s)]
-    public function x() {}
-}
-""" % extra)
+class C {{
+    #[Route('/x', name: 'x'{extra})]
+    public function x() {{}}
+}}
+"""
+    )
     assert route.methods == expected
 
 
@@ -203,14 +207,17 @@ class H {
 
 def test_abstract_class_declares_nothing():
     """Symfony's loader refuses to read attributes from an abstract class."""
-    assert scan(r"""<?php
+    assert (
+        scan(r"""<?php
 namespace App\Controller;
 #[Route('/base', name: 'base-')]
 abstract class BaseController {
     #[Route('/x', name: 'x')]
     public function x() {}
 }
-""") == []
+""")
+        == []
+    )
 
 
 # --- identity ------------------------------------------------------------------------------
@@ -231,7 +238,10 @@ class Beta {
 """)
     assert len(found) == 2
     assert len({r.node_key for r in found}) == 2
-    assert {r.controller_class for r in found} == {"App\\Controller\\Alpha", "App\\Controller\\Beta"}
+    assert {r.controller_class for r in found} == {
+        "App\\Controller\\Alpha",
+        "App\\Controller\\Beta",
+    }
 
 
 def test_node_key_separates_two_paths_on_one_controller():
@@ -262,7 +272,7 @@ class C {
     assert route.path is None
     assert route.resolved is False
     assert route.reason == routes_module.PATH_NOT_LITERAL
-    assert route.name == "x"          # the parts that were literal survive
+    assert route.name == "x"  # the parts that were literal survive
     assert route.controller_method == "x"
 
 
@@ -294,12 +304,15 @@ class C {
 
 
 def test_a_class_without_route_attributes_declares_nothing():
-    assert scan(r"""<?php
+    assert (
+        scan(r"""<?php
 namespace App\Controller;
 class C {
     public function notARoute() {}
 }
-""") == []
+""")
+        == []
+    )
 
 
 # --- the source ----------------------------------------------------------------------------
@@ -315,20 +328,26 @@ def test_available_needs_nothing(tmp_path):
 
 
 def test_source_collects_across_files_and_counts_refusals(tmp_path):
-    (tmp_path / "A.php").write_text("""<?php
+    (tmp_path / "A.php").write_text(
+        """<?php
 namespace App;
 class A {
     #[Route('/a', name: 'a', methods: ['GET'])]
     public function a() {}
 }
-""", encoding="utf-8")
-    (tmp_path / "B.php").write_text("""<?php
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "B.php").write_text(
+        """<?php
 namespace App;
 class B {
     #[Route(self::P . '/b', name: 'b')]
     public function b() {}
 }
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     result = SOURCE.declarations(str(tmp_path), ["A.php", "B.php"])
     assert result.files_seen == 2
     assert len(result.declarations) == 2
@@ -344,13 +363,16 @@ def test_source_counts_a_file_it_cannot_read(tmp_path):
 
 
 def test_source_reads_each_file_once(tmp_path):
-    (tmp_path / "A.php").write_text("""<?php
+    (tmp_path / "A.php").write_text(
+        """<?php
 namespace App;
 class A {
     #[Route('/a', name: 'a')]
     public function a() {}
 }
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     result = SOURCE.declarations(str(tmp_path), ["A.php", "A.php", str(tmp_path / "A.php")])
     assert len(result.declarations) == 1
     assert result.files_seen == 1
@@ -365,7 +387,7 @@ class C {
             defaults: ['token' => 'SECRETDEFAULT'], condition: "request.headers.get('X') == 'SECRETCOND'")]
     public function x() {}
 }
-""")
+""")  # noqa: E501
     blob = repr(route)
     for leaked in ("SECRETPATTERN", "SECRETDEFAULT", "SECRETCOND", "requirements", "condition"):
         assert leaked not in blob, f"{leaked} reached the declaration"
@@ -382,22 +404,54 @@ def test_route_output_leaks_no_planted_secret(tmp_path):
 
     from eval import canaries
 
-    php = """<?php
+    canary = canaries.canary_values()[0]
+    php = f"""<?php
 namespace App\\Controller;
-class C {
-    #[Route('/x', name: 'x', defaults: ['token' => '%s'], condition: "%s")]
-    public function x() {}
-}
-""" % (canaries.canary_values()[0], canaries.canary_values()[0])
+class C {{
+    #[Route('/x', name: 'x', defaults: ['token' => '{canary}'], condition: "{canary}")]
+    public function x() {{}}
+}}
+"""
     (tmp_path / "C.php").write_text(php, encoding="utf-8")
     result = SOURCE.declarations(str(tmp_path), ["C.php"])
 
-    artifact = json.dumps([
-        {"key": d.node_key, "path": d.path, "name": d.name, "methods": list(d.methods),
-         "class": d.controller_class, "method": d.controller_method,
-         "file": d.source_file, "line": d.line, "reason": d.reason}
-        for d in result.declarations
-    ]) + json.dumps(result.unresolved)
+    artifact = json.dumps(
+        [
+            {
+                "key": d.node_key,
+                "path": d.path,
+                "name": d.name,
+                "methods": list(d.methods),
+                "class": d.controller_class,
+                "method": d.controller_method,
+                "file": d.source_file,
+                "line": d.line,
+                "reason": d.reason,
+            }
+            for d in result.declarations
+        ]
+    ) + json.dumps(result.unresolved)
 
     assert result.declarations, "fixture must produce a declaration, or this proves nothing"
     canaries.assert_no_leaks({"routes": artifact})
+
+
+@pytest.mark.parametrize(
+    "written",
+    [r"'/it\'s/{id}'", r'"/tab\t/{id}"', r'"/user/{$id}"', r'"/user/$id"'],
+    ids=["escaped-quote", "escape-sequence", "braced-interpolation", "bare-interpolation"],
+)
+def test_a_string_whose_value_is_not_its_source_text_is_refused_not_truncated(written):
+    """The first `string_content` of `'/it\\'s/{id}'` is `/it`, a path nothing serves."""
+    route = one(
+        rf"""<?php
+namespace App\Controller;
+class C {{
+    #[Route({written}, name: 'x')]
+    public function x() {{}}
+}}
+"""
+    )
+    assert route.path is None
+    assert route.method_path is None
+    assert route.reason == routes_module.PATH_NOT_LITERAL

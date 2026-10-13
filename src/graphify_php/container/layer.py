@@ -35,7 +35,9 @@ class ContainerOverlayLayer:
         self._reader = reader or SymfonyXmlContainerReader()
         self._writer = writer or OverlayWriter()
 
-    def run(self, repo_root: Path, out_dir: Path, name: str = DEFAULT_ARTIFACT_NAME) -> ResolverStatus:
+    def run(
+        self, repo_root: Path, out_dir: Path, name: str = DEFAULT_ARTIFACT_NAME
+    ) -> ResolverStatus:
         record = ResolverStatus(name=LAYER_NAME)
         path, reason = self._locator.locate(Path(repo_root))
         if path is None:

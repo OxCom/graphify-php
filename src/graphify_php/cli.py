@@ -30,10 +30,11 @@ import argparse
 import os
 import shutil
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Callable, Sequence
 
 from . import status
+from .config_resolver import RESOLVER_NAME as RESOLVER_NAME_CONFIG
 from .resolver import RESOLVER_NAME, RESOLVER_NAME_ROUTES
 
 EXIT_OK = 0
@@ -89,7 +90,15 @@ def _run_graphify(args: Sequence[str]) -> int:
         graphify_main()
         return 0
     except SystemExit as exc:
-        return int(exc.code or 0)
+        # graphify exits with a message string in places (`sys.exit("ERROR: ...")`). That is a
+        # failure, and the message is all the caller gets, so it goes to stderr here.
+        code = exc.code
+        if isinstance(code, int):
+            return code
+        if code is None:
+            return 0
+        print(code, file=sys.stderr)
+        return 1
     finally:
         sys.argv = argv
 
@@ -103,26 +112,40 @@ def _split_argv(argv: Sequence[str]) -> tuple[list[str], list[str]]:
     argv = list(argv)
     if "--" in argv:
         cut = argv.index("--")
-        return argv[:cut], argv[cut + 1:]
+        return argv[:cut], argv[cut + 1 :]
     return [], argv
 
 
-def main(argv: Sequence[str] | None = None,
-         run_graphify: Callable[[Sequence[str]], int] | None = None) -> int:
-    ours, passthrough = _split_argv(sys.argv[1:] if argv is None else argv)
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="graphify-php-build",
         description="Run graphify with graphify_php registered, refusing to publish a graph "
-                    "whose expected resolvers did not complete.",
+        "whose expected resolvers did not complete.",
     )
-    parser.add_argument("--graph", type=Path, default=None,
-                        help="graph artifact to protect (default: $GRAPHIFY_OUT/graph.json)")
-    parser.add_argument("--expect", action="append", dest="expect", default=None,
-                        metavar="RESOLVER",
-                        help="resolver that must report (repeatable, default: every resolver "
-                             "this package registers)")
-    opts = parser.parse_args(ours)
-    expected = opts.expect or [RESOLVER_NAME, RESOLVER_NAME_ROUTES]
+    parser.add_argument(
+        "--graph",
+        type=Path,
+        default=None,
+        help="graph artifact to protect (default: $GRAPHIFY_OUT/graph.json)",
+    )
+    parser.add_argument(
+        "--expect",
+        action="append",
+        dest="expect",
+        default=None,
+        metavar="RESOLVER",
+        help="resolver that must report (repeatable, default: every resolver "
+        "this package registers)",
+    )
+    return parser
+
+
+def main(
+    argv: Sequence[str] | None = None, run_graphify: Callable[[Sequence[str]], int] | None = None
+) -> int:
+    ours, passthrough = _split_argv(sys.argv[1:] if argv is None else argv)
+    opts = _parser().parse_args(ours)
+    expected = opts.expect or [RESOLVER_NAME, RESOLVER_NAME_ROUTES, RESOLVER_NAME_CONFIG]
     graph = opts.graph or default_graph_path()
 
     # A record from an earlier build would satisfy this build's gate, which is the one failure
@@ -142,7 +165,10 @@ def main(argv: Sequence[str] | None = None,
             print(f"graphify-php-build: graphify exited {code}", file=sys.stderr)
             return code
 
-        code, message = check(status.read(), expected)
+        try:
+            code, message = check(status.read(), expected)
+        except Exception as exc:  # a record the gate cannot read is a record that proves nothing
+            code, message = EXIT_RESOLVER_MISSING, f"status record unreadable: {exc}"
         if code == EXIT_OK:
             return EXIT_OK
 
@@ -175,9 +201,20 @@ def repo_root_from(args: Sequence[str]) -> str:
 
 
 def _console_main() -> None:
+    ours, passthrough = _split_argv(sys.argv[1:])
+    # Help needs no graphify, and `register` imports it; an environment without graphify
+    # would otherwise lose `--help` to a ModuleNotFoundError. A bare `--help` with no `--`
+    # lands in graphify's half by the split rule, but nothing else is there to pass on, so it
+    # is ours.
+    help_flags = {"-h", "--help"}
+    if help_flags & set(ours) or (
+        not ours and len(passthrough) == 1 and passthrough[0] in help_flags
+    ):
+        _parser().print_help()
+        sys.exit(0)
+
     from . import register
 
-    _, passthrough = _split_argv(sys.argv[1:])
     register(repo_root=repo_root_from(passthrough))
     sys.exit(main())
 

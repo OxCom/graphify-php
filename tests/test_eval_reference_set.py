@@ -28,10 +28,7 @@ def test_every_site_has_a_stratum_and_a_rationale():
 
 @pytest.mark.parametrize("site", rs.SITES, ids=lambda s: s.site_id)
 def test_label_points_at_real_source(site):
-    path = site.resolve_path()
-    if not path.exists():
-        pytest.skip(f"corpus not present: {path}")
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = site.resolve_path().read_text(encoding="utf-8").splitlines()
     assert site.line <= len(lines), f"{site.site_id}: file has {len(lines)} lines"
     text = lines[site.line - 1]
     # The method name is the one token every site shape shares; receivers vary too much

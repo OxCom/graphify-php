@@ -28,11 +28,11 @@ class NodeRef:
     value: str
 
     @staticmethod
-    def config(key: str) -> "NodeRef":
+    def config(key: str) -> NodeRef:
         return NodeRef(REF_CONFIG, key)
 
     @staticmethod
-    def php_class(fqn: str) -> "NodeRef":
+    def php_class(fqn: str) -> NodeRef:
         return NodeRef(REF_PHP_CLASS, fqn)
 
 
@@ -47,7 +47,7 @@ class ConfigNode:
 
     key: str
     label: str
-    kind: str                 # config_file | transport | env_var
+    kind: str  # config_file | transport | env_var
     source_file: str = ""
     source_location: str = ""
 
@@ -77,7 +77,7 @@ class FactSet:
     def unresolvable(self, reason: str, count: int = 1) -> None:
         self.unresolved[reason] = self.unresolved.get(reason, 0) + count
 
-    def extend(self, other: "FactSet") -> None:
+    def extend(self, other: FactSet) -> None:
         self.nodes.extend(other.nodes)
         self.edges.extend(other.edges)
         for reason, count in other.unresolved.items():

@@ -43,6 +43,7 @@ MAX_ALIASES = 500
 REASON_TOO_LARGE = "file_too_large"
 REASON_UNREADABLE = "file_unreadable"
 REASON_MALFORMED = "yaml_malformed"
+REASON_TOO_DEEP = "yaml_nested_too_deep"
 REASON_ALIAS_BUDGET = "yaml_alias_budget_exceeded"
 REASON_NOT_A_MAPPING = "document_not_a_mapping"
 
@@ -105,13 +106,18 @@ class SafeDocumentParser:
             return ParseResult(None, REASON_UNREADABLE)
 
         try:
-            data = yaml.load(text, Loader=ConfigSafeLoader)
+            data = yaml.load(text, Loader=ConfigSafeLoader)  # noqa: S506 - restricted loader
         except _AliasBudgetExceeded:
             return ParseResult(None, REASON_ALIAS_BUDGET)
         except yaml.YAMLError:
             # A hand-edited configuration file with a bad indent is ordinary. It costs this one
             # file, and the count is what makes it visible instead of silent.
             return ParseResult(None, REASON_MALFORMED)
+        except RecursionError:
+            # PyYAML composes one stack frame per nesting level, so ten kilobytes of `[[[[` is
+            # enough to overflow it. That is not a YAMLError, and uncaught it would take the
+            # whole pass down for one file.
+            return ParseResult(None, REASON_TOO_DEEP)
 
         if not isinstance(data, dict):
             # An empty file parses to `None` and a list-rooted file to a list. Neither is a

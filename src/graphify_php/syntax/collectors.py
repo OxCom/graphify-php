@@ -39,10 +39,10 @@ REASSIGNED_LOCAL = "reassigned-local"
 class ScanContext:
     """Where the walker currently is. Collectors read it; they never change it."""
 
-    facts: object            # FileFacts, kept untyped here to avoid an import cycle
-    names: object            # NameResolver
-    klass: object | None     # ClassScope
-    method: object | None    # MethodScope
+    facts: object  # FileFacts, kept untyped here to avoid an import cycle
+    names: object  # NameResolver
+    klass: object | None  # ClassScope
+    method: object | None  # MethodScope
 
 
 class TypeCollector(Protocol):
@@ -70,7 +70,9 @@ def _fact(collector: TypeCollector, fqn: str, members: tuple = ()) -> TypeFact:
     )
 
 
-def _declared_type(collector: TypeCollector, node, ctx: ScanContext) -> tuple[str | None, tuple, str | None]:
+def _declared_type(
+    collector: TypeCollector, node, ctx: ScanContext
+) -> tuple[str | None, tuple, str | None]:
     """Read a declaration's type annotation as (fqn, intersection members, refusal reason).
 
     Four outcomes. A concrete class is a fact. An intersection `A&B` is a fact with several
@@ -193,7 +195,9 @@ class ConstructorAssignmentCollector:
         property in the overwhelming majority of constructors, so restricting this to
         top-level statements would drop real facts for no gain in precision.
         """
-        if node is None:
+        if node is None or node.type in nodes.CLOSURE_KINDS:
+            # A closure's `$x` is the closure's own parameter or capture, not the
+            # constructor's, so an assignment inside one draws from a signature not read here.
             return
         if node.type == "assignment_expression":
             yield node
@@ -251,10 +255,7 @@ class LocalConstructionCollector:
         # Any second write revokes the binding, in either order. Without flow analysis there is
         # no way to tell a call placed before the second write from one placed after it, and
         # only one of those two readings is true.
-        rewritten = local in ctx.method.assigned
-        ctx.method.assigned.add(local)
-        if rewritten:
-            ctx.method.refuse_local(local, REASSIGNED_LOCAL, self.precedence)
+        if not ctx.method.note_write(local, REASSIGNED_LOCAL, self.precedence):
             return
         if right.type != "object_creation_expression":
             return
@@ -265,12 +266,78 @@ class LocalConstructionCollector:
         ctx.method.record_local(local, _fact(self, ctx.names.resolve(created)))
 
 
+class LocalRebindCollector:
+    """A construct that binds a local without an `=`: it revokes a `new` binding all the same.
+
+    A `foreach` target, a closure's parameters and `use` clause, a `catch` variable, a
+    destructuring target and the method's own parameters all write the name. Left uncounted,
+    `$m = new Emails(); foreach ($caches as $m) { $m->get(); }` resolves a call on a cache to
+    `Emails::get`. One instance per grammar node kind, so the walker dispatches as it does for
+    every other collector; none of them records a type, they only revoke.
+    """
+
+    via = "rebinding"
+    confidence = Confidence.INFERRED
+    # The same rank as the `new` binding it revokes: a stronger source's fact survives it.
+    precedence = LocalConstructionCollector.precedence
+
+    def __init__(self, node_kind: str) -> None:
+        self.node_kind = node_kind
+
+    def collect(self, node, ctx: ScanContext) -> None:
+        if ctx.method is None:
+            return
+        for name in _bound_names(node):
+            ctx.method.note_write(name, REASSIGNED_LOCAL, self.precedence)
+
+
+def _bound_names(node) -> list[str]:
+    """The locals a binding construct writes, read from its direct children only.
+
+    Direct children, because a nested `list_literal` is dispatched to its own collector and
+    reading it twice would count one write as two. In a `foreach` only the part after `as`
+    is a target; the subject before it is read, not written.
+    """
+    if node.type == "formal_parameters":
+        params = nodes.children(
+            node, "simple_parameter", "variadic_parameter", "property_promotion_parameter"
+        )
+        return [name for name in (nodes.variable_of(p) for p in params) if name]
+    if node.type == "foreach_statement":
+        seen_as = False
+        targets = []
+        for child in node.children:
+            if not child.is_named and nodes.node_text(child) == "as":
+                seen_as = True
+            elif seen_as:
+                targets.append(child)
+        node_list = targets
+    else:
+        node_list = node.children
+    names = []
+    for child in node_list:
+        if child.type == "pair":
+            names.extend(_bound_names(child))
+        elif child.type == "by_ref":
+            names.extend(_bound_names(child))
+        elif child.type == "variable_name":
+            name = nodes.node_text(child).lstrip("$")
+            if name and name != "this":
+                names.append(name)
+    return names
+
+
 # The registry. Adding a type source means adding a class above and one entry here.
 COLLECTORS: list[TypeCollector] = [
     PromotedParameterCollector(),
     TypedPropertyCollector(),
     ConstructorAssignmentCollector(),
     LocalConstructionCollector(),
+    LocalRebindCollector("formal_parameters"),
+    LocalRebindCollector("anonymous_function_use_clause"),
+    LocalRebindCollector("foreach_statement"),
+    LocalRebindCollector("catch_clause"),
+    LocalRebindCollector("list_literal"),
 ]
 
 

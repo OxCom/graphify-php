@@ -56,7 +56,7 @@ def test_perfect_resolver_scores_clean():
     assert report.site_recall_in_scope == sc.Ratio(3, 3)
     assert report.multi_target_exact == sc.Ratio(1, 1)
     assert report.negatives_held == sc.Ratio(1, 1)
-    assert report.coverage == sc.Ratio(4, 5)   # the negative is eligible and correctly unresolved
+    assert report.coverage == sc.Ratio(4, 5)  # the negative is eligible and correctly unresolved
     assert report.errors == ()
 
 
@@ -64,8 +64,8 @@ def test_over_prediction_costs_precision_and_leaves_recall_alone():
     output = sc.ResolverOutput(
         predictions=PERFECT
         + (
-            sc.Prediction("N", "App\\Basket", "empty"),      # should have stayed silent
-            sc.Prediction("O", "App\\Wrong", "deep"),        # out of scope, so not in recall
+            sc.Prediction("N", "App\\Basket", "empty"),  # should have stayed silent
+            sc.Prediction("O", "App\\Wrong", "deep"),  # out of scope, so not in recall
         )
     )
     report = sc.score(SITES, output)
@@ -128,11 +128,15 @@ def test_alternative_accepted_answers_are_both_correct():
         ),
     )
     for class_fqn in ("App\\Campaign", "App\\SendsMail"):
-        report = sc.score((site,), sc.ResolverOutput(predictions=(sc.Prediction("T", class_fqn, "dispatch"),)))
+        report = sc.score(
+            (site,), sc.ResolverOutput(predictions=(sc.Prediction("T", class_fqn, "dispatch"),))
+        )
         assert report.target_precision.value == 1.0, class_fqn
         assert report.site_recall_in_scope == sc.Ratio(1, 1)
 
-    wrong = sc.score((site,), sc.ResolverOutput(predictions=(sc.Prediction("T", "App\\Other", "dispatch"),)))
+    wrong = sc.score(
+        (site,), sc.ResolverOutput(predictions=(sc.Prediction("T", "App\\Other", "dispatch"),))
+    )
     assert wrong.target_precision == sc.Ratio(0, 1)
 
 
@@ -203,7 +207,14 @@ def test_scorer_never_imports_the_package_under_test():
 
 def test_json_seam_accepts_a_resolver_that_is_not_python(tmp_path):
     payload = {
-        "predictions": [{"site_id": "A", "class_fqn": "App\\Emails", "method": "send", "confidence": "EXTRACTED"}],
+        "predictions": [
+            {
+                "site_id": "A",
+                "class_fqn": "App\\Emails",
+                "method": "send",
+                "confidence": "EXTRACTED",
+            }
+        ],
         "unresolved": {"N": "dynamic_method_name"},
         "observed": ["A", "N"],
     }
@@ -227,7 +238,11 @@ def test_cli_exits_non_zero_on_a_wrong_target(tmp_path, capsys):
         json.dumps(
             {
                 "predictions": [
-                    {"site_id": good.site_id, "class_fqn": target.class_fqn, "method": target.method}
+                    {
+                        "site_id": good.site_id,
+                        "class_fqn": target.class_fqn,
+                        "method": target.method,
+                    }
                 ]
             }
         ),
@@ -252,3 +267,19 @@ def test_cli_exits_non_zero_on_a_wrong_target(tmp_path, capsys):
     )
     assert sc.main([str(dirty)]) == 1
     assert "negatives held" in capsys.readouterr().out
+
+
+def test_a_wrong_pairing_of_an_accepted_class_and_method_is_not_an_extra_target():
+    # (A, bar) against {(A, foo), (B, bar)}: both halves exist in the answer but never together.
+    # That is a wrong class for `bar`, not a fan-out that reached one target too many.
+    site = _site("P", (frozenset({Target("App\\A", "foo"), Target("App\\B", "bar")}),))
+    output = sc.ResolverOutput(
+        predictions=(
+            sc.Prediction("P", "App\\A", "foo"),
+            sc.Prediction("P", "App\\B", "bar"),
+            sc.Prediction("P", "App\\A", "bar"),
+        )
+    )
+    report = sc.score((site,), output)
+    assert sc.EXTRA_TARGET not in report.error_kinds
+    assert report.error_kinds[sc.WRONG_CLASS] == 1

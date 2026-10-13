@@ -26,7 +26,7 @@ TYPE_KINDS = (
     "optional_type",
     "primitive_type",
     "intersection_type",
-    "disjunctive_normal_form_type",   # `(A&B)|C`, a disjunction whose branches are intersections
+    "disjunctive_normal_form_type",  # `(A&B)|C`, a disjunction whose branches are intersections
 )
 
 CLASS_KINDS = (
@@ -34,6 +34,15 @@ CLASS_KINDS = (
     "trait_declaration",
     "interface_declaration",
     "enum_declaration",
+)
+
+# A closure's parameters and `use` clause bind names of their own, and its body is not the
+# enclosing method's body. Both grammar names for the `function () {}` form are listed because
+# tree-sitter-php renamed the node between releases and graphify does not pin the version.
+CLOSURE_KINDS = (
+    "anonymous_function",
+    "anonymous_function_creation_expression",
+    "arrow_function",
 )
 
 _PARSER = None
@@ -170,7 +179,12 @@ def type_name(node) -> str | None:
     """
     if node is None:
         return None
-    if node.type in ("union_type", "disjunctive_normal_form_type", "intersection_type", "primitive_type"):
+    if node.type in (
+        "union_type",
+        "disjunctive_normal_form_type",
+        "intersection_type",
+        "primitive_type",
+    ):
         return None
     if node.type in ("optional_type", "nullable_type"):
         for candidate in node.children:

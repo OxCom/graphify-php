@@ -65,7 +65,11 @@ class OverlayWriter:
             "environment": dict(facts.environment),
             "counts": self.counts(facts),
             "aliases": [
-                {"alias": a.alias_id, "target": a.target_id, "target_class": facts.class_of(a.target_id)}
+                {
+                    "alias": a.alias_id,
+                    "target": a.target_id,
+                    "target_class": facts.class_of(a.target_id),
+                }
                 for a in sorted(facts.aliases.values(), key=lambda a: a.alias_id)
             ],
             "bindings": bindings,
@@ -113,7 +117,9 @@ class OverlayWriter:
             "env_arguments": len([i for i in facts.injections if i.kind is ArgumentKind.ENV]),
         }
 
-    def write(self, facts: ContainerFacts, out_dir: Path, name: str = DEFAULT_ARTIFACT_NAME) -> Path:
+    def write(
+        self, facts: ContainerFacts, out_dir: Path, name: str = DEFAULT_ARTIFACT_NAME
+    ) -> Path:
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / name
         path.write_text(json.dumps(self.build(facts), indent=2, sort_keys=False))

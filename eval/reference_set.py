@@ -27,8 +27,8 @@ Two flags carry meanings that are easy to confuse:
 `REFUSE` sites carry the single accepted answer "no target at all". They are not filler. Six
 upstream issues across four code-graph projects trace their false edges to a name-only
 fallback, one of them after `empty()` was wired to a method named `empty` — so the set holds
-both the synthetic version of that trap and a real `empty($user)` from the reference
-application.
+both the synthetic version of that trap and an `empty($user)` guard copied, shape for shape,
+from a messenger handler in the reference application (`handler_shapes.php`).
 """
 
 from __future__ import annotations
@@ -39,10 +39,6 @@ from enum import Enum
 from pathlib import Path
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures"
-
-# Read-only. Labels that cite it stay in the set when it is absent; the integrity check skips
-# them rather than failing, so the harness runs on a machine that does not have the app.
-REFERENCE_APP_ROOT = Path("/var/www/www.cem.dev.lo")
 
 
 class Stratum(str, Enum):
@@ -97,18 +93,14 @@ class LabelledSite:
     stratum: Stratum
     expectation: Expectation
     in_scope: bool
-    path: str                       # relative to FIXTURE_ROOT, or absolute for a real site
+    path: str  # relative to FIXTURE_ROOT
     line: int
-    receiver: str                   # source text; empty for a language construct like empty()
+    receiver: str  # source text; empty for a language construct like empty()
     method: str
-    caller: str                     # enclosing callable, as Class::method
+    caller: str  # enclosing callable, as Class::method
     accepted: tuple[frozenset[Target], ...]
     why: str
-    trap: bool = False              # a name-only resolver produces an edge here and is wrong
-
-    @property
-    def synthetic(self) -> bool:
-        return not Path(self.path).is_absolute()
+    trap: bool = False  # a name-only resolver produces an edge here and is wrong
 
     @property
     def canonical(self) -> frozenset[Target]:
@@ -127,8 +119,7 @@ class LabelledSite:
         return any(len(option) > 1 for option in self.accepted)
 
     def resolve_path(self) -> Path:
-        path = Path(self.path)
-        return path if path.is_absolute() else FIXTURE_ROOT / path
+        return FIXTURE_ROOT / self.path
 
 
 _EMAILS = "Eval\\Mail\\Emails"
@@ -149,7 +140,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="reminderSubmitWeek",
         caller="Eval\\Promoted\\Reminder::weekly",
         accepted=(_set(_t(_EMAILS, "reminderSubmitWeek")),),
-        why="`private readonly Emails $emails` promoted in the constructor, `use Eval\\Mail\\Emails`.",
+        why="`private readonly Emails $emails` promoted in the constructor, `use "
+        "Eval\\Mail\\Emails`.",
     ),
     LabelledSite(
         site_id="promoted.php:20:$this->emails->reminderSubmitMonth",
@@ -189,7 +181,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="reminderSubmitWeek",
         caller="Eval\\Declared\\Digest::send",
         accepted=(_set(_t(_EMAILS, "reminderSubmitWeek")),),
-        why="`private readonly Emails $legacy;` declared on the class, assigned in the constructor.",
+        why="`private readonly Emails $legacy;` declared on the class, assigned in the "
+        "constructor.",
     ),
     LabelledSite(
         site_id="inheritance.php:18:$this->emails->reminderSubmitWeek",
@@ -229,7 +222,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="reminderSubmitWeek",
         caller="Eval\\CtorBody\\Untyped::opaque",
         accepted=_NO_TARGET,
-        why="Same shape as the site above with an untyped parameter: nothing in source names a class.",
+        why="Same shape as the site above with an untyped parameter: nothing in source names a "
+        "class.",
         trap=True,
     ),
     # --- locals bound by `new` ------------------------------------------------------------
@@ -289,7 +283,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="notify",
         caller="Eval\\Inherit\\WeeklyNotifier::notify",
         accepted=(_set(_t("Eval\\Inherit\\BaseNotifier", "notify")),),
-        why="`extends BaseNotifier` in the same file; parent:: names the declaration, not the runtime class.",
+        why="`extends BaseNotifier` in the same file; parent:: names the declaration, not the "
+        "runtime class.",
     ),
     LabelledSite(
         site_id="inheritance.php:27:$this->emails->reminderSubmitMonth",
@@ -302,7 +297,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="reminderSubmitMonth",
         caller="Eval\\Inherit\\WeeklyNotifier::notify",
         accepted=(_set(_t(_EMAILS, "reminderSubmitMonth")),),
-        why="The property is declared on the parent; resolving it needs the inheritance walk, not just the class's own table.",
+        why="The property is declared on the parent; resolving it needs the inheritance walk, not "
+        "just the class's own table.",
     ),
     # --- traits ----------------------------------------------------------------------------
     LabelledSite(
@@ -316,7 +312,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="reminderSubmitWeek",
         caller="Eval\\Traits\\SendsMail::dispatch",
         accepted=(_set(_t(_EMAILS, "reminderSubmitWeek")),),
-        why="The trait declares the typed property it uses, so the site is resolvable inside the trait.",
+        why="The trait declares the typed property it uses, so the site is resolvable inside the "
+        "trait.",
     ),
     LabelledSite(
         site_id="traits.php:28:$this->dispatch",
@@ -350,7 +347,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="mailer",
         caller="Eval\\Chained\\Registry::firstHop",
         accepted=(_set(_t("Eval\\Chained\\Provider", "mailer")),),
-        why="The first hop of a chain is an ordinary promoted-property call and must not be lost with the second.",
+        why="The first hop of a chain is an ordinary promoted-property call and must not be lost "
+        "with the second.",
     ),
     LabelledSite(
         site_id="chained.php:15:$this->provider->mailer()->reminderSubmitWeek",
@@ -382,7 +380,9 @@ SITES: tuple[LabelledSite, ...] = (
         caller="Eval\\Iface\\Courier::deliver",
         accepted=(
             _set(_t("Eval\\Iface\\Transport", "send")),
-            _set(_t("Eval\\Iface\\SmtpTransport", "send"), _t("Eval\\Iface\\NullTransport", "send")),
+            _set(
+                _t("Eval\\Iface\\SmtpTransport", "send"), _t("Eval\\Iface\\NullTransport", "send")
+            ),
         ),
         why=(
             "8 % of injected properties on the reference application are interface-typed. "
@@ -402,7 +402,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="reminderSubmitMonth",
         caller="Eval\\Declared\\Digest::maybeSend",
         accepted=(_set(_t(_EMAILS, "reminderSubmitMonth")),),
-        why="null owns no methods, so `?Emails` reached through `?->` still has exactly one target.",
+        why="null owns no methods, so `?Emails` reached through `?->` still has exactly one "
+        "target.",
     ),
     LabelledSite(
         site_id="nullable_union.php:18:$this->maybeMailer?->reminderSubmitWeek",
@@ -415,7 +416,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="reminderSubmitWeek",
         caller="Eval\\Variance\\Variant::nullableCall",
         accepted=(_set(_t(_EMAILS, "reminderSubmitWeek")),),
-        why="Nullable on a promoted parameter rather than a declaration: same answer, different parse path.",
+        why="Nullable on a promoted parameter rather than a declaration: same answer, different "
+        "parse path.",
     ),
     LabelledSite(
         site_id="nullable_union.php:23:$this->either->get",
@@ -448,7 +450,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="get",
         caller="Eval\\Traps\\Checkout::typedGet",
         accepted=(_set(_t(_CACHE, "get")),),
-        why="Cache and Basket both declare get(); only the declared type picks Cache, and a name match picks at random.",
+        why="Cache and Basket both declare get(); only the declared type picks Cache, and a name "
+        "match picks at random.",
         trap=True,
     ),
     LabelledSite(
@@ -476,7 +479,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="empty",
         caller="Eval\\Traps\\Checkout::untypedEmpty",
         accepted=_NO_TARGET,
-        why="The synthetic twin of the upstream failure where `empty()` was wired to a method named empty.",
+        why="The synthetic twin of the upstream failure where `empty()` was wired to a method "
+        "named empty.",
         trap=True,
     ),
     # --- negatives that must stay unresolved ---------------------------------------------------
@@ -491,7 +495,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="reminderSubmitWeek",
         caller="Eval\\Dynamic\\Caller::dynamicProperty",
         accepted=_NO_TARGET,
-        why="The property name is a value. `Emails` is in scope in this file, which is exactly what makes the wrong edge tempting.",
+        why="The property name is a value. `Emails` is in scope in this file, which is exactly "
+        "what makes the wrong edge tempting.",
         trap=True,
     ),
     LabelledSite(
@@ -505,7 +510,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="$method",
         caller="Eval\\Dynamic\\Caller::dynamicMethod",
         accepted=_NO_TARGET,
-        why="Receiver type is known and the method name is not: half-knowledge must not become an edge to every Emails method.",
+        why="Receiver type is known and the method name is not: half-knowledge must not become an "
+        "edge to every Emails method.",
         trap=True,
     ),
     LabelledSite(
@@ -533,7 +539,8 @@ SITES: tuple[LabelledSite, ...] = (
         method="invoke",
         caller="Eval\\Dynamic\\Caller::viaReflection",
         accepted=_NO_TARGET,
-        why="The method name appears as a string literal, which is the cheapest false positive available.",
+        why="The method name appears as a string literal, which is the cheapest false positive "
+        "available.",
         trap=True,
     ),
     LabelledSite(
@@ -554,71 +561,78 @@ SITES: tuple[LabelledSite, ...] = (
         ),
         trap=True,
     ),
-    # --- real sites, read off the reference application ----------------------------------------
+    # --- one real handler, copied shape for shape ---------------------------------------------
+    # `handler_shapes.php` reproduces a messenger handler from the reference application with
+    # neutral names: a framework entry point calling its own method, two promoted properties,
+    # two chained calls of which only the first hop is labelled, and an `empty()` guard.
     LabelledSite(
-        site_id="cem:AzureUserAvatarHandler.php:23:$this->process",
+        site_id="handler_shapes.php:95:$this->process",
         stratum=Stratum.SELF_RECEIVER,
         expectation=Expectation.RESOLVE,
         in_scope=True,
-        path=str(REFERENCE_APP_ROOT / "src/Messages/Handler/AzureUserAvatarHandler.php"),
-        line=23,
+        path="handler_shapes.php",
+        line=95,
         receiver="$this",
         method="process",
-        caller="App\\Messages\\Handler\\AzureUserAvatarHandler::__invoke",
-        accepted=(_set(_t("App\\Messages\\Handler\\AzureUserAvatarHandler", "process")),),
-        why="Declared at line 26 of the same file. A framework entry point calling its own method.",
+        caller="Eval\\Handler\\AvatarHandler::__invoke",
+        accepted=(_set(_t("Eval\\Handler\\AvatarHandler", "process")),),
+        why="Declared at line 98 of the same file. A framework entry point calling its own method.",
     ),
     LabelledSite(
-        site_id="cem:AzureUserAvatarHandler.php:28:$this->users->disableDoctrineListeners",
+        site_id="handler_shapes.php:100:$this->users->disableListeners",
         stratum=Stratum.PROMOTED_CTOR_PROPERTY,
         expectation=Expectation.RESOLVE,
         in_scope=True,
-        path=str(REFERENCE_APP_ROOT / "src/Messages/Handler/AzureUserAvatarHandler.php"),
-        line=28,
+        path="handler_shapes.php",
+        line=100,
         receiver="$this->users",
-        method="disableDoctrineListeners",
-        caller="App\\Messages\\Handler\\AzureUserAvatarHandler::process",
-        accepted=(_set(_t("App\\Repository\\CEM\\UserRepository", "disableDoctrineListeners")),),
-        why="`private readonly UserRepository $users`; target declared at src/Repository/CEM/UserRepository.php:50.",
+        method="disableListeners",
+        caller="Eval\\Handler\\AvatarHandler::process",
+        accepted=(_set(_t("Eval\\Handler\\UserRepository", "disableListeners")),),
+        why="`private readonly UserRepository $users`; target declared at handler_shapes.php:45, "
+        "on the repository itself rather than on the base class it extends.",
     ),
     LabelledSite(
-        site_id="cem:AzureUserAvatarHandler.php:36:$this->azure->users",
+        site_id="handler_shapes.php:108:$this->directory->users",
         stratum=Stratum.PROMOTED_CTOR_PROPERTY,
         expectation=Expectation.RESOLVE,
         in_scope=True,
-        path=str(REFERENCE_APP_ROOT / "src/Messages/Handler/AzureUserAvatarHandler.php"),
-        line=36,
-        receiver="$this->azure",
+        path="handler_shapes.php",
+        line=108,
+        receiver="$this->directory",
         method="users",
-        caller="App\\Messages\\Handler\\AzureUserAvatarHandler::process",
-        accepted=(_set(_t("App\\Handler\\Azure", "users")),),
-        why="`private readonly Azure $azure`; target declared at src/Handler/Azure.php:23. Only the first hop is labelled.",
+        caller="Eval\\Handler\\AvatarHandler::process",
+        accepted=(_set(_t("Eval\\Handler\\DirectoryClient", "users")),),
+        why="`private readonly DirectoryClient $directory`; target declared at "
+        "handler_shapes.php:73. Only the first hop is labelled.",
     ),
     LabelledSite(
-        site_id="cem:AzureUserAvatarHandler.php:53:$this->azure->avatar",
+        site_id="handler_shapes.php:122:$this->directory->avatar",
         stratum=Stratum.PROMOTED_CTOR_PROPERTY,
         expectation=Expectation.RESOLVE,
         in_scope=True,
-        path=str(REFERENCE_APP_ROOT / "src/Messages/Handler/AzureUserAvatarHandler.php"),
-        line=53,
-        receiver="$this->azure",
+        path="handler_shapes.php",
+        line=122,
+        receiver="$this->directory",
         method="avatar",
-        caller="App\\Messages\\Handler\\AzureUserAvatarHandler::process",
-        accepted=(_set(_t("App\\Handler\\Azure", "avatar")),),
-        why="Target declared at src/Handler/Azure.php:28. Same caller and receiver as the site above, different method.",
+        caller="Eval\\Handler\\AvatarHandler::process",
+        accepted=(_set(_t("Eval\\Handler\\DirectoryClient", "avatar")),),
+        why="Target declared at handler_shapes.php:78. Same caller and receiver as the site "
+        "above, different method.",
     ),
     LabelledSite(
-        site_id="cem:AzureUserAvatarHandler.php:32:empty",
+        site_id="handler_shapes.php:104:empty",
         stratum=Stratum.SAME_NAME_TRAP,
         expectation=Expectation.REFUSE,
         in_scope=True,
-        path=str(REFERENCE_APP_ROOT / "src/Messages/Handler/AzureUserAvatarHandler.php"),
-        line=32,
+        path="handler_shapes.php",
+        line=104,
         receiver="",
         method="empty",
-        caller="App\\Messages\\Handler\\AzureUserAvatarHandler::process",
+        caller="Eval\\Handler\\AvatarHandler::process",
         accepted=_NO_TARGET,
-        why="`empty($user)` is a language construct. The real form of the upstream defect, in real code.",
+        why="`empty($user)` is a language construct. The real form of the upstream defect, as "
+        "it appears in handler code.",
         trap=True,
     ),
 )

@@ -15,7 +15,11 @@ from . import reasons
 
 # Both halves of a Symfony install: the framework itself, and the bundle that compiles the
 # container the dump comes from. Either one present is enough to call the project Symfony.
-_SYMFONY_MARKERS = ("symfony/framework-bundle", "symfony/http-kernel", "symfony/dependency-injection")
+_SYMFONY_MARKERS = (
+    "symfony/framework-bundle",
+    "symfony/http-kernel",
+    "symfony/dependency-injection",
+)
 
 
 class SymfonyCacheLocator:
@@ -47,6 +51,10 @@ class SymfonyCacheLocator:
                 else len(self._preferred)
             )
             for candidate in sorted(environment_dir.glob("*Container.xml")):
+                # A link under `var/cache` can point anywhere on the machine; following it
+                # would read a file outside the repository under the repository's name.
+                if candidate.is_symlink():
+                    continue
                 candidates.append((rank, candidate))
         if not candidates:
             return None, reasons.SKIP_XML_ABSENT

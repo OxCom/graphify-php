@@ -16,9 +16,9 @@ would stop working the day a new artifact is added, which is the day it is most 
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures"
 
@@ -28,10 +28,10 @@ MARKER = "CANARY"
 @dataclass(frozen=True)
 class Canary:
     name: str
-    kind: str              # where a real secret of this shape would live
+    kind: str  # where a real secret of this shape would live
     value: str
-    planted_in: str        # path relative to FIXTURE_ROOT
-    identifier: str        # the name beside it, which IS allowed in an artifact
+    planted_in: str  # path relative to FIXTURE_ROOT
+    identifier: str  # the name beside it, which IS allowed in an artifact
 
 
 CANARIES: tuple[Canary, ...] = (
@@ -82,7 +82,7 @@ class Leak:
     canary: str
     artifact: str
     line: int
-    excerpt: str           # the canary value replaced, so the report cannot leak it further
+    excerpt: str  # the canary value replaced, so the report cannot leak it further
 
 
 def canary_values() -> tuple[str, ...]:
@@ -107,9 +107,13 @@ def verify_planted(root: Path | None = None) -> list[str]:
         if canary.value not in text:
             problems.append(f"{canary.name}: value not present in {canary.planted_in}")
         if canary.identifier not in text:
-            problems.append(f"{canary.name}: identifier {canary.identifier} not present in {canary.planted_in}")
+            problems.append(
+                f"{canary.name}: identifier {canary.identifier} not present in {canary.planted_in}"
+            )
         if MARKER not in canary.value:
-            problems.append(f"{canary.name}: value carries no {MARKER} marker, so it may be a real secret")
+            problems.append(
+                f"{canary.name}: value carries no {MARKER} marker, so it may be a real secret"
+            )
     return problems
 
 
@@ -125,7 +129,9 @@ def scan_text(artifact: str, text: str) -> list[Leak]:
                         canary=canary.name,
                         artifact=artifact,
                         line=number,
-                        excerpt=line.strip().replace(canary.value, f"<{canary.name} redacted>")[:200],
+                        excerpt=line.strip().replace(canary.value, f"<{canary.name} redacted>")[
+                            :200
+                        ],
                     )
                 )
     return found
@@ -160,5 +166,7 @@ def collect_artifacts(paths: Iterable[Path]) -> dict[str, str]:
 def assert_no_leaks(artifacts: Mapping[str, str]) -> None:
     leaks = scan_artifacts(artifacts)
     if leaks:
-        detail = "\n".join(f"  {leak.canary} in {leak.artifact}:{leak.line}: {leak.excerpt}" for leak in leaks)
+        detail = "\n".join(
+            f"  {leak.canary} in {leak.artifact}:{leak.line}: {leak.excerpt}" for leak in leaks
+        )
         raise CanaryLeak(f"{len(leaks)} planted value(s) reached an artifact:\n{detail}")

@@ -1,0 +1,146 @@
+name: stage-security
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks — scan git history for hardcoded secrets
+        # Plain OSS gitleaks CLI, not gitleaks/gitleaks-action: that Action now
+        # requires a paid GITLEAKS_LICENSE for GitHub Organizations. The CLI
+        # itself stays free/open-source.
+        # The sha256 below is pinned from the official release checksums file:
+        # https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
+        # .gitleaks.toml at the repository root extends the default rules with
+        # a path allowlist for the planted canaries (see that file).
+        run: |
+          curl -sSfL -o gitleaks_8.30.1_linux_x64.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks_8.30.1_linux_x64.tar.gz gitleaks
+          ./gitleaks detect --source . --no-banner --redact
+
+  trufflehog:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # The pull-request scan reports the `unknown` result class, the history
+      # scan does not. An `unknown` result is a string that looks like a
+      # credential and cannot be verified. On a pull request it is in the diff
+      # under review and can still be changed; in old history it can only be
+      # silenced by rewriting the commits that contain it, which would fail this
+      # job on every future run of a repository that leaks nothing.
+      #
+      # Both scans report every verified result, from every detector. A real
+      # leak fails this job wherever it lands.
+      - name: trufflehog — scan PR commits for verified and unknown secrets (pull_request)
+        if: github.event_name == 'pull_request'
+        uses: trufflesecurity/trufflehog@363923b901c911a9164f50b6c423f47c15372b1c # v3.97.4
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          # --exclude-paths names the two files that plant fake credentials on
+          # purpose; .trufflehog-exclude.txt explains which and why. Excluding
+          # those paths is what keeps the `unknown` class switched on for every
+          # other file in the diff.
+          extra_args: --results=verified,unknown --exclude-paths=.trufflehog-exclude.txt
+
+      # Runs on push, and on the nightly schedule and manual dispatch too.
+      - name: trufflehog — scan full git history for verified secrets
+        if: github.event_name != 'pull_request'
+        uses: trufflesecurity/trufflehog@363923b901c911a9164f50b6c423f47c15372b1c # v3.97.4
+        with:
+          path: ./
+          base: ""
+          head: ${{ github.ref_name }}
+          # No --exclude-paths here: this scan reports only verified results,
+          # and a verified credential must fail the job whatever file it sits
+          # in, canary fixture included.
+          extra_args: --results=verified
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install graphify-php with test and lint extras
+        # The package has no runtime dependencies; the test extra is what pulls
+        # graphifyy and its tree-sitter grammars, so this is the tree worth
+        # auditing.
+        run: pip install -e ".[test,lint]"
+
+      - name: pip-audit — audit installed Python dependencies for known CVEs
+        # pip-audit exits 1 when it finds known vulnerabilities — that MUST
+        # fail the job. Only other nonzero exit codes (infra/network errors,
+        # e.g. the PyPI advisory DB being unreachable) are downgraded to a
+        # logged warning so a transient hiccup doesn't block the pipeline.
+        run: |
+          pip install pip-audit
+          set +e
+          pip-audit
+          code=$?
+          set -e
+          case "$code" in
+            0)
+              echo "pip-audit: no known vulnerabilities found."
+              ;;
+            1)
+              echo "::error::pip-audit found known vulnerabilities in installed dependencies."
+              exit 1
+              ;;
+            *)
+              echo "::warning::pip-audit exited with code $code (infra/network error, not a vulnerability finding); not failing the job."
+              ;;
+          esac
+
+  php-lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up PHP
+        # The SHA is the one symfony/symfony's own workflows pin for 2.37.2; it
+        # was copied from a local checkout, not verified against the release
+        # page from this machine.
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          # php/README.md verifies the collector against PHP 8.4.
+          php-version: "8.4"
+          coverage: none
+          tools: none
+
+      - name: php -l — syntax-check the PHPStan collector
+        # The Python suite only exercises php/ through PHPStan, which CI does
+        # not have (see stage-tests.yml), so this is the one check that runs
+        # against the PHP files on every push.
+        run: |
+          set -euo pipefail
+          find php/src -name '*.php' -print0 | xargs -0 -n1 php -l
+          php -l php/autoload.php

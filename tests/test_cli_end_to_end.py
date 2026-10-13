@@ -120,13 +120,18 @@ def _build(tmp_path: Path, register: bool) -> tuple[dict, dict]:
         "PYTHONHASHSEED": "0",
     }
     src = str(Path(__file__).resolve().parents[1] / "src")
-    script = RUNNER % {"src": src, "repo": str(repo)} if register else (
-        "import sys\nsys.argv = ['graphify', 'update', %r, '--no-cluster']\n"
-        "from graphify.__main__ import main\n"
-        "try:\n    main()\nexcept SystemExit as exc:\n    pass\n" % str(repo)
+    script = (
+        RUNNER % {"src": src, "repo": str(repo)}
+        if register
+        else (
+            f"import sys\nsys.argv = ['graphify', 'update', {str(repo)!r}, '--no-cluster']\n"
+            "from graphify.__main__ import main\n"
+            "try:\n    main()\nexcept SystemExit as exc:\n    pass\n"
+        )
     )
-    done = subprocess.run([sys.executable, "-c", script], env=env,
-                          capture_output=True, text=True, timeout=300)
+    done = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300
+    )
     assert done.returncode == 0, done.stderr
 
     graph = json.loads((out / "graph.json").read_text())
@@ -204,7 +209,8 @@ def test_the_route_declaration_is_published_as_a_node(builds):
     (plain, _), (registered, _) = builds
 
     assert not [n for n in plain["nodes"] if n.get("_kind") == "http_route"], (
-        "graphify alone knows nothing about routes")
+        "graphify alone knows nothing about routes"
+    )
 
     routes = [n for n in registered["nodes"] if n.get("_kind") == "http_route"]
     assert len(routes) == 1
@@ -222,8 +228,11 @@ def test_the_route_node_is_edged_to_the_controller_method(builds):
     label = {n["id"]: n["label"] for n in registered["nodes"]}
     route = next(n for n in registered["nodes"] if n.get("_kind") == "http_route")
 
-    edges = [e for e in registered["links"]
-             if e["relation"] == ROUTE_RELATION and e["source"] == route["id"]]
+    edges = [
+        e
+        for e in registered["links"]
+        if e["relation"] == ROUTE_RELATION and e["source"] == route["id"]
+    ]
     assert len(edges) == 1
     # The path is served by the controller method, which is the connection that makes a route
     # answerable by traversal rather than by grep.

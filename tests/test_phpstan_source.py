@@ -7,15 +7,17 @@ never run on the nine of twenty repositories that have no PHPStan at all.
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from graphify_php.ports import CallSite, Confidence
 from graphify_php.sources import phpstan_source as ps
-
 
 WIRING = """
 services:
@@ -32,8 +34,9 @@ services:
 """
 
 
-def make_repo(tmp_path: Path, *, binary: bool = True, config: bool = True,
-              wired: bool = True) -> Path:
+def make_repo(
+    tmp_path: Path, *, binary: bool = True, config: bool = True, wired: bool = True
+) -> Path:
     root = tmp_path / "repo"
     (root / "vendor" / "bin").mkdir(parents=True)
     if binary:
@@ -146,8 +149,18 @@ class TestWiring:
 
     def test_rule_without_collector_still_counts_as_unwired(self, tmp_path):
         root = make_repo(tmp_path, wired=False)
+        (root / "phpstan.neon").write_text("services:\n\t-\n\t\tclass: CallGraph\\CallEdgeRule\n")
+        missing = ps.EnvironmentProbe().missing_wiring(root / "phpstan.neon")
+        assert missing == ("CallGraph\\MethodCallCollector",)
+
+    def test_a_commented_out_registration_does_not_count(self, tmp_path):
+        """A `#` line is what a project leaves behind after trying the block and backing it out."""
+        root = make_repo(tmp_path, wired=False)
         (root / "phpstan.neon").write_text(
-            "services:\n\t-\n\t\tclass: CallGraph\\CallEdgeRule\n")
+            "services:\n"
+            "\t# - class: CallGraph\\MethodCallCollector\n"
+            "\t-\n\t\tclass: CallGraph\\CallEdgeRule # CallGraph\\MethodCallCollector later\n"
+        )
         missing = ps.EnvironmentProbe().missing_wiring(root / "phpstan.neon")
         assert missing == ("CallGraph\\MethodCallCollector",)
 
@@ -156,7 +169,8 @@ class TestWiring:
         (root / "build").mkdir()
         (root / "build" / "call-graph.neon").write_text(WIRING)
         (root / "phpstan.neon").write_text(
-            "includes:\n\t- build/call-graph.neon\n\nparameters:\n\tlevel: 5\n")
+            "includes:\n\t- build/call-graph.neon\n\nparameters:\n\tlevel: 5\n"
+        )
         assert ps.EnvironmentProbe().missing_wiring(root / "phpstan.neon") == ()
 
     def test_include_cycle_terminates(self, tmp_path):
@@ -167,14 +181,29 @@ class TestWiring:
 
     def test_a_missing_include_does_not_raise(self, tmp_path):
         root = make_repo(tmp_path, wired=False)
-        (root / "phpstan.neon").write_text(
-            "includes:\n\t- vendor/nothing/here.neon\n" + WIRING)
+        (root / "phpstan.neon").write_text("includes:\n\t- vendor/nothing/here.neon\n" + WIRING)
         assert ps.EnvironmentProbe().missing_wiring(root / "phpstan.neon") == ()
 
     def test_placeholder_include_is_skipped_not_guessed(self, tmp_path):
         root = make_repo(tmp_path, wired=False)
         (root / "phpstan.neon").write_text("includes:\n\t- %rootDir%/conf/config.neon\n")
         assert ps._includes((root / "phpstan.neon").read_text()) == []
+
+    def test_wrapper_quotes_the_include_so_neon_syntax_in_the_path_is_literal(self, tmp_path):
+        """`%` is parameter syntax in NEON; a path holding one must arrive as the path."""
+        root = tmp_path / "100% done" / "repo"
+        (root / "vendor" / "bin").mkdir(parents=True)
+        (root / "vendor" / "bin" / "phpstan").write_text("#!/bin/sh\nexit 0\n")
+        (root / "phpstan.neon").write_text("parameters:\n\tlevel: 5\n")
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        text = ps.PhpStanRunner().config_for(str(root), workdir).read_text()
+        include = next(line for line in text.splitlines() if line.strip().startswith("-"))
+        expected = str((root / "phpstan.neon").resolve()).replace("%", "%%")
+        assert include.strip() == f'- "{expected}"'
+
+    def test_neon_string_escapes_a_quote_and_a_backslash(self):
+        assert ps._neon_string('a"b\\c%d') == '"a\\"b\\\\c%%d"'
 
     def test_a_repository_without_a_config_cannot_be_wrapped(self, tmp_path):
         root = make_repo(tmp_path, config=False)
@@ -207,6 +236,14 @@ class TestRecordParsing:
     @pytest.mark.parametrize("over", [{}, {"callPos": None}, {"callPos": "412"}])
     def test_call_position_is_none_when_absent_or_not_an_int(self, over):
         assert ps.PhpStanCall.from_json(record(**over)).call_pos is None
+
+    def test_callee_file_is_read_when_present(self):
+        call = ps.PhpStanCall.from_json(record(calleeFile="/repo/vendor/acme/Lib.php"))
+        assert call.callee_file == "/repo/vendor/acme/Lib.php"
+
+    @pytest.mark.parametrize("over", [{}, {"calleeFile": None}])
+    def test_callee_file_defaults_to_empty(self, over):
+        assert ps.PhpStanCall.from_json(record(**over)).callee_file == ""
 
     @pytest.mark.parametrize(
         "raw",
@@ -276,10 +313,28 @@ class TestResolve:
         assert result.files_seen == 1
         assert ps.REASON_NOT_TYPED not in result.unresolved
 
+    def test_declaring_file_reaches_the_target(self, tmp_path):
+        root = make_repo(tmp_path)
+        line = json.dumps(
+            record(file=str(root / "src/App.php"), calleeFile=str(root / "vendor/acme/Lib.php"))
+        )
+        result = source_with(FakeRunner(ps.RunOutcome(True), [line])).resolve(str(root), [site()])
+
+        assert result.targets[0].declaring_file == str(root / "vendor/acme/Lib.php")
+
+    def test_declaring_file_is_empty_when_the_record_has_none(self, tmp_path):
+        root = make_repo(tmp_path)
+        line = json.dumps(record(file=str(root / "src/App.php")))
+        result = source_with(FakeRunner(ps.RunOutcome(True), [line])).resolve(str(root), [site()])
+
+        assert result.targets[0].declaring_file == ""
+
     def test_interface_target_reaches_the_caller_flagged(self, tmp_path):
         root = make_repo(tmp_path)
         line = json.dumps(
-            record(file=str(root / "src/App.php"), calleeClass="App\\Mailer", calleeKind="interface")
+            record(
+                file=str(root / "src/App.php"), calleeClass="App\\Mailer", calleeKind="interface"
+            )
         )
         result = source_with(FakeRunner(ps.RunOutcome(True), [line])).resolve(str(root), [site()])
 
@@ -299,7 +354,9 @@ class TestResolve:
         root = make_repo(tmp_path)
         path = str(root / "src/App.php")
         lines = [
-            json.dumps(record(file=path, line=20, calleeMethod="factory", calleeClass="App\\Controller")),
+            json.dumps(
+                record(file=path, line=20, calleeMethod="factory", calleeClass="App\\Controller")
+            ),
             json.dumps(record(file=path, line=20, calleeMethod="send")),
         ]
         sites = [site(line="20", method="factory"), site(line="20", method="send")]
@@ -312,10 +369,14 @@ class TestResolve:
         root = make_repo(tmp_path)
         path = str(root / "src/App.php")
         lines = [
-            json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Emails", callPos=40)),
+            json.dumps(
+                record(file=path, calleeMethod="get", calleeClass="App\\Emails", callPos=40)
+            ),
             json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Cache", callPos=40)),
         ]
-        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(str(root), [site(method="get")])
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(
+            str(root), [site(method="get")]
+        )
 
         assert {t.class_fqn for t in result.targets} == {"App\\Emails", "App\\Cache"}
         assert ps.REASON_SAME_LINE_COLLISION not in result.unresolved
@@ -325,22 +386,72 @@ class TestResolve:
         root = make_repo(tmp_path)
         path = str(root / "src/App.php")
         lines = [
-            json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Emails", callPos=40)),
+            json.dumps(
+                record(file=path, calleeMethod="get", calleeClass="App\\Emails", callPos=40)
+            ),
             json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Cache", callPos=58)),
         ]
-        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(str(root), [site(method="get")])
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(
+            str(root), [site(method="get")]
+        )
 
         assert result.targets == []
         assert result.unresolved[ps.REASON_SAME_LINE_COLLISION] == 1
+
+    def test_two_sites_sharing_one_record_group_are_both_refused(self, tmp_path):
+        """`$a->get() ?? $b->get()` with `$b` untyped.
+
+        One record, two sites, no way to say whose.
+        """
+        root = make_repo(tmp_path)
+        path = str(root / "src/App.php")
+        lines = [
+            json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Emails", callPos=40))
+        ]
+        first = site(method="get")
+        second = dataclasses.replace(first, caller_nid="n2")
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(
+            str(root), [first, second]
+        )
+
+        assert result.targets == []
+        assert result.unresolved == {ps.REASON_SAME_LINE_COLLISION: 2}
+
+    def test_two_sites_with_a_record_group_each_both_resolve(self, tmp_path):
+        """The control: one group per site, so each site has a record to stand on."""
+        root = make_repo(tmp_path)
+        path = str(root / "src/App.php")
+        lines = [
+            json.dumps(
+                record(file=path, calleeMethod="get", calleeClass="App\\Emails", callPos=40)
+            ),
+            json.dumps(
+                record(file=path, calleeMethod="get", calleeClass="App\\Emails", callPos=58)
+            ),
+        ]
+        first = site(method="get")
+        second = dataclasses.replace(first, caller_nid="n2")
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(
+            str(root), [first, second]
+        )
+
+        assert {t.site.caller_nid for t in result.targets} == {"n1", "n2"}
+        assert ps.REASON_SAME_LINE_COLLISION not in result.unresolved
 
     def test_two_calls_on_one_line_proving_the_same_target_keep_it(self, tmp_path):
         root = make_repo(tmp_path)
         path = str(root / "src/App.php")
         lines = [
-            json.dumps(record(file=path, calleeMethod="getId", calleeClass="App\\User", callPos=40)),
-            json.dumps(record(file=path, calleeMethod="getId", calleeClass="App\\User", callPos=58)),
+            json.dumps(
+                record(file=path, calleeMethod="getId", calleeClass="App\\User", callPos=40)
+            ),
+            json.dumps(
+                record(file=path, calleeMethod="getId", calleeClass="App\\User", callPos=58)
+            ),
         ]
-        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(str(root), [site(method="getId")])
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(
+            str(root), [site(method="getId")]
+        )
 
         assert [t.class_fqn for t in result.targets] == ["App\\User"]
         assert ps.REASON_SAME_LINE_COLLISION not in result.unresolved
@@ -352,14 +463,18 @@ class TestResolve:
             json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Emails")),
             json.dumps(record(file=path, calleeMethod="get", calleeClass="App\\Cache")),
         ]
-        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(str(root), [site(method="get")])
+        result = source_with(FakeRunner(ps.RunOutcome(True), lines)).resolve(
+            str(root), [site(method="get")]
+        )
 
         assert {t.class_fqn for t in result.targets} == {"App\\Emails", "App\\Cache"}
 
     def test_identical_duplicate_records_yield_one_target(self, tmp_path):
         root = make_repo(tmp_path)
         line = json.dumps(record(file=str(root / "src/App.php"), callPos=40))
-        result = source_with(FakeRunner(ps.RunOutcome(True), [line, line])).resolve(str(root), [site()])
+        result = source_with(FakeRunner(ps.RunOutcome(True), [line, line])).resolve(
+            str(root), [site()]
+        )
 
         assert len(result.targets) == 1
 
@@ -398,7 +513,9 @@ class TestFailureModes:
 
     def test_nonzero_exit_with_no_records_is_unavailable_for_this_build(self, tmp_path):
         root = make_repo(tmp_path)
-        runner = FakeRunner(ps.RunOutcome(False, ps.REASON_RUN_FAILED, "PHP Fatal error: out of memory"))
+        runner = FakeRunner(
+            ps.RunOutcome(False, ps.REASON_RUN_FAILED, "PHP Fatal error: out of memory")
+        )
         result = source_with(runner).resolve(str(root), [site()])
 
         assert result.targets == []
@@ -430,26 +547,47 @@ class TestFailureModes:
         assert result.unresolved == {}
 
 
+def gone(pid: int, within_s: float = 3.0) -> bool:
+    """True once the process has exited (a zombie that is not yet reaped still counts)."""
+    deadline = time.monotonic() + within_s
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return True
+        if state == "Z":
+            return True
+        time.sleep(0.05)
+    return False
+
+
 class TestRunner:
-    def test_timeout_expiring_becomes_a_reason(self, tmp_path, monkeypatch):
+    def test_timeout_kills_the_processes_phpstan_spawned_not_only_the_phar(
+        self, tmp_path, monkeypatch
+    ):
+        """PHPStan's phar re-executes itself and forks workers; a kill of the child alone
+        leaves them running to completion, which was observed on the reference application."""
         root = make_repo(tmp_path)
+        pid_file = tmp_path / "grandchild.pid"
+        binary = root / "vendor" / "bin" / "phpstan"
+        binary.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > '{pid_file}'\nwait\n")
+        binary.chmod(0o755)
+        monkeypatch.setenv(ps._TIMEOUT_ENV, "1")
 
-        def explode(*_args, **_kwargs):
-            raise subprocess.TimeoutExpired(cmd="phpstan", timeout=1.0)
-
-        monkeypatch.setattr(ps.subprocess, "run", explode)
         outcome = ps.PhpStanRunner().run(str(root), tmp_path / "out.jsonl")
 
         assert outcome.ok is False
         assert outcome.reason == ps.REASON_TIMEOUT
+        grandchild = int(pid_file.read_text())
+        assert gone(grandchild), f"sleep {grandchild} survived the timeout"
 
-    def test_unlaunchable_binary_becomes_a_reason(self, tmp_path, monkeypatch):
+    def test_unlaunchable_binary_becomes_a_reason(self, tmp_path):
         root = make_repo(tmp_path)
-
-        def explode(*_args, **_kwargs):
-            raise OSError("Exec format error")
-
-        monkeypatch.setattr(ps.subprocess, "run", explode)
+        # `make_repo` writes the script without the execute bit, so launching it is refused.
         outcome = ps.PhpStanRunner().run(str(root), tmp_path / "out.jsonl")
 
         assert outcome.ok is False
@@ -471,22 +609,48 @@ class TestRunner:
         assert any(arg.startswith("--memory-limit=") for arg in argv)
         assert "--autoload-file" in argv
 
-    def test_subprocess_is_given_no_stdin_and_the_output_path(self, tmp_path, monkeypatch):
+    def test_subprocess_is_given_no_stdin_its_own_session_and_the_output_path(
+        self, tmp_path, monkeypatch
+    ):
         root = make_repo(tmp_path)
         seen = {}
 
-        def capture(argv, **kwargs):
-            seen["argv"] = argv
-            seen["kwargs"] = kwargs
-            return subprocess.CompletedProcess(argv, 0, "", "")
+        class Launched:
+            returncode = 0
 
-        monkeypatch.setattr(ps.subprocess, "run", capture)
+            def __init__(self, argv, **kwargs):
+                seen["argv"] = argv
+                seen["kwargs"] = kwargs
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+        monkeypatch.setattr(ps.subprocess, "Popen", Launched)
         ps.PhpStanRunner().run(str(root), tmp_path / "out.jsonl")
 
         assert seen["kwargs"]["stdin"] is subprocess.DEVNULL
         assert seen["kwargs"]["cwd"] == str(root)
         assert seen["kwargs"]["env"]["PHP_CALL_GRAPH_OUT"] == str(tmp_path / "out.jsonl")
-        assert seen["kwargs"]["check"] is False
+        assert seen["kwargs"]["start_new_session"] is True
+
+    def test_stderr_secrets_never_reach_the_record(self, tmp_path):
+        """PHPStan runs project bootstrap code, and a fatal there can print a DSN."""
+        root = make_repo(tmp_path)
+        binary = root / "vendor" / "bin" / "phpstan"
+        binary.write_text(
+            "#!/bin/sh\n"
+            "echo 'PHP Fatal error: connect password=hunter2 DB_TOKEN: abc dsn=mysql://u:p@h/db'"
+            " 'and https://user:pw@host/x' >&2\nexit 255\n"
+        )
+        binary.chmod(0o755)
+
+        result = ps.PhpStanSource().resolve(str(root), [site()])
+
+        keys = "\n".join(result.unresolved)
+        assert ps.STDERR_PREFIX + "PHP Fatal error" in keys
+        for secret in ("hunter2", "abc", "u:p@", "user:pw@"):
+            assert secret not in keys, keys
+        assert "mysql://<redacted>@h/db" not in keys or "dsn=<redacted>" in keys
 
 
 class TestExtensionShipped:
@@ -495,5 +659,11 @@ class TestExtensionShipped:
 
     def test_php_sources_parse(self):
         php = ps.extension_autoload_file().parent
-        for name in ["CallEdge", "CallEdgeWriter", "JsonLinesWriter", "MethodCallCollector", "CallEdgeRule"]:
+        for name in [
+            "CallEdge",
+            "CallEdgeWriter",
+            "JsonLinesWriter",
+            "MethodCallCollector",
+            "CallEdgeRule",
+        ]:
             assert (php / "src" / "CallGraph" / f"{name}.php").is_file()

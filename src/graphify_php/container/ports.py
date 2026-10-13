@@ -30,7 +30,7 @@ class ContainerReader(Protocol):
     """Turns one container file into facts."""
 
     name: str
-    format: str          # recorded in the artifact, so a consumer knows which reader spoke
+    format: str  # recorded in the artifact, so a consumer knows which reader spoke
 
     def read(self, path: Path) -> ContainerFacts | None:
         """Facts, or None when the file is unreadable or malformed.

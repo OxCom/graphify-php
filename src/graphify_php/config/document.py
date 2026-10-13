@@ -24,5 +24,6 @@ class DocumentNodeFactory:
     """Builds the node for one configuration file."""
 
     def node(self, path: str) -> ConfigNode:
-        return ConfigNode(key=file_key(path), label=path.rsplit("/", 1)[-1],
-                          kind="config_file", source_file=path)
+        return ConfigNode(
+            key=file_key(path), label=path.rsplit("/", 1)[-1], kind="config_file", source_file=path
+        )

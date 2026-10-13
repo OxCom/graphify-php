@@ -24,16 +24,22 @@ same artifact.
 from __future__ import annotations
 
 import inspect
+import os
 import re
 import time
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Callable, Iterable, Protocol, Sequence, runtime_checkable
 
 from . import status
 from .ports import CallSite, CallTarget, CallTargetSource, EdgeSink, NodeIndex, ScopeIndex
 
 RESOLVER_NAME = "php_member_calls"
 PHP_SUFFIXES = frozenset({".php"})
+
+# "1" mints a body-less `external` node per vendor class a proven call targets, instead of
+# dropping the record. Off by default: graphify core refuses stubs for `calls` because they
+# become hub nodes; this plugin opts in per build.
+EXTERNAL_STUBS_ENV = "GRAPHIFY_PHP_EXTERNAL_STUBS"
 
 # The unresolved-reason vocabulary this module owns. Reasons a source reports are prefixed with
 # that source's name, so the two namespaces cannot collide and the histogram stays a work list.
@@ -46,6 +52,17 @@ REASON_SCOPE_AMBIGUOUS = "scoped_method_ambiguous"
 _IDENTIFIER = re.compile(r"^[A-Za-z_\\][A-Za-z0-9_\\]*$")
 
 
+def is_vendor_file(path: str, repo_root: str) -> bool:
+    """Whether `path` sits under the repository's `vendor/` directory.
+
+    Only the first segment under the root counts. A project class the build left out (a
+    `Tests\\` class under `.graphifyignore`) is still project code and gets no stub for it.
+    """
+    if not path:
+        return False
+    root = os.path.abspath(repo_root)
+    relative = os.path.relpath(os.path.join(root, path), root)
+    return relative.replace("\\", "/").split("/", 1)[0] == "vendor"
 
 
 @dataclass
@@ -79,13 +96,15 @@ def collect_sites(per_file: Sequence[dict]) -> list[CallSite]:
             source_file = raw.get("source_file") or ""
             if not caller or not callee or not source_file.endswith(".php"):
                 continue
-            sites.append(CallSite(
-                caller_nid=caller,
-                receiver=raw.get("receiver") or "",
-                method=callee,
-                source_file=source_file,
-                source_location=raw.get("source_location") or "",
-            ))
+            sites.append(
+                CallSite(
+                    caller_nid=caller,
+                    receiver=raw.get("receiver") or "",
+                    method=callee,
+                    source_file=source_file,
+                    source_location=raw.get("source_location") or "",
+                )
+            )
     return sites
 
 
@@ -109,8 +128,13 @@ def collect_scoped_groups(per_file: Sequence[dict], scopes: ScopeIndex) -> list[
             if not _IDENTIFIER.match(str(scope)):
                 continue
             candidates = [
-                CallSite(caller_nid=caller, receiver=str(scope), method=name,
-                         source_file=source_file, source_location=raw.get("source_location") or "")
+                CallSite(
+                    caller_nid=caller,
+                    receiver=str(scope),
+                    method=name,
+                    source_file=source_file,
+                    source_location=raw.get("source_location") or "",
+                )
                 for name in scopes.scope_methods(caller, str(scope))
             ]
             if candidates:
@@ -152,8 +176,12 @@ def collect_corpus(per_file: Sequence[dict]) -> list[str]:
 _ACCEPTS_CORPUS: dict[type, bool] = {}
 
 
-def _resolve_with(source: CallTargetSource, repo_root: str,
-                  sites: Sequence[CallSite], corpus: Sequence[str] | None):
+def _resolve_with(
+    source: CallTargetSource,
+    repo_root: str,
+    sites: Sequence[CallSite],
+    corpus: Sequence[str] | None,
+):
     kind = type(source)
     accepts = _ACCEPTS_CORPUS.get(kind)
     if accepts is None:
@@ -163,7 +191,8 @@ def _resolve_with(source: CallTargetSource, repo_root: str,
             accepts = False
         else:
             accepts = "corpus" in params or any(
-                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
         _ACCEPTS_CORPUS[kind] = accepts
     if corpus is not None and accepts:
         return source.resolve(repo_root, sites, corpus)
@@ -225,8 +254,15 @@ def _resolve_groups(
         return []
     probes = [site for group in groups for site in group.candidates]
     found: dict[CallSite, list[CallTarget]] = {}
-    for target in _ask_sources(sources, repo_root, probes, record, reason_prefix="probe:",
-                               count_unclaimed=False, corpus=corpus):
+    for target in _ask_sources(
+        sources,
+        repo_root,
+        probes,
+        record,
+        reason_prefix="probe:",
+        count_unclaimed=False,
+        corpus=corpus,
+    ):
         found.setdefault(target.site, []).append(target)
     targets: list[CallTarget] = []
     for group in groups:
@@ -247,6 +283,8 @@ def _write_edges(
     index: NodeIndex,
     sink: EdgeSink,
     record: status.ResolverStatus,
+    stubs=None,
+    repo_root: str = ".",
 ) -> None:
     # `ports.NodeIndex` takes no caller, so an index that can apply the caller's own visibility
     # offers a wider call and is used when present. The report asks for the caller to be added
@@ -255,10 +293,18 @@ def _write_edges(
     # Counted per target record, not per site: a union site with one arm missing from the graph
     # still gets its other arm, and the histogram says how many records were lost.
     for target in targets:
-        callee_nid = (origin_aware(target.site.caller_nid, target.class_fqn, target.method)
-                      if callable(origin_aware)
-                      else index.method_node(target.class_fqn, target.method))
+        callee_nid = (
+            origin_aware(target.site.caller_nid, target.class_fqn, target.method)
+            if callable(origin_aware)
+            else index.method_node(target.class_fqn, target.method)
+        )
         if callee_nid is None:
+            # Only a class proven to live under `vendor/` gets a stub. Project code the build
+            # excluded is still project code, and a stub for it would shadow the real class.
+            if stubs is not None and is_vendor_file(target.declaring_file, repo_root):
+                stubs.add_call(target.site.caller_nid, stubs.node_for(target.class_fqn), target)
+                record.external_stubbed += 1
+                continue
             # `NodeIndex` answers one question, so a missing class and a missing method arrive
             # here indistinguishable. Widening the port to tell them apart would tie this
             # package to graphify's node schema, which is the part most likely to move.
@@ -275,20 +321,32 @@ def run(
     all_nodes: list[dict],
     all_edges: list[dict],
     *,
-    sources: Sequence[CallTargetSource],
+    sources: Sequence[CallTargetSource] | Callable[[str], Sequence[CallTargetSource]],
     repo_root: str = ".",
     index: NodeIndex | None = None,
     sink: EdgeSink | None = None,
     scopes: ScopeIndex | None = None,
+    stubs=None,
 ) -> status.ResolverStatus:
-    """Resolve PHP member calls into `calls` edges, and record what happened either way."""
+    """Resolve PHP member calls into `calls` edges, and record what happened either way.
+
+    `sources` may be a factory taking the repository root. It is called in here, inside the
+    record's own try, so a factory that raises leaves a `failed` record and not silence.
+    """
     record = status.ResolverStatus(name=RESOLVER_NAME)
     try:
+        if callable(sources):
+            sources = sources(repo_root)
         if index is None or sink is None:
             from .graph_adapter import GraphEdgeSink, GraphNodeIndex
+
             built = GraphNodeIndex(all_nodes, all_edges)
             index = index or built
             sink = sink or GraphEdgeSink(all_edges, built)
+        if stubs is None and os.environ.get(EXTERNAL_STUBS_ENV) == "1":
+            from .graph_adapter import GraphStubSink
+
+            stubs = GraphStubSink(all_nodes, all_edges)
         if scopes is None and isinstance(index, ScopeIndex):
             scopes = index
 
@@ -316,8 +374,11 @@ def run(
         targets = _ask_sources(usable, repo_root, sites, record, corpus=corpus)
         targets += _resolve_groups(groups, usable, repo_root, record, corpus=corpus)
         record.resolved_sites = len({t.site for t in targets})
-        _write_edges(targets, index, sink, record)
+        _write_edges(targets, index, sink, record, stubs=stubs, repo_root=repo_root)
         record.edges_added = getattr(sink, "added", record.resolved_sites)
+        if stubs is not None:
+            record.stub_nodes_added = stubs.nodes_added
+            record.stub_edges_added = stubs.edges_added
         record.state = "completed"
         if unavailable:
             record.reason = "; ".join(unavailable)
@@ -331,16 +392,17 @@ def run(
         status.write([record])
 
 
-def make_resolver(sources_factory: Callable[[str], Sequence[CallTargetSource]],
-                  repo_root: str = "."):
+def make_resolver(
+    sources_factory: Callable[[str], Sequence[CallTargetSource]], repo_root: str = "."
+):
     """Wrap `run` in the `(per_file, all_nodes, all_edges) -> None` shape graphify calls.
 
     The factory is called at resolution time, not at registration time: registering happens at
     import, when the working directory and the repository under build are not yet settled.
     """
+
     def resolve(per_file, all_nodes, all_edges) -> None:
-        run(per_file, all_nodes, all_edges,
-            sources=sources_factory(repo_root), repo_root=repo_root)
+        run(per_file, all_nodes, all_edges, sources=sources_factory, repo_root=repo_root)
 
     resolve.__name__ = RESOLVER_NAME
     return resolve
@@ -358,7 +420,7 @@ def run_routes(
     all_nodes: list[dict],
     all_edges: list[dict],
     *,
-    sources: Sequence[object],
+    sources: Sequence[object] | Callable[[str], Sequence[object]],
     repo_root: str = ".",
     index: NodeIndex | None = None,
     sink=None,
@@ -373,8 +435,12 @@ def run_routes(
     """
     record = status.ResolverStatus(name=RESOLVER_NAME_ROUTES)
     try:
+        if callable(sources):
+            # Same contract as `run`: a factory, called inside the try so that it reports.
+            sources = sources(repo_root)
         if index is None or sink is None:
             from .graph_adapter import GraphNodeIndex, GraphRouteSink
+
             index = index or GraphNodeIndex(all_nodes, all_edges)
             sink = sink or GraphRouteSink(all_nodes, all_edges)
 
@@ -412,11 +478,14 @@ def run_routes(
         in_file = getattr(index, "method_node_in_file", None)
         for declaration in declarations:
             controller_nid = (
-                in_file(declaration.source_file, declaration.controller_class,
-                        declaration.controller_method)
+                in_file(
+                    declaration.source_file,
+                    declaration.controller_class,
+                    declaration.controller_method,
+                )
                 if callable(in_file)
-                else index.method_node(declaration.controller_class,
-                                       declaration.controller_method))
+                else index.method_node(declaration.controller_class, declaration.controller_method)
+            )
             if controller_nid is None:
                 # The node still goes in: the declaration is a fact about this codebase whether
                 # or not the controller method survived extraction, and dropping it would hide
@@ -440,12 +509,11 @@ def run_routes(
         status.write([record])
 
 
-def make_route_resolver(sources_factory: Callable[[str], Sequence[object]],
-                        repo_root: str = "."):
+def make_route_resolver(sources_factory: Callable[[str], Sequence[object]], repo_root: str = "."):
     """Wrap `run_routes` in the shape graphify's registry calls."""
+
     def resolve(per_file, all_nodes, all_edges) -> None:
-        run_routes(per_file, all_nodes, all_edges,
-                   sources=sources_factory(repo_root), repo_root=repo_root)
+        run_routes(per_file, all_nodes, all_edges, sources=sources_factory, repo_root=repo_root)
 
     resolve.__name__ = RESOLVER_NAME_ROUTES
     return resolve

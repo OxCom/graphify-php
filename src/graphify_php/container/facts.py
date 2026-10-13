@@ -29,15 +29,15 @@ from enum import Enum
 class ArgumentKind(str, Enum):
     """The kind of thing wired into one argument slot. Never the thing itself."""
 
-    SERVICE = "service"                    # a reference to another service id
-    SERVICE_CLOSURE = "service_closure"    # a lazy reference; same target, deferred
-    TAGGED_ITERATOR = "tagged_iterator"    # every service carrying a tag
-    ITERATOR = "iterator"                  # an explicit list of service references
-    COLLECTION = "collection"              # a structured literal; its leaves are scalars
-    ENV = "env"                            # a `%env(...)%` reference, name kept, value not
-    SCALAR = "scalar"                      # a literal. Recorded as a kind and discarded.
-    ABSTRACT = "abstract"                  # an unfilled slot in an abstract definition
-    CONSTANT = "constant"                  # a PHP constant reference
+    SERVICE = "service"  # a reference to another service id
+    SERVICE_CLOSURE = "service_closure"  # a lazy reference; same target, deferred
+    TAGGED_ITERATOR = "tagged_iterator"  # every service carrying a tag
+    ITERATOR = "iterator"  # an explicit list of service references
+    COLLECTION = "collection"  # a structured literal; its leaves are scalars
+    ENV = "env"  # a `%env(...)%` reference, name kept, value not
+    SCALAR = "scalar"  # a literal. Recorded as a kind and discarded.
+    ABSTRACT = "abstract"  # an unfilled slot in an abstract definition
+    CONSTANT = "constant"  # a PHP constant reference
     UNKNOWN = "unknown"
 
 
@@ -45,8 +45,8 @@ class Member(str, Enum):
     """Where in the consumer the argument lands."""
 
     CONSTRUCTOR = "constructor"
-    CALL = "call"            # a setter or any other post-construction method call
-    FACTORY = "factory"      # an argument to the factory, not to the constructor
+    CALL = "call"  # a setter or any other post-construction method call
+    FACTORY = "factory"  # an argument to the factory, not to the constructor
     PROPERTY = "property"
 
 
@@ -93,16 +93,16 @@ class Injection:
     consumer_id: str
     consumer_class: str | None
     member: Member
-    member_name: str | None        # the method for Member.CALL, None for a constructor
+    member_name: str | None  # the method for Member.CALL, None for a constructor
     position: int
     parameter: str | None
     kind: ArgumentKind
-    requested_id: str | None = None      # the service id written in the definition
-    resolved_id: str | None = None       # after following aliases
-    resolved_class: str | None = None    # the class that actually arrives here
+    requested_id: str | None = None  # the service id written in the definition
+    resolved_id: str | None = None  # after following aliases
+    resolved_class: str | None = None  # the class that actually arrives here
     via_alias: bool = False
-    tag: str | None = None               # for TAGGED_ITERATOR, the tag being collected
-    env_name: str | None = None          # for ENV, the variable name. Never its value.
+    tag: str | None = None  # for TAGGED_ITERATOR, the tag being collected
+    env_name: str | None = None  # for ENV, the variable name. Never its value.
 
 
 @dataclass(frozen=True)

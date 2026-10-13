@@ -70,7 +70,9 @@ def test_a_repository_without_config_is_a_skip_not_a_failure(tmp_path):
 
 def test_routing_reaches_the_message_class_node_when_the_graph_has_it(tmp_path):
     root = repo(tmp_path, {"config/packages/messenger.yaml": MESSENGER_YAML})
-    nodes = [php_class_node("m1", "AbstractCronMessage", "src/Cron/Message/AbstractCronMessage.php")]
+    nodes = [
+        php_class_node("m1", "AbstractCronMessage", "src/Cron/Message/AbstractCronMessage.php")
+    ]
     edges = [contains("f1", "m1")]
 
     record, nodes, edges = run(root, nodes, edges)
@@ -89,8 +91,10 @@ def test_a_message_class_outside_the_graph_keeps_its_transport_and_says_so(tmp_p
 
     assert record.state == "completed"
     assert record.unresolved["message_class_not_in_graph"] == 2
-    assert {n["id"] for n in nodes} == {file_key("config/packages/messenger.yaml"),
-                                        transport_key("cron")}
+    assert {n["id"] for n in nodes} == {
+        file_key("config/packages/messenger.yaml"),
+        transport_key("cron"),
+    }
     assert [e["relation"] for e in edges] == ["declares_transport"]
 
 
@@ -99,19 +103,23 @@ def test_environment_references_become_nodes_the_file_points_at(tmp_path):
 
     assert env_key("MICROSOFT_CLIENT_SECRET") in {n["id"] for n in nodes}
     assert [(e["source"], e["target"]) for e in edges if e["relation"] == "reads_env"] == [
-        (file_key("config/services.yaml"), env_key("MICROSOFT_CLIENT_SECRET"))]
+        (file_key("config/services.yaml"), env_key("MICROSOFT_CLIENT_SECRET"))
+    ]
     assert record.resolved_sites == 1
 
 
 def test_one_variable_across_two_files_is_one_node_with_two_edges(tmp_path):
-    root = repo(tmp_path, {
-        "config/services.yaml": SERVICES_YAML,
-        "config/packages/mailer.yaml": """
+    root = repo(
+        tmp_path,
+        {
+            "config/services.yaml": SERVICES_YAML,
+            "config/packages/mailer.yaml": """
             framework:
                 mailer:
                     dsn: '%env(MICROSOFT_CLIENT_SECRET)%'
         """,
-    })
+        },
+    )
     _, nodes, edges = run(root)
 
     assert len([n for n in nodes if n["id"] == env_key("MICROSOFT_CLIENT_SECRET")]) == 1
@@ -119,10 +127,13 @@ def test_one_variable_across_two_files_is_one_node_with_two_edges(tmp_path):
 
 
 def test_a_malformed_file_is_counted_and_the_rest_is_still_indexed(tmp_path):
-    root = repo(tmp_path, {
-        "config/packages/messenger.yaml": MESSENGER_YAML,
-        "config/broken.yaml": "parameters: [unclosed\n",
-    })
+    root = repo(
+        tmp_path,
+        {
+            "config/packages/messenger.yaml": MESSENGER_YAML,
+            "config/broken.yaml": "parameters: [unclosed\n",
+        },
+    )
     record, nodes, _ = run(root)
 
     assert record.state == "completed"
@@ -133,11 +144,16 @@ def test_a_malformed_file_is_counted_and_the_rest_is_still_indexed(tmp_path):
 
 
 def test_a_file_this_package_indexes_nothing_from_gets_no_node(tmp_path):
-    root = repo(tmp_path, {"config/packages/cache.yaml": """
+    root = repo(
+        tmp_path,
+        {
+            "config/packages/cache.yaml": """
         framework:
             cache:
                 app: cache.adapter.filesystem
-    """})
+    """
+        },
+    )
     record, nodes, edges = run(root)
 
     assert (nodes, edges) == ([], [])
@@ -160,7 +176,48 @@ def test_the_gate_is_php_because_a_yaml_gate_would_never_fire():
     `.php`-gated and a `.yaml`-gated probe registered, ran only the `.php` one.
     """
     from graphify_php.resolver import PHP_SUFFIXES
+
     assert PHP_SUFFIXES == frozenset({".php"})
+
+
+def test_the_package_registration_includes_this_pass(monkeypatch):
+    """`graphify_php.register()` is the only registration a real build makes, so a pass it
+    leaves out never runs — which is how this one sat dead in every published graph."""
+    registry = pytest.importorskip("graphify.resolver_registry")
+    import graphify_php
+
+    monkeypatch.setattr(registry, "_REGISTRY", [])
+    monkeypatch.setattr(graphify_php, "_registered", False)
+
+    assert graphify_php.register(repo_root="/nonexistent") is True
+    names = [r.name for r in registry.registered_resolvers()]
+    assert names == [
+        graphify_php.RESOLVER_NAME,
+        graphify_php.RESOLVER_NAME_ROUTES,
+        cr.RESOLVER_NAME,
+    ]
+
+
+def test_missing_pyyaml_is_a_recorded_skip_not_a_raise(tmp_path, monkeypatch):
+    """graphify does not depend on pyyaml. The pass must still report, with a fixed reason,
+    rather than die on import inside graphify's exception-swallowing driver."""
+    import graphify_php
+
+    for name in [m for m in sys.modules if m == "yaml" or m.startswith("graphify_php.config")]:
+        monkeypatch.delitem(sys.modules, name)
+    # `from . import config` is satisfied by the parent package's attribute before any import
+    # happens, so the cached subpackage must go there too.
+    monkeypatch.delattr(graphify_php, "config", raising=False)
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    root = repo(tmp_path, {"config/services.yaml": SERVICES_YAML})
+
+    record, nodes, edges = run(root)
+
+    assert (record.state, record.reason) == ("skipped", cr.REASON_PYYAML_MISSING)
+    assert (nodes, edges) == ([], [])
+    written = json.loads(Path(tmp_path / "status.json").read_text())
+    entry = next(r for r in written["resolvers"] if r["name"] == cr.RESOLVER_NAME)
+    assert entry["state"] == "skipped"
 
 
 def test_no_planted_value_reaches_a_node_an_edge_or_the_record(tmp_path):
@@ -168,22 +225,27 @@ def test_no_planted_value_reaches_a_node_an_edge_or_the_record(tmp_path):
     yaml_canary = next(c for c in cn.CANARIES if c.name == "yaml_value")
     dsn_canary = next(c for c in cn.CANARIES if c.name == "dsn")
     default_canary = next(c for c in cn.CANARIES if c.name == "env_default")
-    root = repo(tmp_path, {
-        "config/services.yaml": f"""
+    root = repo(
+        tmp_path,
+        {
+            "config/services.yaml": f"""
             parameters:
                 {yaml_canary.identifier}: '{yaml_canary.value}'
                 fallback_dsn: '{dsn_canary.value}'
                 api_key: '%env(default:{default_canary.value}:{default_canary.identifier})%'
         """,
-        "config/packages/messenger.yaml": MESSENGER_YAML,
-    })
+            "config/packages/messenger.yaml": MESSENGER_YAML,
+        },
+    )
     record, nodes, edges = run(root)
 
-    cn.assert_no_leaks({
-        "nodes": json.dumps(nodes),
-        "edges": json.dumps(edges),
-        "status": Path(tmp_path / "status.json").read_text(),
-        "record": repr(record),
-    })
+    cn.assert_no_leaks(
+        {
+            "nodes": json.dumps(nodes),
+            "edges": json.dumps(edges),
+            "status": Path(tmp_path / "status.json").read_text(),
+            "record": repr(record),
+        }
+    )
     # The check would pass on a graph that indexed nothing, so assert the identifier survived.
     assert env_key(default_canary.identifier) in {n["id"] for n in nodes}

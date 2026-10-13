@@ -25,19 +25,25 @@ two are deliberately about different files.
 from __future__ import annotations
 
 import time
-from typing import Callable, Sequence
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 from . import status
-from .config import (ConfigDocument, ConfigFileFinder, DocumentNodeFactory, FactSet,
-                     GraphWriter, SafeDocumentParser, default_readers)
-from .config.ports import ConfigFactReader
 from .resolver import PHP_SUFFIXES
+
+if TYPE_CHECKING:
+    from .config import ConfigFileFinder, GraphWriter, SafeDocumentParser
+    from .config.ports import ConfigFactReader
 
 RESOLVER_NAME = "php_symfony_config"
 
 # Reasons this module owns. A reader's own reasons arrive prefixed with the reader's name, so
 # the histogram stays a work list rather than a pile of colliding words.
 REASON_NO_FACTS = "document_held_no_indexed_fact"
+# `config.safe_yaml` imports pyyaml, which graphify does not depend on. The package is therefore
+# imported inside `run`, so that a build without pyyaml records this skip instead of failing
+# at import — before any record could be written.
+REASON_PYYAML_MISSING = "pyyaml-not-installed"
 
 
 def run(
@@ -54,7 +60,16 @@ def run(
     """Index the configuration facts under `repo_root`, and record what happened either way."""
     record = status.ResolverStatus(name=RESOLVER_NAME)
     try:
-        finder = finder or ConfigFileFinder(repo_root)
+        try:
+            from . import config as cfg
+        except ImportError as exc:
+            if getattr(exc, "name", None) != "yaml":
+                raise
+            record.state = "skipped"
+            record.reason = REASON_PYYAML_MISSING
+            return record
+
+        finder = finder or cfg.ConfigFileFinder(repo_root)
         available, why_not = finder.available()
         if not available:
             # Most repositories graphify indexes are not Symfony applications. Recording this
@@ -64,10 +79,10 @@ def run(
             record.reason = why_not
             return record
 
-        parser = parser or SafeDocumentParser()
-        readers = readers if readers is not None else default_readers()
-        writer = writer or GraphWriter(all_nodes, all_edges)
-        documents = DocumentNodeFactory()
+        parser = parser or cfg.SafeDocumentParser()
+        readers = readers if readers is not None else cfg.default_readers()
+        writer = writer or cfg.GraphWriter(all_nodes, all_edges)
+        documents = cfg.DocumentNodeFactory()
 
         files = finder.find()
         record.files_seen = len(files)
@@ -79,8 +94,8 @@ def run(
                 # on, because one bad indent must not decide whether the rest is indexed.
                 record.unresolvable(f"{parser.__class__.__name__.lower()}:{parsed.reason}")
                 continue
-            document = ConfigDocument(path=relative_path, data=parsed.data)
-            collected = FactSet()
+            document = cfg.ConfigDocument(path=relative_path, data=parsed.data)
+            collected = cfg.FactSet()
             for reader in readers:
                 facts = reader.read(document)
                 for reason, count in facts.unresolved.items():
@@ -110,15 +125,19 @@ def run(
         status.write([record])
 
 
-def make_resolver(repo_root: str = ".",
-                  readers_factory: Callable[[], Sequence[ConfigFactReader]] = default_readers):
+def make_resolver(
+    repo_root: str = ".", readers_factory: Callable[[], Sequence[ConfigFactReader]] | None = None
+):
     """Wrap `run` in the `(per_file, all_nodes, all_edges) -> None` shape graphify calls.
 
     The readers are assembled at resolution time, not at registration time: registration happens
-    at import, before the repository under build is settled.
+    at import, before the repository under build is settled. `None` means the shipped readers,
+    which `run` names itself so that nothing here imports the config package.
     """
+
     def resolve(per_file, all_nodes, all_edges) -> None:
-        run(per_file, all_nodes, all_edges, repo_root=repo_root, readers=readers_factory())
+        readers = readers_factory() if readers_factory is not None else None
+        run(per_file, all_nodes, all_edges, repo_root=repo_root, readers=readers)
 
     resolve.__name__ = RESOLVER_NAME
     return resolve
@@ -135,9 +154,11 @@ def register(repo_root: str = ".") -> bool:
 
     if any(r.name == RESOLVER_NAME for r in resolver_registry.registered_resolvers()):
         return False
-    resolver_registry.register(resolver_registry.LanguageResolver(
-        name=RESOLVER_NAME,
-        suffixes=PHP_SUFFIXES,
-        resolve=make_resolver(repo_root),
-    ))
+    resolver_registry.register(
+        resolver_registry.LanguageResolver(
+            name=RESOLVER_NAME,
+            suffixes=PHP_SUFFIXES,
+            resolve=make_resolver(repo_root),
+        )
+    )
     return True

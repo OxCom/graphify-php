@@ -19,14 +19,15 @@ name is the final colon-separated segment.
 from __future__ import annotations
 
 import re
-from typing import Iterator
+from collections.abc import Iterator
 
 from .document import file_key
-from .facts import ConfigEdge, ConfigNode, ConfigDocument, FactSet, NodeRef
+from .facts import ConfigDocument, ConfigEdge, ConfigNode, FactSet, NodeRef
 
 RELATION_READS_ENV = "reads_env"
 
 REASON_UNRECOGNISED_NAME = "env_name_not_an_identifier"
+REASON_DEPTH_LIMIT = "env_depth_limit"
 
 # `[^()%]*` on purpose: a placeholder cannot contain a nested `%env(` and stopping at the first
 # `%` keeps a run-on string like `'%env(A)%:%env(B)%'` as two matches instead of one wrong one.
@@ -51,7 +52,7 @@ class EnvReferenceReader:
         facts = FactSet()
         file_ref = NodeRef.config(file_key(document.path))
         seen: set[str] = set()
-        for placeholder in self._placeholders(document.data, _MAX_DEPTH):
+        for placeholder in self._placeholders(document.data, _MAX_DEPTH, facts):
             name = placeholder.rsplit(":", 1)[-1].strip()
             if not _NAME.match(name):
                 facts.unresolvable(REASON_UNRECOGNISED_NAME)
@@ -60,20 +61,30 @@ class EnvReferenceReader:
                 continue
             seen.add(name)
             node_key = env_key(name)
-            facts.nodes.append(ConfigNode(key=node_key, label=name, kind="env_var",
-                                          source_file=document.path))
-            facts.edges.append(ConfigEdge(source=file_ref, target=NodeRef.config(node_key),
-                                          relation=RELATION_READS_ENV,
-                                          source_file=document.path))
+            facts.nodes.append(
+                ConfigNode(key=node_key, label=name, kind="env_var", source_file=document.path)
+            )
+            facts.edges.append(
+                ConfigEdge(
+                    source=file_ref,
+                    target=NodeRef.config(node_key),
+                    relation=RELATION_READS_ENV,
+                    source_file=document.path,
+                )
+            )
         return facts
 
-    def _placeholders(self, node, depth: int) -> Iterator[str]:
+    def _placeholders(self, node, depth: int, facts: FactSet) -> Iterator[str]:
         """Every placeholder body in the document, keys included.
 
         Only the text inside `env(...)` ever leaves this method. The scalar that carried it —
         which may be a DSN with an inline password — is not yielded, not stored and not logged.
         """
         if depth < 0:
+            # Past the bound the subtree is not walked, so a placeholder in it would vanish
+            # without trace. One count per cut-off subtree says that something was left out;
+            # the subtree is not read, so the count is not a number of placeholders.
+            facts.unresolvable(REASON_DEPTH_LIMIT)
             return
         if isinstance(node, str):
             yield from _PLACEHOLDER.findall(node)
@@ -81,10 +92,10 @@ class EnvReferenceReader:
             for key, value in node.items():
                 if isinstance(key, str):
                     yield from _PLACEHOLDER.findall(key)
-                yield from self._placeholders(value, depth - 1)
+                yield from self._placeholders(value, depth - 1, facts)
         elif isinstance(node, (list, tuple)):
             for item in node:
-                yield from self._placeholders(item, depth - 1)
+                yield from self._placeholders(item, depth - 1, facts)
 
 
 def env_key(name: str) -> str:

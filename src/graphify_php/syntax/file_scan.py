@@ -42,7 +42,9 @@ def _walk(node, facts: FileFacts, names: NameResolver, registry, klass, method) 
 
     if _is_anonymous_class(node):
         # Its members belong to a class with no name, so attributing them to the enclosing
-        # class would invent properties the enclosing class does not have.
+        # class would invent properties the enclosing class does not have. The span is kept
+        # so a call site inside it is refused rather than read against the enclosing class.
+        facts.anonymous_classes.append(nodes.line_span(node))
         return
 
     if kind == "namespace_definition":
@@ -70,7 +72,10 @@ def _is_anonymous_class(node) -> bool:
     """`new class { ... }`, which the grammar hangs under an `object_creation_expression`."""
     if node.type == "anonymous_class":
         return True
-    return node.type == "object_creation_expression" and nodes.child(node, "declaration_list") is not None
+    return (
+        node.type == "object_creation_expression"
+        and nodes.child(node, "declaration_list") is not None
+    )
 
 
 def _read_namespace(node, names: NameResolver) -> None:
@@ -118,7 +123,9 @@ def _alias_of(clause) -> str:
 
 def _open_class(node, facts: FileFacts, names: NameResolver) -> ClassScope:
     start, end = nodes.line_span(node)
-    scope = ClassScope(fqn=names.qualify_declaration(nodes.name_of(node)), start_line=start, end_line=end)
+    scope = ClassScope(
+        fqn=names.qualify_declaration(nodes.name_of(node)), start_line=start, end_line=end
+    )
     base = nodes.child(node, "base_clause")
     if base is not None:
         inherited = _names_in(base, names)

@@ -12,7 +12,6 @@ dist/
 php-call-graph.jsonl
 graphify-out
 graphify-out/
-/var/www/knowledge-base/graphify/agentscopex/graphify-php/
 docs/kb
 .serena
 CLAUDE.md

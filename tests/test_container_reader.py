@@ -21,7 +21,9 @@ TAIL = "</container>\n"
 
 def container(tmp_path: Path, services: str, parameters: str = "") -> Path:
     path = tmp_path / "App_KernelTestDebugContainer.xml"
-    path.write_text(HEAD + parameters + "<services>\n" + textwrap.dedent(services) + "\n</services>\n" + TAIL)
+    path.write_text(
+        HEAD + parameters + "<services>\n" + textwrap.dedent(services) + "\n</services>\n" + TAIL
+    )
     return path
 
 
@@ -104,8 +106,13 @@ def test_tagged_iterator_records_the_tag_and_the_members(tmp_path: Path) -> None
     assert injection.kind is ArgumentKind.TAGGED_ITERATOR
     assert injection.tag == "app.cron_job"
     members = {(t.service_id, t.class_fqn) for t in facts.tags if t.tag == "app.cron_job"}
-    assert members == {("App\\Cron\\Nightly", "App\\Cron\\Nightly"), ("App\\Cron\\Hourly", "App\\Cron\\Hourly")}
-    assert next(t for t in facts.tags if t.service_id == "App\\Cron\\Nightly").attributes == {"priority": "10"}
+    assert members == {
+        ("App\\Cron\\Nightly", "App\\Cron\\Nightly"),
+        ("App\\Cron\\Hourly", "App\\Cron\\Hourly"),
+    }
+    assert next(t for t in facts.tags if t.service_id == "App\\Cron\\Nightly").attributes == {
+        "priority": "10"
+    }
 
 
 def test_decorator_is_recovered_from_the_inner_renaming(tmp_path: Path) -> None:
@@ -133,7 +140,7 @@ def test_factory_class_and_method_are_kept(tmp_path: Path) -> None:
           <argument>%env(REDIS_URL)%</argument>
           <factory class="Symfony\\Component\\Cache\\Adapter\\RedisAdapter" method="createConnection"/>
         </service>
-        """,
+        """,  # noqa: E501
     )
     service = facts.services["app.redis"]
     assert (service.factory_class, service.factory_method) == (
@@ -176,7 +183,7 @@ def test_env_argument_records_only_the_name(tmp_path: Path) -> None:
 
 def test_malformed_xml_returns_none(tmp_path: Path) -> None:
     path = tmp_path / "App_KernelTestDebugContainer.xml"
-    path.write_text(HEAD + "<services><service id=\"broken\"")
+    path.write_text(HEAD + '<services><service id="broken"')
     assert SymfonyXmlContainerReader().read(path) is None
 
 
@@ -217,3 +224,86 @@ def test_environment_provenance_is_two_parameters_and_nothing_else(tmp_path: Pat
     assert facts.environment["kernel_environment"] == "dev"
     assert facts.environment["kernel_debug"] == "true"
     assert "hunter2" not in repr(facts.environment)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "%env(A)%:%env(B)%",
+        "%env(HOST)%:5432/db?password=X)%",
+        "%env(not a name)%",
+    ],
+)
+def test_an_env_expression_that_is_not_one_placeholder_yields_nothing(expression: str) -> None:
+    # A greedy match would return `%env(B` or a DSN fragment as the "name"; neither is one.
+    assert env_name(expression) is None
+
+
+def test_a_run_on_env_argument_is_dropped_with_a_reason_and_leaks_nothing(tmp_path: Path) -> None:
+    facts = read(
+        tmp_path,
+        """
+        <service id="app.db" class="App\\Db">
+          <argument>%env(HOST)%:5432/db?password=X)%</argument>
+        </service>
+        """,
+    )
+    (injection,) = facts.injections
+    assert injection.env_name is None
+    assert facts.skipped == {"env-expression-without-name": 1}
+    assert "password" not in repr(facts.injections)
+
+
+def test_factory_built_service_arguments_belong_to_the_factory_method(tmp_path: Path) -> None:
+    # Symfony's XmlDumper writes the factory's arguments at service level and `<factory/>` is
+    # always childless, so they are the factory's, not the constructor's.
+    facts = read(
+        tmp_path,
+        """
+        <service id="repo" class="App\\Repo">
+          <argument type="service" id="em"/>
+          <factory service="doctrine" method="getRepository"/>
+        </service>
+        <service id="em" class="App\\Em"/>
+        <service id="doctrine" class="App\\Doctrine"/>
+        """,
+    )
+    (injection,) = facts.injections
+    assert (injection.member, injection.member_name, injection.position) == (
+        Member.FACTORY,
+        "getRepository",
+        0,
+    )
+
+
+def test_named_constructor_arguments_carry_the_constructor_name(tmp_path: Path) -> None:
+    facts = read(
+        tmp_path,
+        """
+        <service id="app.clock" class="App\\Clock" constructor="fromSystem">
+          <argument>UTC</argument>
+        </service>
+        """,
+    )
+    (injection,) = facts.injections
+    assert (injection.member, injection.member_name) == (Member.FACTORY, "fromSystem")
+
+
+def test_the_decorator_is_the_service_holding_the_inner_id_not_the_first_referrer(
+    tmp_path: Path,
+) -> None:
+    facts = read(
+        tmp_path,
+        """
+        <service id="app.collector" class="App\\Collector">
+          <argument type="service" id="app.serializer.inner"/>
+        </service>
+        <service id="app.serializer.inner" class="App\\NativeSerializer"/>
+        <service id="app.serializer" class="App\\LoggingSerializer">
+          <argument type="service" id="app.serializer.inner"/>
+        </service>
+        """,
+    )
+    (decoration,) = facts.decorations
+    assert decoration.decorator_id == "app.serializer"
+    assert decoration.decorator_class == "App\\LoggingSerializer"

@@ -1,8 +1,11 @@
-"""The publish gate: which resolver states let a graph through, and what happens when one does not."""
+"""The publish gate: which resolver states let a graph through, and what happens when one does
+not.
+"""
 
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -23,18 +26,20 @@ def build(tmp_path, monkeypatch):
 
 def runner_writing(state, *, name=cli.RESOLVER_NAME, reason="", graph=None):
     """A stand-in for graphify: publishes a new graph, then leaves the record `state` describes."""
+
     def run(args):
         if graph is not None:
             graph.write_text(json.dumps({"nodes": ["fresh"], "links": []}))
         if state is not None:
             records = [status.ResolverStatus(name=name, state=state, reason=reason)]
-            if name != cli.RESOLVER_NAME_ROUTES:
+            for other in (cli.RESOLVER_NAME_ROUTES, cli.RESOLVER_NAME_CONFIG):
                 # Every resolver this package registers must report, so a test about one of
-                # them still has to satisfy the other or it is testing the wrong refusal.
-                records.append(status.ResolverStatus(name=cli.RESOLVER_NAME_ROUTES,
-                                                     state="completed"))
+                # them still has to satisfy the others or it is testing the wrong refusal.
+                if name != other:
+                    records.append(status.ResolverStatus(name=other, state="completed"))
             status.write(records)
         return 0
+
     return run
 
 
@@ -46,16 +51,21 @@ def test_completed_publishes(build):
 
 
 def test_skipped_with_a_reason_publishes(build):
-    code = cli.main([], run_graphify=runner_writing(
-        "skipped", reason="phpstan: vendor/bin/phpstan not found", graph=build))
+    code = cli.main(
+        [],
+        run_graphify=runner_writing(
+            "skipped", reason="phpstan: vendor/bin/phpstan not found", graph=build
+        ),
+    )
 
     assert code == cli.EXIT_OK
     assert json.loads(build.read_text())["nodes"] == ["fresh"]
 
 
 def test_failed_refuses_and_restores_the_previous_graph(build, capsys):
-    code = cli.main([], run_graphify=runner_writing(
-        "failed", reason="RuntimeError: boom", graph=build))
+    code = cli.main(
+        [], run_graphify=runner_writing("failed", reason="RuntimeError: boom", graph=build)
+    )
 
     assert code == cli.EXIT_RESOLVER_FAILED
     assert json.loads(build.read_text())["nodes"] == ["previous"]
@@ -73,8 +83,9 @@ def test_no_record_at_all_refuses(build, capsys):
 
 
 def test_a_record_for_another_resolver_does_not_satisfy_the_gate(build, capsys):
-    code = cli.main([], run_graphify=runner_writing("completed", name="something_else",
-                                                    graph=build))
+    code = cli.main(
+        [], run_graphify=runner_writing("completed", name="something_else", graph=build)
+    )
 
     assert code == cli.EXIT_RESOLVER_MISSING
     assert "php_member_calls" in capsys.readouterr().err
@@ -138,8 +149,10 @@ def test_arguments_without_a_separator_all_reach_graphify(build):
 
 
 def test_extra_expected_resolver_must_also_report(build):
-    code = cli.main(["--expect", cli.RESOLVER_NAME, "--expect", "php_attributes", "--"],
-                    run_graphify=runner_writing("completed", graph=build))
+    code = cli.main(
+        ["--expect", cli.RESOLVER_NAME, "--expect", "php_attributes", "--"],
+        run_graphify=runner_writing("completed", graph=build),
+    )
 
     assert code == cli.EXIT_RESOLVER_MISSING
 
@@ -153,6 +166,87 @@ def test_the_default_gate_requires_every_resolver_this_package_registers(build, 
 
     assert code == cli.EXIT_RESOLVER_MISSING
     assert cli.RESOLVER_NAME_ROUTES in capsys.readouterr().err
+
+
+def test_the_default_gate_requires_the_config_pass_too(build, capsys):
+    def without_config(args):
+        status.write(
+            [
+                status.ResolverStatus(name=cli.RESOLVER_NAME, state="completed"),
+                status.ResolverStatus(name=cli.RESOLVER_NAME_ROUTES, state="completed"),
+            ]
+        )
+        return 0
+
+    code = cli.main([], run_graphify=without_config)
+
+    assert code == cli.EXIT_RESOLVER_MISSING
+    assert cli.RESOLVER_NAME_CONFIG in capsys.readouterr().err
+
+
+def test_a_status_file_that_is_not_a_record_refuses_and_restores(build, capsys):
+    def writes_a_list(args):
+        build.write_text(json.dumps({"nodes": ["fresh"], "links": []}))
+        status.status_path().write_text("[]")
+        return 0
+
+    code = cli.main([], run_graphify=writes_a_list)
+
+    assert code == cli.EXIT_RESOLVER_MISSING
+    assert json.loads(build.read_text())["nodes"] == ["previous"]
+    assert "refusing to publish" in capsys.readouterr().err
+
+
+def test_a_string_system_exit_from_graphify_is_a_failure_not_a_crash(build, capsys, monkeypatch):
+    graphify_main = pytest.importorskip("graphify.__main__")
+
+    def dies(*args, **kwargs):
+        raise SystemExit("ERROR: x")
+
+    monkeypatch.setattr(graphify_main, "main", dies)
+
+    code = cli.main([])
+
+    assert code == 1
+    assert json.loads(build.read_text())["nodes"] == ["previous"]
+    err = capsys.readouterr().err
+    assert "ERROR: x" in err and "graphify exited 1" in err
+
+
+def test_help_works_without_graphify_installed(monkeypatch, capsys):
+    """`--help` must not need graphify: the console script registers before parsing."""
+    monkeypatch.setitem(sys.modules, "graphify", None)
+    monkeypatch.setattr(sys, "argv", ["graphify-php-build", "--help"])
+
+    with pytest.raises(SystemExit) as stop:
+        cli._console_main()
+
+    assert stop.value.code == 0
+    assert "graphify-php-build" in capsys.readouterr().out
+
+
+def test_write_merges_over_a_status_file_that_is_not_a_record(build):
+    status.status_path().write_text("[]")
+
+    status.write([status.ResolverStatus(name="r", state="completed")])
+
+    assert [r["name"] for r in status.read()["resolvers"]] == ["r"]
+
+
+def test_write_drops_rows_that_carry_no_name(build):
+    status.status_path().write_text(
+        json.dumps({"resolvers": [{"state": "completed"}, "junk", {"name": "kept"}]})
+    )
+
+    status.write([status.ResolverStatus(name="r", state="completed")])
+
+    assert [r["name"] for r in status.read()["resolvers"]] == ["kept", "r"]
+
+
+def test_read_returns_nothing_for_a_status_file_that_is_not_a_record(build):
+    status.status_path().write_text("[]")
+
+    assert status.read() == {}
 
 
 def test_check_is_pure_and_needs_no_build():

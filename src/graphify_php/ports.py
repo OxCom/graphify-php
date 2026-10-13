@@ -17,16 +17,17 @@ and one guessed from a declaration must not arrive looking alike.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 class Confidence(str, Enum):
     """How the target was established, in graphify's own vocabulary."""
 
-    EXTRACTED = "EXTRACTED"   # the receiver's type is stated in source and was read there
-    INFERRED = "INFERRED"     # derived: a constructor-body assignment, a `new` binding
+    EXTRACTED = "EXTRACTED"  # the receiver's type is stated in source and was read there
+    INFERRED = "INFERRED"  # derived: a constructor-body assignment, a `new` binding
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,7 @@ class CallSite:
     """
 
     caller_nid: str
-    receiver: str          # source text of the receiver expression, e.g. `$this->emails`
+    receiver: str  # source text of the receiver expression, e.g. `$this->emails`
     method: str
     source_file: str
     source_location: str
@@ -52,7 +53,10 @@ class CallTarget:
     class_fqn: str
     method: str
     confidence: Confidence
-    via: str               # which type source proved it, for diagnosis and for the status record
+    via: str  # which type source proved it, for diagnosis and for the status record
+    # Where the declaring class lives, '' when the source does not know. Lets the graph layer
+    # tell a vendor target from a project class the build left out, without guessing from the FQN.
+    declaring_file: str = ""
 
 
 @runtime_checkable
@@ -81,7 +85,7 @@ class CallTargetSource(Protocol):
         repo_root: str,
         sites: Iterable[CallSite],
         corpus: Iterable[str] | None = None,
-    ) -> "Resolution":
+    ) -> Resolution:
         """Resolve `sites`, optionally with `corpus` as the set of files that may be read.
 
         `corpus` exists because a source needs declarations from files that hold no call site
@@ -107,7 +111,7 @@ class Resolution:
     """What a source made of the sites it was given."""
 
     targets: list[CallTarget]
-    unresolved: dict[str, int]      # reason -> count, a fixed vocabulary per source
+    unresolved: dict[str, int]  # reason -> count, a fixed vocabulary per source
     files_seen: int = 0
 
 
@@ -120,16 +124,14 @@ class NodeIndex(Protocol):
     most likely to move under it between releases.
     """
 
-    def method_node(self, class_fqn: str, method: str) -> str | None:
-        ...
+    def method_node(self, class_fqn: str, method: str) -> str | None: ...
 
 
 @runtime_checkable
 class EdgeSink(Protocol):
     """Where resolved targets become graph edges."""
 
-    def add_call(self, caller_nid: str, callee_nid: str, target: CallTarget) -> None:
-        ...
+    def add_call(self, caller_nid: str, callee_nid: str, target: CallTarget) -> None: ...
 
 
 @runtime_checkable
@@ -164,8 +166,7 @@ class RouteDeclarationSource(Protocol):
 
     name: str
 
-    def available(self, repo_root: str) -> tuple[bool, str]:
-        ...
+    def available(self, repo_root: str) -> tuple[bool, str]: ...
 
     def declarations(self, repo_root: str, files: Iterable[str]) -> object:
         """Route declarations found in `files`. The concrete result type lives with the source,

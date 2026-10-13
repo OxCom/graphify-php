@@ -40,8 +40,14 @@ NS = "{http://symfony.com/schema/dic/services}"
 
 # `%env(bool:default:some_param:APP_DEBUG)%` — processors and defaults are colon-separated and
 # the variable name is always last. Only that last segment is kept; every earlier segment may
-# name a parameter whose value we are not entitled to touch.
-_ENV_EXPRESSION = re.compile(r"^%env\((?P<body>.*)\)%$")
+# name a parameter whose value we are not entitled to touch. `[^()%]*` rather than `.*`: a
+# greedy body makes `%env(A)%:%env(B)%` one match with the name `%env(B`, and a DSN that merely
+# ends in `)%` would hand its tail over as a "name".
+_ENV_EXPRESSION = re.compile(r"^%env\(([^()%]*)\)%$")
+
+# What an environment variable can actually be called. Anything else in the last segment is
+# a processor argument or a stray value, and neither belongs in the overlay.
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 _KIND_BY_TYPE = {
     "service": ArgumentKind.SERVICE,
@@ -69,8 +75,8 @@ def env_name(text: str) -> str | None:
     match = _ENV_EXPRESSION.match(text.strip())
     if not match:
         return None
-    name = match.group("body").rsplit(":", 1)[-1].strip()
-    return name or None
+    name = match.group(1).rsplit(":", 1)[-1].strip()
+    return name if _ENV_NAME.match(name) else None
 
 
 class SymfonyXmlContainerReader:
@@ -81,7 +87,8 @@ class SymfonyXmlContainerReader:
 
     def read(self, path: Path) -> ContainerFacts | None:
         try:
-            root = ET.parse(path).getroot()
+            # expat >= 2.7 rejects entity expansion and external entities; ParseError -> None.
+            root = ET.parse(path).getroot()  # noqa: S314
         except ET.ParseError:
             return None
         except OSError:
@@ -158,11 +165,19 @@ class SymfonyXmlContainerReader:
             facts.skip(reasons.DROP_SERVICE_WITHOUT_CLASS)
 
         self._read_tags(element, service, facts)
-        self._read_arguments(element, service, Member.CONSTRUCTOR, None, facts)
+        # XmlDumper writes the arguments of a factory-built or named-constructor service at
+        # service level and emits `<factory/>` without children, so service-level arguments
+        # are the factory's whenever there is one. Recording them as constructor arguments
+        # would join them against a `__construct` signature they never reach.
+        if factory is not None:
+            member, member_name = Member.FACTORY, service.factory_method
+        elif service.constructor is not None:
+            member, member_name = Member.FACTORY, service.constructor
+        else:
+            member, member_name = Member.CONSTRUCTOR, None
+        self._read_arguments(element, service, member, member_name, facts)
         for call in element.findall(NS + "call"):
             self._read_arguments(call, service, Member.CALL, call.get("method"), facts)
-        if factory is not None:
-            self._read_arguments(factory, service, Member.FACTORY, service.factory_method, facts)
 
     def _read_tags(self, element: ET.Element, service: Service, facts: ContainerFacts) -> None:
         for tag in element.findall(NS + "tag"):
@@ -222,7 +237,7 @@ class SymfonyXmlContainerReader:
             name = env_name(text)
             if name:
                 kind = ArgumentKind.ENV
-            elif text.strip().startswith("%env(") :
+            elif text.strip().startswith("%env("):
                 kind = ArgumentKind.ENV
                 facts.skip(reasons.DROP_ENV_NAME_UNPARSEABLE)
             else:
@@ -289,7 +304,14 @@ class SymfonyXmlContainerReader:
         consumers: dict[str, str] = {}
         for injection in facts.injections:
             if injection.requested_id and injection.requested_id.endswith(".inner"):
-                consumers.setdefault(injection.requested_id, injection.consumer_id)
+                # The decorator is the service that took over the original id, so when that
+                # service references `<id>.inner` it wins over a collector that happens to be
+                # listed first and also holds the reference.
+                owner = injection.requested_id[: -len(".inner")]
+                if injection.consumer_id == owner:
+                    consumers[injection.requested_id] = owner
+                else:
+                    consumers.setdefault(injection.requested_id, injection.consumer_id)
         for service_id, service in facts.services.items():
             if not service_id.endswith(".inner"):
                 continue

@@ -17,15 +17,25 @@ test, in a linter, in a tool that only wants the ports — never requires graphi
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from importlib import import_module
-from typing import Sequence
 
 from .ports import CallTargetSource
-from .resolver import (PHP_SUFFIXES, RESOLVER_NAME, RESOLVER_NAME_ROUTES,
-                       make_resolver, make_route_resolver)
+from .resolver import (
+    PHP_SUFFIXES,
+    RESOLVER_NAME,
+    RESOLVER_NAME_ROUTES,
+    make_resolver,
+    make_route_resolver,
+)
 
-__all__ = ["RESOLVER_NAME", "RESOLVER_NAME_ROUTES", "default_route_sources",
-           "default_sources", "register"]
+__all__ = [
+    "RESOLVER_NAME",
+    "RESOLVER_NAME_ROUTES",
+    "default_route_sources",
+    "default_sources",
+    "register",
+]
 
 _registered = False
 
@@ -59,8 +69,10 @@ def default_sources(repo_root: str = ".") -> Sequence[CallTargetSource]:
     # Precedence, and the only place it is written down: the type engine knows untyped
     # properties, chains and docblocks that the parser must refuse, so it answers first.
     assembled: list[CallTargetSource] = []
-    for module_name, class_name in (("phpstan_source", "PhpStanSource"),
-                                    ("tree_sitter_source", "TreeSitterSource")):
+    for module_name, class_name in (
+        ("phpstan_source", "PhpStanSource"),
+        ("tree_sitter_source", "TreeSitterSource"),
+    ):
         try:
             module = import_module(f"{__name__}.sources.{module_name}")
         except ImportError:
@@ -86,8 +98,11 @@ def default_route_sources(repo_root: str = "."):
     return (source(),) if source is not None else ()
 
 
-def register(sources_factory=default_sources, repo_root: str = ".",
-             route_sources_factory=default_route_sources) -> bool:
+def register(
+    sources_factory=default_sources,
+    repo_root: str = ".",
+    route_sources_factory=default_route_sources,
+) -> bool:
     """Register the PHP resolver with graphify. Returns whether this call did the registering.
 
     Idempotent by name rather than by a flag alone: a process that imported this package twice
@@ -98,22 +113,32 @@ def register(sources_factory=default_sources, repo_root: str = ".",
     global _registered
     from graphify import resolver_registry
 
-    if _registered or any(r.name == RESOLVER_NAME
-                          for r in resolver_registry.registered_resolvers()):
+    if _registered or any(
+        r.name == RESOLVER_NAME for r in resolver_registry.registered_resolvers()
+    ):
         _registered = True
         return False
 
-    resolver_registry.register(resolver_registry.LanguageResolver(
-        name=RESOLVER_NAME,
-        suffixes=PHP_SUFFIXES,
-        resolve=make_resolver(sources_factory, repo_root),
-    ))
+    resolver_registry.register(
+        resolver_registry.LanguageResolver(
+            name=RESOLVER_NAME,
+            suffixes=PHP_SUFFIXES,
+            resolve=make_resolver(sources_factory, repo_root),
+        )
+    )
     # A second pass, not a stage of the first: routes add nodes rather than connect existing
     # ones, and a separate registration gives them a status record the build gate can require.
-    resolver_registry.register(resolver_registry.LanguageResolver(
-        name=RESOLVER_NAME_ROUTES,
-        suffixes=PHP_SUFFIXES,
-        resolve=make_route_resolver(route_sources_factory, repo_root),
-    ))
+    resolver_registry.register(
+        resolver_registry.LanguageResolver(
+            name=RESOLVER_NAME_ROUTES,
+            suffixes=PHP_SUFFIXES,
+            resolve=make_route_resolver(route_sources_factory, repo_root),
+        )
+    )
+    # The Symfony configuration pass. Registered here because this is the one registration a
+    # build makes; a pass left out of it never runs, however complete its own `register` is.
+    from . import config_resolver
+
+    config_resolver.register(repo_root)
     _registered = True
     return True

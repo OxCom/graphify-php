@@ -9,9 +9,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from graphify_php.ports import Confidence                      # noqa: E402
-from graphify_php.syntax import nodes                          # noqa: E402
-from graphify_php.syntax.collectors import (                   # noqa: E402
+from graphify_php.ports import Confidence  # noqa: E402
+from graphify_php.syntax import nodes  # noqa: E402
+from graphify_php.syntax.collectors import (  # noqa: E402
     COLLECTORS,
     ConstructorAssignmentCollector,
     LocalConstructionCollector,
@@ -19,8 +19,8 @@ from graphify_php.syntax.collectors import (                   # noqa: E402
     TypedPropertyCollector,
     by_node_kind,
 )
-from graphify_php.syntax.file_scan import scan_source          # noqa: E402
-from graphify_php.syntax.names import NameResolver             # noqa: E402
+from graphify_php.syntax.file_scan import scan_source  # noqa: E402
+from graphify_php.syntax.names import NameResolver  # noqa: E402
 
 
 def scan(php: str):
@@ -378,7 +378,7 @@ def test_a_new_type_source_plugs_in_without_touching_the_walker():
     ],
 )
 def test_type_name_reads_one_class_or_nothing(declaration, expected):
-    tree = nodes.parse(("<?php class C { %s }" % declaration).encode())
+    tree = nodes.parse(f"<?php class C {{ {declaration} }}".encode())
     prop = _find(tree.root_node, "property_declaration")
     assert nodes.type_name(nodes.type_node(prop)) == expected
 
@@ -450,16 +450,24 @@ class C { public function run(): void { Helper::format(); } }
 
 def test_class_index_separates_declared_absent_and_unknown():
     from graphify_php.syntax.class_index import (
-        DECLARED, MAGIC, NOT_DECLARED, UNKNOWN, ClassIndex, index_from_facts,
+        DECLARED,
+        MAGIC,
+        NOT_DECLARED,
+        UNKNOWN,
+        ClassIndex,
+        index_from_facts,
     )
 
     index = ClassIndex()
-    index_from_facts(index, scan(r"""<?php
+    index_from_facts(
+        index,
+        scan(r"""<?php
 namespace App;
 class Plain { public function actual(): void {} }
 class Magic { public function __call($n, $a) {} }
 class Child extends Unread { public function own(): void {} }
-"""))
+"""),
+    )
     assert index.declares("App\\Plain", "actual") == DECLARED
     assert index.declares("App\\Plain", "missing") == NOT_DECLARED
     assert index.declares("App\\Magic", "anything") == MAGIC
@@ -472,12 +480,15 @@ def test_class_index_walks_traits_and_interfaces():
     from graphify_php.syntax.class_index import DECLARED, ClassIndex, index_from_facts
 
     index = ClassIndex()
-    index_from_facts(index, scan(r"""<?php
+    index_from_facts(
+        index,
+        scan(r"""<?php
 namespace App;
 trait Sends { public function dispatch(): void {} }
 interface Mailer { public function deliver(): void; }
 class Campaign implements Mailer { use Sends; public function deliver(): void {} }
-"""))
+"""),
+    )
     assert index.declares("App\\Campaign", "dispatch") == DECLARED
     assert index.declares("App\\Campaign", "deliver") == DECLARED
     assert index.declares("App\\Mailer", "deliver") == DECLARED
@@ -496,11 +507,14 @@ def test_property_walk_prefers_the_nearest_declaration():
     from graphify_php.syntax.class_index import ClassIndex, index_from_facts
 
     index = ClassIndex()
-    index_from_facts(index, scan(r"""<?php
+    index_from_facts(
+        index,
+        scan(r"""<?php
 namespace App;
 class Base { protected Wide $client; protected Only $fromBase; }
 class Child extends Base { protected Narrow $client; }
-"""))
+"""),
+    )
     assert index.property_fact("App\\Child", "client")[0].fqn == "App\\Narrow"
     assert index.property_fact("App\\Child", "fromBase")[0].fqn == "App\\Only"
     assert index.property_fact("App\\Base", "client")[0].fqn == "App\\Wide"
@@ -510,10 +524,13 @@ def test_property_walk_returns_nothing_for_an_unread_ancestor():
     from graphify_php.syntax.class_index import ClassIndex, index_from_facts
 
     index = ClassIndex()
-    index_from_facts(index, scan(r"""<?php
+    index_from_facts(
+        index,
+        scan(r"""<?php
 namespace App;
 class Child extends Unread {}
-"""))
+"""),
+    )
     assert index.property_fact("App\\Child", "anything") == (None, None)
 
 
@@ -521,9 +538,39 @@ def test_property_walk_reports_an_ancestors_refusal():
     from graphify_php.syntax.class_index import ClassIndex, index_from_facts
 
     index = ClassIndex()
-    index_from_facts(index, scan(r"""<?php
+    index_from_facts(
+        index,
+        scan(r"""<?php
 namespace App;
 class Base { protected Alpha|Beta $either; }
 class Child extends Base {}
-"""))
+"""),
+    )
     assert index.property_fact("App\\Child", "either") == (None, "union-type")
+
+
+def test_constructor_assignment_inside_a_closure_is_not_read_from_the_constructor_signature():
+    """`$x` inside the closure is the closure's parameter, not the constructor's."""
+    scope = only_class(r"""<?php
+namespace App;
+class C {
+    private $store;
+    public function __construct(Emails $x) {
+        $this->later = function (Cache $x) { $this->store = $x; };
+    }
+}
+""")
+    assert "store" not in scope.properties
+
+
+def test_constructor_assignment_inside_an_arrow_function_is_not_read_either():
+    scope = only_class(r"""<?php
+namespace App;
+class C {
+    private $store;
+    public function __construct(Emails $x) {
+        $this->later = fn (Cache $x) => $this->store = $x;
+    }
+}
+""")
+    assert "store" not in scope.properties

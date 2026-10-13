@@ -30,8 +30,9 @@ is a wrong class (a broken type table) or a wrong method (a broken node lookup).
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -67,7 +68,7 @@ class ResolverOutput:
     """
 
     predictions: tuple[Prediction, ...] = ()
-    unresolved: Mapping[str, str] = field(default_factory=dict)   # site_id -> reason
+    unresolved: Mapping[str, str] = field(default_factory=dict)  # site_id -> reason
     observed: frozenset[str] | None = None
 
 
@@ -148,17 +149,25 @@ def _best_option(predicted: frozenset, options: Sequence[frozenset]) -> frozense
     return max(options, key=lambda option: (len(predicted & option), -len(predicted ^ option)))
 
 
-def _classify(predicted_key: tuple[str, str], option: frozenset[tuple[str, str]]) -> ErrorKind:
+def _classify(
+    predicted_key: tuple[str, str],
+    option: frozenset[tuple[str, str]],
+    options: Sequence[frozenset[tuple[str, str]]],
+) -> ErrorKind:
+    if len(options) > 1 and any(predicted_key in other for other in options):
+        # Correct under another accepted answer for this site: the resolver fanned out across
+        # alternatives instead of picking one. Only a site with alternatives can produce this.
+        return EXTRA_TARGET
     class_fqn, method = predicted_key
     same_class = any(c == class_fqn for c, _ in option)
     same_method = any(m == method for _, m in option)
     if same_class and not same_method:
         return WRONG_METHOD
-    if same_method and not same_class:
+    if same_method:
+        # The method is accepted, on a different class. `(A, bar)` against `{(A, foo), (B, bar)}`
+        # is a wrong pairing — the class table pointed `bar` at the wrong class — and both
+        # halves being present somewhere in the answer does not make it an extra target.
         return WRONG_CLASS
-    if same_class and same_method:
-        # Both halves appear in the accepted set but not as a pair: an over-eager fan-out.
-        return EXTRA_TARGET
     return WRONG_CLASS_AND_METHOD
 
 
@@ -206,7 +215,9 @@ def score(sites: Sequence, output: ResolverOutput) -> Report:
         # Not silently dropped: a prediction for a site nobody labelled cannot be judged, and
         # counting it as correct or as wrong would both be inventions.
         errors.append(
-            ScoringError(prediction.site_id, UNKNOWN_SITE, f"{prediction.class_fqn}::{prediction.method}", "")
+            ScoringError(
+                prediction.site_id, UNKNOWN_SITE, f"{prediction.class_fqn}::{prediction.method}", ""
+            )
         )
 
     for site in sites:
@@ -220,13 +231,18 @@ def score(sites: Sequence, output: ResolverOutput) -> Report:
             if predicted_key in target_option:
                 correct_targets += 1
                 continue
-            kind = RESOLVED_A_NEGATIVE if is_negative else _classify(predicted_key, target_option)
+            kind = (
+                RESOLVED_A_NEGATIVE
+                if is_negative
+                else _classify(predicted_key, target_option, options)
+            )
             errors.append(
                 ScoringError(
                     site_id=site.site_id,
                     kind=kind,
                     predicted=f"{predicted_key[0]}::{predicted_key[1]}",
-                    expected=", ".join(sorted(f"{c}::{m}" for c, m in target_option)) or "(no target)",
+                    expected=", ".join(sorted(f"{c}::{m}" for c, m in target_option))
+                    or "(no target)",
                     stratum=getattr(site.stratum, "value", str(site.stratum)),
                 )
             )
@@ -296,7 +312,9 @@ def score(sites: Sequence, output: ResolverOutput) -> Report:
         negatives_held=Ratio(negatives_held, negatives_total),
         pair_precision=Ratio(len(correct_pairs), len(predicted_pairs)),
         pair_recall_in_scope=Ratio(len(correct_pairs & expected_pairs), len(expected_pairs)),
-        per_stratum_recall={s: Ratio(stratum_hits[s], stratum_total[s]) for s in sorted(stratum_total)},
+        per_stratum_recall={
+            s: Ratio(stratum_hits[s], stratum_total[s]) for s in sorted(stratum_total)
+        },
         unresolved_by_reason=dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
         errors=tuple(errors),
         error_kinds=dict(sorted(Counter(e.kind for e in errors).items())),
@@ -394,11 +412,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from .reference_set import SITES
 
-    parser = argparse.ArgumentParser(description="Score a resolver's output against the reference set.")
+    parser = argparse.ArgumentParser(
+        description="Score a resolver's output against the reference set."
+    )
     parser.add_argument("predictions", help="JSON file, or - for stdin")
     args = parser.parse_args(argv)
 
-    text = sys.stdin.read() if args.predictions == "-" else open(args.predictions, encoding="utf-8").read()
+    text = (
+        sys.stdin.read()
+        if args.predictions == "-"
+        else open(args.predictions, encoding="utf-8").read()
+    )
     report = score(SITES, output_from_json(json.loads(text)))
     print(format_report(report))
     # Non-zero on any wrong target, so a build pipeline can gate on precision without parsing

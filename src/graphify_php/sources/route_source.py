@@ -32,8 +32,8 @@ resolver should treat `reason` the way it treats `Resolution.unresolved`: a coun
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable, Protocol, runtime_checkable
 
 from ..ports import RouteDeclarationSource  # noqa: F401  the port this module implements
 from ..syntax import nodes
@@ -55,8 +55,6 @@ class RouteResolution:
     @property
     def resolved(self) -> list[RouteDeclaration]:
         return [d for d in self.declarations if d.resolved]
-
-
 
 
 class TreeSitterRouteSource:

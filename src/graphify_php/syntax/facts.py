@@ -59,6 +59,19 @@ class MethodScope:
             return
         self.locals[name] = fact
 
+    def note_write(self, name: str, reason: str, precedence: int) -> bool:
+        """Record a binding of `name`, revoking an earlier one. True when it was the first.
+
+        Every binding form counts — an assignment, a parameter, a `foreach` target, a `catch`
+        variable, a destructuring target — because without flow analysis a second write
+        anywhere in the method is the evidence that the first no longer holds at the call.
+        """
+        rewritten = name in self.assigned
+        self.assigned.add(name)
+        if rewritten:
+            self.refuse_local(name, reason, precedence)
+        return not rewritten
+
     def refuse_local(self, name: str, reason: str, precedence: int) -> None:
         """Drop whatever was known about a local and say why.
 
@@ -130,6 +143,12 @@ class FileFacts:
     # Route attributes declared in this file. Not a type fact, carried here because the file
     # is what owns them and one parse should answer every question about it.
     routes: list[RouteDeclaration] = field(default_factory=list)
+    # Line spans of every `new class { ... }`. The walker reads nothing inside one, so a site
+    # there has no facts of its own and must not be answered with the enclosing class's.
+    anonymous_classes: list[tuple[int, int]] = field(default_factory=list)
+
+    def in_anonymous_class(self, line: int) -> bool:
+        return any(start <= line <= end for start, end in self.anonymous_classes)
 
     def class_at(self, line: int) -> ClassScope | None:
         """The innermost class whose body covers `line`.

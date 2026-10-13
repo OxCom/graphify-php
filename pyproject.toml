@@ -19,14 +19,19 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
 ]
 
-# No runtime dependencies on purpose. graphify and tree-sitter are supplied by the environment
-# that runs the build: this package is loaded into graphify's own process and pinning either of
-# them here would fight graphify's pins and could install a second, unused copy alongside the
-# one actually doing the work.
-dependencies = []
+# graphify and tree-sitter are supplied by the environment that runs the build and are
+# deliberately not pinned here: this package is loaded into graphify's own process and pinning
+# either of them here would fight graphify's pins and could install a second, unused copy
+# alongside the one actually doing the work. pyyaml is declared because the Symfony config pass
+# reads YAML and graphify does not bring it.
+dependencies = ["pyyaml>=6.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+# graphifyy is the PyPI name of graphify. It declares tree-sitter and tree-sitter-php itself, so
+# listing it here is what makes the parser tests runnable: syntax/nodes.py sets the tree-sitter
+# modules to None when the import fails and the tests then fail rather than skip.
+test = ["pytest>=7.0", "graphifyy>=0.9.66"]
+lint = ["ruff>=0.15"]
 
 [project.scripts]
 graphify-php-build = "graphify_php.cli:_console_main"
@@ -38,3 +43,18 @@ packages = ["src/graphify_php"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+# PHP and YAML fixtures the measurement harness labels; nothing Python lives there.
+extend-exclude = ["eval/fixtures"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, UP pyupgrade, B flake8-bugbear, S flake8-bandit.
+select = ["E", "F", "W", "I", "UP", "B", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use bare asserts (S101), fixed fake credentials (S105/S106) and subprocess calls to
+# php and phpstan (S603/S607) on purpose.
+"tests/**" = ["S101", "S104", "S105", "S106", "S108", "S311", "S603", "S607"]

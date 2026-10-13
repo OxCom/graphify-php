@@ -62,7 +62,7 @@ def test_assert_no_leaks_raises_and_redacts():
     with pytest.raises(cn.CanaryLeak) as raised:
         cn.assert_no_leaks({"diagnostics.txt": f"failed to parse token {canary.value}"})
     message = str(raised.value)
-    assert canary.value not in message      # the failure report must not leak it again
+    assert canary.value not in message  # the failure report must not leak it again
     assert "redacted" in message
     assert "diagnostics.txt" in message
 
@@ -71,7 +71,9 @@ def test_leak_in_any_artifact_kind_is_caught():
     value = cn.CANARIES[1].value
     artifacts = {
         "graph.json": "{}",
-        "status.json": json.dumps({"resolvers": [{"name": "php_types", "reason": f"bad dsn {value}"}]}),
+        "status.json": json.dumps(
+            {"resolvers": [{"name": "php_types", "reason": f"bad dsn {value}"}]}
+        ),
     }
     leaks = cn.scan_artifacts(artifacts)
     assert [leak.artifact for leak in leaks] == ["status.json"]

@@ -1,11 +1,10 @@
-<!-- Superseded by SwarmVault vault page: raw/agentscopex/graphify-php/explanation/measurement-harness.md -->
 # Measurement harness
 
 This directory answers one question about a PHP call-target resolver: **how many of the edges
 it adds are right, and how many of the right ones is it still missing?**
 
-It exists because the obvious number cannot answer that. The reference application carries
-2172 `calls` edges against 3426 callable nodes — 24 % of callables with an outgoing call edge,
+It exists because the obvious number cannot answer that. A reference Symfony application
+(584 PHP files, not shipped with this package) carries 2172 `calls` edges against 3426 callable nodes — 24 % of callables with an outgoing call edge,
 20 % with an incoming one — and the temptation is to run a resolver, watch that count rise,
 and call it fixed. A rise is compatible with two opposite outcomes. The upstream project whose
 fix is closest to this one recorded **+1,566 correct edges and −454 false ones in the same
@@ -31,8 +30,8 @@ own output.
 Tests, including every scorer defect case and the leak check:
 
 ```sh
-PYTHONPATH=/usr/lib/python3/dist-packages \
-  /home/oxcom/.local/share/pipx/venvs/graphify-mesh/bin/python -m pytest tests/test_eval_*.py
+pip install -e ".[test]"
+python -m pytest tests/test_eval_*.py
 ```
 
 Scoring a resolver. Write its output as JSON and hand it over; exit status is non-zero if any
@@ -135,9 +134,9 @@ number available, never as the expected field error rate.
 - **In-scope is a claim about this version, not about PHP.** Moving a pattern into scope moves
   the recall denominator, and two recall figures from different versions are not comparable
   without the denominators beside them.
-- **28 of 33 labels are synthetic.** They are minimal on purpose, so a failure names one cause.
-  Real code combines patterns, and 5 labels from the reference application are not enough to
-  show what that combination costs.
+- **28 of 33 labels are minimal on purpose**, so a failure names one cause. Real code combines
+  patterns; the 5 labels in `handler_shapes.php` copy one messenger handler from the reference
+  application shape for shape, and 5 are not enough to show what that combination costs.
 
 ## Canaries
 

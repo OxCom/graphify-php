@@ -1,5 +1,8 @@
 """Reads the reference application's real compiled container, and skips when it is absent.
 
+`GRAPHIFY_PHP_REFERENCE_PROJECT` names the Symfony project root; the container is read from
+`var/cache/dev/App_KernelDevDebugContainer.xml` under it.
+
 Read-only, and the artifact goes to a pytest temporary directory: nothing under the reference
 application is written, no PHP runs, no kernel boots. The point of the test is that the shapes
 the unit fixtures assert — an alias, a tagged iterator, a decorator, an env argument — are the
@@ -8,17 +11,27 @@ shapes a 1.36 MB production-grade dump actually has, at a scale a fixture cannot
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from graphify_php.container import ArgumentKind, OverlayWriter, SymfonyXmlContainerReader
 
-REFERENCE = Path("/var/www/www.cem.dev.lo/var/cache/dev/App_KernelDevDebugContainer.xml")
-
-pytestmark = pytest.mark.skipif(
-    not REFERENCE.exists(), reason=f"reference container not present at {REFERENCE}"
+REFERENCE_PROJECT_ENV = "GRAPHIFY_PHP_REFERENCE_PROJECT"
+REFERENCE = Path(
+    os.environ.get(REFERENCE_PROJECT_ENV, ""), "var/cache/dev/App_KernelDevDebugContainer.xml"
 )
+
+pytestmark = [
+    pytest.mark.skipif(
+        not os.environ.get(REFERENCE_PROJECT_ENV),
+        reason=f"{REFERENCE_PROJECT_ENV} is not set",
+    ),
+    pytest.mark.skipif(
+        not REFERENCE.is_file(), reason=f"reference container not present at {REFERENCE}"
+    ),
+]
 
 
 def _interface_aliases_in(path: Path) -> int:
@@ -31,7 +44,8 @@ def _interface_aliases_in(path: Path) -> int:
     """
     import xml.etree.ElementTree as ET
 
-    root = ET.parse(path).getroot()
+    # expat >= 2.7 rejects entity expansion and external entities; stdlib stays on purpose.
+    root = ET.parse(path).getroot()  # noqa: S314
     namespace = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
     tag = (lambda name: f"{{{namespace}}}{name}") if namespace else (lambda name: name)
 
@@ -41,7 +55,8 @@ def _interface_aliases_in(path: Path) -> int:
         if service.get("id") and not service.get("alias")
     }
     aliases = [
-        service for service in root.iter(tag("service"))
+        service
+        for service in root.iter(tag("service"))
         if service.get("alias") and str(service.get("id", "")).endswith("Interface")
     ]
     return sum(1 for a in aliases if classes.get(a.get("alias")))

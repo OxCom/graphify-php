@@ -7,9 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from graphify_php.config import (ConfigDocument, ConfigFileFinder, EnvReferenceReader,
-                                 MessageRoutingReader, SafeDocumentParser)
-from graphify_php.config import safe_yaml
+from graphify_php.config import (
+    ConfigDocument,
+    ConfigFileFinder,
+    EnvReferenceReader,
+    MessageRoutingReader,
+    SafeDocumentParser,
+    safe_yaml,
+)
 from graphify_php.config.document import file_key
 from graphify_php.config.environment import RELATION_READS_ENV, env_key
 from graphify_php.config.messaging import RELATION_DECLARES, RELATION_ROUTED_TO, transport_key
@@ -47,23 +52,32 @@ def test_routing_binds_each_message_class_to_its_transport(tmp_path):
     assert {e.target.value for e in routed} == {transport_key("cron")}
     # The file declares the transport whatever happens to the message classes.
     assert [e.source.value for e in facts.edges if e.relation == RELATION_DECLARES] == [
-        file_key("messenger.yaml")] * 2
+        file_key("messenger.yaml")
+    ] * 2
 
 
 def test_a_bare_top_level_routing_table_is_read_too(tmp_path):
-    document = parse(tmp_path, "messenger.yaml", """
+    document = parse(
+        tmp_path,
+        "messenger.yaml",
+        """
         routing:
             'App\\Messages\\TimezoneInitializedMessage': cron
-    """)
+    """,
+    )
     facts = MessageRoutingReader().read(document)
     assert [e.target.value for e in facts.edges if e.relation == RELATION_ROUTED_TO] == [
-        transport_key("cron")]
+        transport_key("cron")
+    ]
 
 
-@pytest.mark.parametrize("body,expected", [
-    ("'App\\M': [async, audit]", {"async", "audit"}),
-    ("'App\\M': {senders: [async]}", {"async"}),
-])
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ("'App\\M': [async, audit]", {"async", "audit"}),
+        ("'App\\M': {senders: [async]}", {"async"}),
+    ],
+)
 def test_the_list_and_senders_forms_name_the_same_transports(tmp_path, body, expected):
     document = parse(tmp_path, "m.yaml", f"routing:\n    {body}\n")
     facts = MessageRoutingReader().read(document)
@@ -71,10 +85,14 @@ def test_the_list_and_senders_forms_name_the_same_transports(tmp_path, body, exp
 
 
 def test_a_routing_key_that_is_not_a_class_is_counted_not_guessed(tmp_path):
-    document = parse(tmp_path, "m.yaml", """
+    document = parse(
+        tmp_path,
+        "m.yaml",
+        """
         routing:
             '*': async
-    """)
+    """,
+    )
     facts = MessageRoutingReader().read(document)
 
     assert facts.unresolved == {"routing_key_is_not_a_class": 1}
@@ -85,37 +103,49 @@ def test_a_routing_key_that_is_not_a_class_is_counted_not_guessed(tmp_path):
 
 
 def test_a_file_with_no_routing_produces_nothing(tmp_path):
-    document = parse(tmp_path, "cache.yaml", """
+    document = parse(
+        tmp_path,
+        "cache.yaml",
+        """
         framework:
             cache:
                 app: cache.adapter.filesystem
-    """)
+    """,
+    )
     facts = MessageRoutingReader().read(document)
     assert (facts.nodes, facts.edges, facts.unresolved) == ([], [], {})
 
 
-@pytest.mark.parametrize("placeholder,name", [
-    ("%env(MICROSOFT_CLIENT_SECRET)%", "MICROSOFT_CLIENT_SECRET"),
-    ("%env(bool:APP_DEBUG)%", "APP_DEBUG"),
-    ("%env(int:WORKER_COUNT)%", "WORKER_COUNT"),
-    ("%env(default:foo:DATABASE_URL)%", "DATABASE_URL"),
-    ("%env(resolve:default:app.dsn:MAILER_DSN)%", "MAILER_DSN"),
-])
+@pytest.mark.parametrize(
+    "placeholder,name",
+    [
+        ("%env(MICROSOFT_CLIENT_SECRET)%", "MICROSOFT_CLIENT_SECRET"),
+        ("%env(bool:APP_DEBUG)%", "APP_DEBUG"),
+        ("%env(int:WORKER_COUNT)%", "WORKER_COUNT"),
+        ("%env(default:foo:DATABASE_URL)%", "DATABASE_URL"),
+        ("%env(resolve:default:app.dsn:MAILER_DSN)%", "MAILER_DSN"),
+    ],
+)
 def test_every_processor_form_yields_the_innermost_name(tmp_path, placeholder, name):
     document = parse(tmp_path, "services.yaml", f"parameters:\n    k: '{placeholder}'\n")
     facts = EnvReferenceReader().read(document)
 
     assert [n.label for n in facts.nodes] == [name]
     assert [(e.source.value, e.relation, e.target.value) for e in facts.edges] == [
-        (file_key("services.yaml"), RELATION_READS_ENV, env_key(name))]
+        (file_key("services.yaml"), RELATION_READS_ENV, env_key(name))
+    ]
 
 
 def test_the_surrounding_value_is_never_kept(tmp_path):
     """The placeholder is usually embedded. Only the name may survive this reader."""
-    document = parse(tmp_path, "services.yaml", """
+    document = parse(
+        tmp_path,
+        "services.yaml",
+        """
         parameters:
             dsn: 'smtp://user:hunter2@mail.invalid:587/?token=%env(MAILER_TOKEN)%'
-    """)
+    """,
+    )
     facts = EnvReferenceReader().read(document)
 
     assert [n.label for n in facts.nodes] == ["MAILER_TOKEN"]
@@ -124,11 +154,15 @@ def test_the_surrounding_value_is_never_kept(tmp_path):
 
 
 def test_one_variable_read_twice_is_one_node(tmp_path):
-    document = parse(tmp_path, "services.yaml", """
+    document = parse(
+        tmp_path,
+        "services.yaml",
+        """
         parameters:
             a: '%env(APP_SECRET)%'
             b: '%env(string:APP_SECRET)%'
-    """)
+    """,
+    )
     assert [n.label for n in EnvReferenceReader().read(document).nodes] == ["APP_SECRET"]
 
 
@@ -142,11 +176,13 @@ def test_a_processor_argument_that_is_not_a_name_is_counted(tmp_path):
 def test_symfony_php_tags_stay_opaque_strings(tmp_path):
     """`!php/const` needs PHP to mean anything. Parsing must neither resolve nor refuse it."""
     path = tmp_path / "services.yaml"
-    path.write_text(textwrap.dedent("""
+    path.write_text(
+        textwrap.dedent("""
         parameters:
             version: !php/const App\\Kernel::VERSION
             status: !php/enum App\\Status::Draft
-    """).lstrip())
+    """).lstrip()
+    )
     result = SafeDocumentParser().parse(path)
 
     assert result.data is not None, result.reason
@@ -188,11 +224,7 @@ def test_alias_resolution_is_bounded(tmp_path, monkeypatch):
 
 def test_ordinary_merge_keys_still_parse(tmp_path):
     path = tmp_path / "services.yaml"
-    path.write_text(
-        "defaults: &d {autowire: true}\n"
-        "services:\n"
-        "  _defaults: {<<: *d}\n"
-    )
+    path.write_text("defaults: &d {autowire: true}\nservices:\n  _defaults: {<<: *d}\n")
     result = SafeDocumentParser().parse(path)
     assert result.data["services"]["_defaults"]["autowire"] is True
 
@@ -205,8 +237,11 @@ def test_an_oversized_file_is_refused_unread(tmp_path, monkeypatch):
 
 
 def test_the_finder_stays_inside_config(tmp_path):
-    for name in ("config/services.yaml", "config/packages/messenger.yaml",
-                 "config/packages/.hidden.yaml"):
+    for name in (
+        "config/services.yaml",
+        "config/packages/messenger.yaml",
+        "config/packages/.hidden.yaml",
+    ):
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("parameters: {}\n")
@@ -216,8 +251,11 @@ def test_the_finder_stays_inside_config(tmp_path):
         path.write_text("x\n")
 
     found = [relative for relative, _ in ConfigFileFinder(tmp_path).find()]
-    assert found == ["config/packages/.hidden.yaml", "config/packages/messenger.yaml",
-                     "config/services.yaml"]
+    assert found == [
+        "config/packages/.hidden.yaml",
+        "config/packages/messenger.yaml",
+        "config/services.yaml",
+    ]
 
 
 def test_a_symlink_inside_config_is_not_followed(tmp_path):
@@ -225,3 +263,54 @@ def test_a_symlink_inside_config_is_not_followed(tmp_path):
     (tmp_path / "outside.yaml").write_text("parameters: {}\n")
     (tmp_path / "config" / "linked.yaml").symlink_to(tmp_path / "outside.yaml")
     assert ConfigFileFinder(tmp_path).find() == []
+
+
+def test_a_deeply_nested_flow_document_is_named_not_raised(tmp_path):
+    # PyYAML recurses once per nesting level; 5000 levels overflow the interpreter stack with a
+    # RecursionError, which is not a YAMLError and would otherwise escape the parser.
+    path = tmp_path / "deep.yaml"
+    path.write_text("a: " + "[" * 5000 + "]" * 5000 + "\n")
+    result = SafeDocumentParser().parse(path)
+
+    assert result.data is None
+    assert result.reason == safe_yaml.REASON_TOO_DEEP
+
+
+def test_a_placeholder_below_the_depth_bound_is_counted_not_dropped_silently(tmp_path):
+    from graphify_php.config import environment
+
+    nested = {"deep": "%env(DEEP)%"}
+    for _ in range(environment._MAX_DEPTH + 1):
+        nested = {"k": nested}
+    document = ConfigDocument(path="services.yaml", data={"a": "%env(TOP)%", **nested})
+    facts = EnvReferenceReader().read(document)
+
+    assert [n.label for n in facts.nodes] == ["TOP"]
+    assert facts.unresolved == {environment.REASON_DEPTH_LIMIT: 1}
+
+
+def php_class_node(nid: str, label: str, source_file: str) -> dict:
+    return {"id": nid, "label": label, "source_file": source_file, "_callable_class": True}
+
+
+def contains(file_id: str, class_id: str) -> dict:
+    return {"source": file_id, "target": class_id, "relation": "contains"}
+
+
+def test_a_foreign_namespace_does_not_bind_to_the_only_local_short_name_match():
+    from graphify_php.config.class_lookup import GraphClassIndex
+
+    nodes = [php_class_node("m1", "SyncUsers", "src/Cron/Message/SyncUsers.php")]
+    index = GraphClassIndex(nodes, [contains("f1", "m1")])
+
+    assert index.node_id("Vendor\\Billing\\Event\\SyncUsers") is None
+    assert index.node_id("App\\Cron\\Message\\SyncUsers") == "m1"
+
+
+def test_a_two_segment_namespace_binds_on_one_matching_directory():
+    from graphify_php.config.class_lookup import GraphClassIndex
+
+    nodes = [php_class_node("e1", "Emails", "src/Service/Emails.php")]
+    index = GraphClassIndex(nodes, [contains("f1", "e1")])
+
+    assert index.node_id("App\\Service\\Emails") == "e1"

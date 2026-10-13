@@ -36,7 +36,8 @@ def _path_parts(source_file: str) -> list[str]:
 
 def _tail_overlap(a: list[str], b: list[str]) -> int:
     count = 0
-    for left, right in zip(reversed(a), reversed(b)):
+    # Paths differ in length on purpose; the overlap stops at the shorter one.
+    for left, right in zip(reversed(a), reversed(b), strict=False):
         if _key(left) != _key(right):
             break
         count += 1
@@ -62,16 +63,23 @@ class GraphClassIndex:
         candidates = self._by_short.get(_key(parts[-1]), [])
         if not candidates:
             return None
-        if len(candidates) == 1:
-            return candidates[0].get("id")
 
         # Directories only. The file stem repeats the class name, so including it would score
         # every candidate identically and decide nothing.
         namespace = parts[:-1]
-        scored = [(_tail_overlap(namespace, _path_parts(c.get("source_file", ""))[:-1]), c)
-                  for c in candidates]
+        scored = [
+            (_tail_overlap(namespace, _path_parts(c.get("source_file", ""))[:-1]), c)
+            for c in candidates
+        ]
         best = max(score for score, _ in scored)
         winners = [c for score, c in scored if score == best]
         if best == 0 or len(winners) != 1:
+            return None
+        # A lone candidate is not evidence. `Vendor\Billing\Event\SyncUsers` in messenger.yaml
+        # and the project's own `src/Cron/Message/SyncUsers.php` share a short name and nothing
+        # else, and binding them would be exactly the false edge this module exists to refuse.
+        # The namespace minus its root (`App`, `Vendor`) has to match the path tail; the same
+        # rule `graph_adapter._class_node` applies for call resolution.
+        if len(namespace) >= 2 and best < len(namespace) - 1:
             return None
         return winners[0].get("id")

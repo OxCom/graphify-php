@@ -38,8 +38,9 @@ CONFIDENCE = "EXTRACTED"
 class GraphWriter:
     """Appends configuration nodes and edges to graphify's lists, once each."""
 
-    def __init__(self, all_nodes: list[dict], all_edges: list[dict],
-                 classes: GraphClassIndex | None = None) -> None:
+    def __init__(
+        self, all_nodes: list[dict], all_edges: list[dict], classes: GraphClassIndex | None = None
+    ) -> None:
         self._nodes = all_nodes
         self._edges = all_edges
         self._classes = classes if classes is not None else GraphClassIndex(all_nodes, all_edges)
@@ -59,16 +60,18 @@ class GraphWriter:
         if node.key in self._node_ids:
             return
         self._node_ids.add(node.key)
-        self._nodes.append({
-            "id": node.key,
-            "label": node.label,
-            "file_type": FILE_TYPE,
-            "source_file": node.source_file,
-            "source_location": node.source_location or "L1",
-            "_origin": "ast",
-            EDGE_MARKER: EDGE_ORIGIN,
-            "_config_kind": node.kind,
-        })
+        self._nodes.append(
+            {
+                "id": node.key,
+                "label": node.label,
+                "file_type": FILE_TYPE,
+                "source_file": node.source_file,
+                "source_location": node.source_location or "L1",
+                "_origin": "ast",
+                EDGE_MARKER: EDGE_ORIGIN,
+                "_config_kind": node.kind,
+            }
+        )
         self.nodes_added += 1
 
     def _add_edge(self, edge: ConfigEdge) -> None:
@@ -80,16 +83,18 @@ class GraphWriter:
         if key in self._pairs:
             return
         self._pairs.add(key)
-        self._edges.append({
-            "source": source,
-            "target": target,
-            "relation": edge.relation,
-            "confidence": CONFIDENCE,
-            "source_file": edge.source_file,
-            "source_location": edge.source_location or "L1",
-            "weight": 1.0,
-            EDGE_MARKER: EDGE_ORIGIN,
-        })
+        self._edges.append(
+            {
+                "source": source,
+                "target": target,
+                "relation": edge.relation,
+                "confidence": CONFIDENCE,
+                "source_file": edge.source_file,
+                "source_location": edge.source_location or "L1",
+                "weight": 1.0,
+                EDGE_MARKER: EDGE_ORIGIN,
+            }
+        )
         self.edges_added += 1
 
     def _resolve(self, ref: NodeRef) -> str | None:
@@ -106,6 +111,7 @@ class GraphWriter:
                 # and the count is what says how much of the routing table points outside the
                 # indexed tree.
                 self.unresolved[REASON_CLASS_NOT_IN_GRAPH] = (
-                    self.unresolved.get(REASON_CLASS_NOT_IN_GRAPH, 0) + 1)
+                    self.unresolved.get(REASON_CLASS_NOT_IN_GRAPH, 0) + 1
+                )
             return found
         return None

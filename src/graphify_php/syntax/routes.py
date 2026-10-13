@@ -30,7 +30,7 @@ The composition rules are read from Symfony's own loader rather than guessed, in
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from . import nodes
 
@@ -84,7 +84,10 @@ class RouteDeclaration:
         collapsing them onto one node would claim a relationship between two codebases that
         share nothing but a string.
         """
-        return f"{self.controller_class}::{self.controller_method}#{self.path or self.method_path or ''}"
+        return (
+            f"{self.controller_class}::{self.controller_method}#"
+            f"{self.path or self.method_path or ''}"
+        )
 
 
 def collect_routes(root, names, source_file: str) -> list[RouteDeclaration]:
@@ -143,7 +146,7 @@ class _Prefix:
     path_literal: bool = True
 
     @classmethod
-    def read(cls, attribute) -> "_Prefix":
+    def read(cls, attribute) -> _Prefix:
         if attribute is None:
             return cls()
         positional, named = _arguments(attribute)
@@ -157,7 +160,9 @@ class _Prefix:
         )
 
 
-def _compose(attribute, prefix: _Prefix, class_fqn: str, method_name: str, source_file: str) -> RouteDeclaration:
+def _compose(
+    attribute, prefix: _Prefix, class_fqn: str, method_name: str, source_file: str
+) -> RouteDeclaration:
     positional, named = _arguments(attribute)
     path_node = named.get("path") or (positional[0] if positional else None)
     method_path, literal = _path_of(path_node)
@@ -171,7 +176,9 @@ def _compose(attribute, prefix: _Prefix, class_fqn: str, method_name: str, sourc
     if path_node is None:
         reason = NO_PATH
     elif not literal:
-        reason = LOCALIZED_PATH if method_path is None and _is_array(path_node) else PATH_NOT_LITERAL
+        reason = (
+            LOCALIZED_PATH if method_path is None and _is_array(path_node) else PATH_NOT_LITERAL
+        )
     elif not prefix.path_literal:
         reason = PREFIX_NOT_LITERAL
     else:
@@ -248,9 +255,13 @@ def _string_value(node) -> str | None:
     """
     if node is None or node.type not in STRING_KINDS:
         return None
-    content = nodes.child(node, "string_content")
-    if content is not None:
-        return nodes.node_text(content)
+    parts = [c for c in node.children if c.is_named]
+    if len(parts) == 1 and parts[0].type == "string_content":
+        return nodes.node_text(parts[0])
+    if parts:
+        # An escape sequence or an interpolation: the value is not the source text, and the
+        # first `string_content` of `'/it\'s/{id}'` is `/it`, a path nothing serves.
+        return None
     text = nodes.node_text(node)
     return text[1:-1] if len(text) >= 2 and text[0] in "\"'" else text
 

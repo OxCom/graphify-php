@@ -51,7 +51,11 @@ def sample_facts() -> ContainerFacts:
             env_name="MAILER_API_KEY",
         )
     )
-    facts.tags.append(TagMembership(tag="app.cron_job", service_id="App\\Cron\\Nightly", class_fqn="App\\Cron\\Nightly"))
+    facts.tags.append(
+        TagMembership(
+            tag="app.cron_job", service_id="App\\Cron\\Nightly", class_fqn="App\\Cron\\Nightly"
+        )
+    )
     facts.decorations.append(
         Decoration(
             decorator_id="App\\Serializer\\Serializer",

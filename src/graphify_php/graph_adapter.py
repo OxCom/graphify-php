@@ -4,9 +4,8 @@ This module is the only place that knows graphify's node and edge schema. Everyt
 the package talks to the two protocols in `ports`, so a schema move between graphify releases
 is repaired here and nowhere else.
 
-The schema this is written against, read from a real build
-(`/var/www/knowledge-base/graphify/cem/hub/graph.json`, 6302 nodes / 17886 links, 4012 of them
-from `.php` files):
+The schema this is written against, read from a real build of the reference application
+(6302 nodes / 17886 links, 4012 of them from `.php` files):
 
 - a class node carries `_callable_class: true` and a `label` that is the SHORT class name
   (`AbstractFrontController`), never the FQN, so an FQN has to be matched down to its last
@@ -59,7 +58,8 @@ def _path_parts(source_file: str) -> list[str]:
 def _tail_overlap(a: list[str], b: list[str]) -> int:
     """How many trailing segments the two paths share, compared normalised."""
     count = 0
-    for left, right in zip(reversed(a), reversed(b)):
+    # Paths differ in length on purpose; the overlap stops at the shorter one.
+    for left, right in zip(reversed(a), reversed(b), strict=False):
         if _key(left) != _key(right):
             break
         count += 1
@@ -170,11 +170,25 @@ class GraphNodeIndex:
 
         visible = [c for c in candidates if self._visible_to(caller_nid, c["id"])]
         chosen = visible[0] if len(visible) == 1 else None
+        if chosen is not None and self._outscored(chosen, candidates, parts[:-1]):
+            # Visibility picked one class, but the namespace the type source proved points
+            # at a different candidate more precisely (a parent `App\Legacy\Emails` is
+            # visible; the property is typed `App\Mail\Emails`). Binding the visible one
+            # would contradict the proof, so the call gets no edge.
+            return None
         if chosen is None and not visible:
             chosen = self._class_node(class_fqn)
         if chosen is None:
             return None
         return self._methods.get((chosen["id"], _key(method)))
+
+    @staticmethod
+    def _outscored(chosen: dict, candidates: list[dict], namespace: list[str]) -> bool:
+        def overlap(node: dict) -> int:
+            return _tail_overlap(namespace, _path_parts(node.get("source_file", ""))[:-1])
+
+        own = overlap(chosen)
+        return any(c is not chosen and overlap(c) > own for c in candidates)
 
     def _visible_to(self, caller_nid: str, class_nid: str) -> bool:
         caller_class = self._owner_of.get(caller_nid, caller_nid)
@@ -199,8 +213,11 @@ class GraphNodeIndex:
         parts = _fqn_parts(class_fqn)
         if not parts:
             return None
-        in_file = [c for c in self._classes_by_name.get(_key(parts[-1]), [])
-                   if c.get("source_file") == source_file]
+        in_file = [
+            c
+            for c in self._classes_by_name.get(_key(parts[-1]), [])
+            if c.get("source_file") == source_file
+        ]
         chosen = in_file[0] if len(in_file) == 1 else self._class_node(class_fqn)
         if chosen is None:
             return None
@@ -242,8 +259,12 @@ class GraphNodeIndex:
         # the candidate is a method NAME, and the source resolves the class itself from the
         # file's own namespace and `use` statements.
         return self._with_ancestors(
-            [n["id"] for n in self._classes_by_name.get(_key(_fqn_parts(scope)[-1]
-                                                             if _fqn_parts(scope) else ""), [])]
+            [
+                n["id"]
+                for n in self._classes_by_name.get(
+                    _key(_fqn_parts(scope)[-1] if _fqn_parts(scope) else ""), []
+                )
+            ]
         )
 
     def _with_ancestors(self, class_nids: list[str]) -> list[str]:
@@ -270,8 +291,10 @@ class GraphNodeIndex:
 
         # Directories only: the file stem is the class name and matching it against the
         # namespace would score every candidate the same.
-        scored = [(_tail_overlap(namespace, _path_parts(c.get("source_file", ""))[:-1]), c)
-                  for c in candidates]
+        scored = [
+            (_tail_overlap(namespace, _path_parts(c.get("source_file", ""))[:-1]), c)
+            for c in candidates
+        ]
         best = max(score for score, _ in scored)
         winners = [c for score, c in scored if score == best]
         if len(winners) != 1:
@@ -284,7 +307,10 @@ class GraphNodeIndex:
         # whatever project class happens to share its last segment — a unique match, and
         # wrong. A single-segment namespace is exempt: the PSR-4 root (`App\`) maps to the
         # source directory (`src/`) and never appears as a directory itself.
-        if len(namespace) >= 2 and best == 0:
+        # One shared segment is not enough either: `Vendor\Lib\Emails` against
+        # `src/Lib/Emails.php` overlaps by one and is still foreign. Every segment but the
+        # PSR-4 root has to be on the path.
+        if len(namespace) >= 2 and best < len(namespace) - 1:
             return None
         return winners[0]
 
@@ -297,12 +323,13 @@ class GraphEdgeSink:
     another route, and a second edge would double that pair's weight in every consumer.
     """
 
-    def __init__(self, all_edges: list[dict], index: "GraphNodeIndex | None" = None) -> None:
+    def __init__(self, all_edges: list[dict], index: GraphNodeIndex | None = None) -> None:
         self._all_edges = all_edges
         self._index = index
         self._pairs = {(e.get("source"), e.get("target")) for e in all_edges}
-        self._class_calls = {(e.get("source"), e.get("target"))
-                             for e in all_edges if e.get("relation") == "calls"}
+        self._class_calls = {
+            (e.get("source"), e.get("target")) for e in all_edges if e.get("relation") == "calls"
+        }
         self.added = 0
 
     def add_call(self, caller_nid: str, callee_nid: str, target: CallTarget) -> None:
@@ -332,6 +359,77 @@ class GraphEdgeSink:
             edge["_refines"] = owner
         self._all_edges.append(edge)
         self.added += 1
+
+
+STUB_ID_PREFIX = "php_external_"
+
+
+def _stub_nid(class_fqn: str) -> str:
+    """One id per external class, derived from the FQN alone so every build agrees.
+
+    `external: True` keeps the id global in `merge-graphs`, so the prefix must not collide with
+    graphify's own project-class ids, which never start this way.
+    """
+    return STUB_ID_PREFIX + re.sub(r"[^a-z0-9_]", "_", class_fqn.lower().replace("\\", "_"))
+
+
+class GraphStubSink:
+    """Mints a body-less node per external declaring class and edges proven calls to it.
+
+    The opt-in graphify core refuses for `calls` (phantom hubs): a `Doctrine\\ORM\\EntityManager`
+    stub will carry hundreds of edges. One stub per CLASS, never per method, so the node count
+    stays at the number of vendor classes the project touches; the method survives on the edge.
+    """
+
+    def __init__(self, all_nodes: list[dict], all_edges: list[dict]) -> None:
+        self._all_nodes = all_nodes
+        self._all_edges = all_edges
+        self._by_id = {n.get("id") for n in all_nodes}
+        self._pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+        self.nodes_added = 0
+        self.edges_added = 0
+
+    def node_for(self, class_fqn: str) -> str:
+        nid = _stub_nid(class_fqn)
+        if nid not in self._by_id:
+            self._by_id.add(nid)
+            # The same shape graphify core gives an import stub (build.py), so every consumer
+            # that already handles those handles these.
+            self._all_nodes.append(
+                {
+                    "id": nid,
+                    "label": class_fqn,
+                    "file_type": "concept",
+                    "type": "external",
+                    "external": True,
+                    "source_file": "",
+                    EDGE_MARKER: EDGE_ORIGIN,
+                }
+            )
+            self.nodes_added += 1
+        return nid
+
+    def add_call(self, caller_nid: str, stub_nid: str, target: CallTarget) -> None:
+        if (caller_nid, stub_nid) in self._pairs:
+            return
+        self._pairs.add((caller_nid, stub_nid))
+        self._all_edges.append(
+            {
+                "source": caller_nid,
+                "target": stub_nid,
+                "relation": "calls",
+                "context": "call",
+                "confidence": target.confidence.value,
+                "confidence_score": _CONFIDENCE_SCORE[target.confidence],
+                "source_file": target.site.source_file,
+                "source_location": target.site.source_location,
+                "weight": 1.0,
+                EDGE_MARKER: EDGE_ORIGIN,
+                "_via": target.via,
+                "_external_target": f"{target.class_fqn}::{target.method}",
+            }
+        )
+        self.edges_added += 1
 
 
 # A route declaration is not a call, so it needs a relation of its own. `routed_to` is already
@@ -383,36 +481,40 @@ class GraphRouteSink:
         nid = _route_nid(declaration.node_key)
         if nid not in self._by_id:
             self._by_id.add(nid)
-            self._all_nodes.append({
-                "id": nid,
-                "label": path,
-                "source_file": declaration.source_file,
-                "source_location": f"L{declaration.line}",
-                "file_type": "code",
-                EDGE_MARKER: EDGE_ORIGIN,
-                "_kind": ROUTE_NODE_KIND,
-                "route_name": declaration.name or "",
-                "http_methods": list(declaration.methods),
-                # A path composed from only one half is a usable partial, not a whole answer,
-                # and a reader ranking routes needs to know which it is looking at.
-                "route_complete": declaration.path is not None,
-            })
+            self._all_nodes.append(
+                {
+                    "id": nid,
+                    "label": path,
+                    "source_file": declaration.source_file,
+                    "source_location": f"L{declaration.line}",
+                    "file_type": "code",
+                    EDGE_MARKER: EDGE_ORIGIN,
+                    "_kind": ROUTE_NODE_KIND,
+                    "route_name": declaration.name or "",
+                    "http_methods": list(declaration.methods),
+                    # A path composed from only one half is a usable partial, not a whole answer,
+                    # and a reader ranking routes needs to know which it is looking at.
+                    "route_complete": declaration.path is not None,
+                }
+            )
             self.nodes_added += 1
 
         if controller_nid and (nid, controller_nid) not in self._pairs:
             self._pairs.add((nid, controller_nid))
-            self._all_edges.append({
-                "source": nid,
-                "target": controller_nid,
-                "relation": ROUTE_RELATION,
-                "context": "route",
-                "confidence": Confidence.EXTRACTED.value,
-                "confidence_score": 1.0,
-                "source_file": declaration.source_file,
-                "source_location": f"L{declaration.line}",
-                "weight": 1.0,
-                EDGE_MARKER: EDGE_ORIGIN,
-                "_via": "attribute",
-            })
+            self._all_edges.append(
+                {
+                    "source": nid,
+                    "target": controller_nid,
+                    "relation": ROUTE_RELATION,
+                    "context": "route",
+                    "confidence": Confidence.EXTRACTED.value,
+                    "confidence_score": 1.0,
+                    "source_file": declaration.source_file,
+                    "source_location": f"L{declaration.line}",
+                    "weight": 1.0,
+                    EDGE_MARKER: EDGE_ORIGIN,
+                    "_via": "attribute",
+                }
+            )
             self.edges_added += 1
         return nid

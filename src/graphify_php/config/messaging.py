@@ -14,10 +14,10 @@ two ends.
 from __future__ import annotations
 
 import re
-from typing import Iterator
+from collections.abc import Iterator
 
 from .document import file_key
-from .facts import ConfigEdge, ConfigNode, ConfigDocument, FactSet, NodeRef
+from .facts import ConfigDocument, ConfigEdge, ConfigNode, FactSet, NodeRef
 
 RELATION_ROUTED_TO = "routed_to"
 RELATION_DECLARES = "declares_transport"
@@ -29,10 +29,12 @@ REASON_NO_TRANSPORT = "routing_entry_names_no_transport"
 # `'App\Foo': {senders: [async]}`. The third form is the documented long form of the first two.
 _SENDERS_KEY = "senders"
 
-# A routing key is a class or interface FQN, possibly with a trailing `*` wildcard. Anything
-# else in that position is a Symfony feature this reader does not model, and guessing would put
-# a fabricated class on the edge.
-_CLASS_KEY = re.compile(r"^\\?[A-Za-z_\x80-\xff][\w\x80-\xff]*(\\[A-Za-z_\x80-\xff][\w\x80-\xff]*)*$")
+# A routing key is a class or interface FQN. Anything else in that position — a `*` wildcard
+# included — is a Symfony feature this reader does not model, and guessing would put a
+# fabricated class on the edge.
+_CLASS_KEY = re.compile(
+    r"^\\?[A-Za-z_\x80-\xff][\w\x80-\xff]*(\\[A-Za-z_\x80-\xff][\w\x80-\xff]*)*$"
+)
 
 # How deep to look for a `messenger` block. Symfony nests it at `framework.messenger` and under
 # an environment guard at `when@test.framework.messenger`; three is one more than the deepest
@@ -60,27 +62,38 @@ class MessageRoutingReader:
                     continue
                 for transport in transports:
                     node_key = transport_key(transport)
-                    facts.nodes.append(ConfigNode(
-                        key=node_key, label=transport, kind="transport",
-                        source_file=document.path,
-                    ))
+                    facts.nodes.append(
+                        ConfigNode(
+                            key=node_key,
+                            label=transport,
+                            kind="transport",
+                            source_file=document.path,
+                        )
+                    )
                     # The file-to-transport edge is written whether or not the message class is
                     # in the graph. A transport whose message lives in a package this build did
                     # not index is still a transport this application declares, and dropping the
                     # node would report the application as having fewer than it has.
-                    facts.edges.append(ConfigEdge(
-                        source=file_ref, target=NodeRef.config(node_key),
-                        relation=RELATION_DECLARES, source_file=document.path,
-                    ))
+                    facts.edges.append(
+                        ConfigEdge(
+                            source=file_ref,
+                            target=NodeRef.config(node_key),
+                            relation=RELATION_DECLARES,
+                            source_file=document.path,
+                        )
+                    )
                     class_fqn = str(key).lstrip("\\")
                     if not _CLASS_KEY.match(class_fqn):
                         facts.unresolvable(REASON_NOT_A_CLASS)
                         continue
-                    facts.edges.append(ConfigEdge(
-                        source=NodeRef.php_class(class_fqn),
-                        target=NodeRef.config(node_key),
-                        relation=RELATION_ROUTED_TO, source_file=document.path,
-                    ))
+                    facts.edges.append(
+                        ConfigEdge(
+                            source=NodeRef.php_class(class_fqn),
+                            target=NodeRef.config(node_key),
+                            relation=RELATION_ROUTED_TO,
+                            source_file=document.path,
+                        )
+                    )
         return facts
 
     def _routing_tables(self, data: dict) -> Iterator[dict]:

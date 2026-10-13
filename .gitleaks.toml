@@ -1,0 +1,14 @@
+# Keeps gitleaks' default rule set and allowlists the two files that plant fake
+# credentials on purpose: eval/fixtures/secrets.php and eval/canaries.py (see
+# .trufflehog-exclude.txt for what they hold and why). Allowlisting by path
+# rather than by .gitleaksignore fingerprint, because a fingerprint names one
+# commit and one line, and every edit to those files would mint a new one.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Planted CANARY values that tests/test_eval_canaries.py checks never leak"
+paths = [
+  '''^eval/fixtures/secrets\.php$''',
+  '''^eval/canaries\.py$''',
+]

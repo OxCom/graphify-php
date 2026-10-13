@@ -17,15 +17,15 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Iterable
+from collections.abc import Iterable
 
 from ..ports import CallSite, CallTarget, Confidence, Resolution
 from ..syntax import nodes
 from ..syntax.class_index import DECLARED, MAGIC, NOT_DECLARED, ClassIndex, index_from_facts
 from ..syntax.collectors import REASSIGNED_LOCAL, UNION_TYPE
 from ..syntax.facts import FileFacts
-from ..syntax.names import NameResolver
 from ..syntax.file_scan import scan_source
+from ..syntax.names import NameResolver
 
 
 class Reason:
@@ -53,22 +53,25 @@ class Reason:
     AMBIGUOUS_INTERSECTION = "ambiguous-intersection"
     DYNAMIC_SCOPE = "dynamic-scope"
     UNRESOLVABLE_SCOPE = "unresolvable-scope"
+    ANONYMOUS_CLASS_SCOPE = "anonymous-class-scope"
 
 
 # Types whose methods dispatch somewhere else at runtime. Resolving `$container->get('x')` to
 # `ContainerInterface::get` is true and useless: the edge that matters goes to whatever the
 # container returns, which is not written at the call site. Reflection is the same shape.
-DISPATCH_BARRIER_TYPES = frozenset({
-    "Psr\\Container\\ContainerInterface",
-    "Symfony\\Component\\DependencyInjection\\ContainerInterface",
-    "Symfony\\Component\\DependencyInjection\\Container",
-    "ReflectionClass",
-    "ReflectionMethod",
-    "ReflectionProperty",
-    "ReflectionFunction",
-    "ReflectionObject",
-    "Closure",
-})
+DISPATCH_BARRIER_TYPES = frozenset(
+    {
+        "Psr\\Container\\ContainerInterface",
+        "Symfony\\Component\\DependencyInjection\\ContainerInterface",
+        "Symfony\\Component\\DependencyInjection\\Container",
+        "ReflectionClass",
+        "ReflectionMethod",
+        "ReflectionProperty",
+        "ReflectionFunction",
+        "ReflectionObject",
+        "Closure",
+    }
+)
 
 # Methods that are a dispatch mechanism rather than a destination.
 DISPATCH_BARRIER_METHODS = frozenset({"__call", "__callStatic", "__invoke", "__get", "__set"})
@@ -150,7 +153,9 @@ class TreeSitterSource:
                 index_from_facts(index, facts)
         return index
 
-    def _facts(self, repo_root: str, path: str, cache: dict[str, FileFacts | None]) -> FileFacts | None:
+    def _facts(
+        self, repo_root: str, path: str, cache: dict[str, FileFacts | None]
+    ) -> FileFacts | None:
         full = path if os.path.isabs(path) else os.path.join(repo_root, path)
         full = os.path.realpath(full)
         if full in cache:
@@ -165,7 +170,9 @@ class TreeSitterSource:
         cache[full] = facts
         return facts
 
-    def _resolve_site(self, site: CallSite, facts: FileFacts, index: ClassIndex) -> tuple[CallTarget | None, str]:
+    def _resolve_site(
+        self, site: CallSite, facts: FileFacts, index: ClassIndex
+    ) -> tuple[CallTarget | None, str]:
         method = (site.method or "").strip()
         if not _IDENTIFIER.match(method):
             return None, Reason.DYNAMIC_NAME
@@ -178,14 +185,22 @@ class TreeSitterSource:
         klass = facts.class_at(line)
         if klass is None:
             return None, Reason.UNLOCATABLE_SITE
+        if facts.in_anonymous_class(line):
+            # `class_at` finds the enclosing class, but `$this->emails` here is a property of
+            # the `new class { ... }` the walker read nothing of, so the enclosing class's
+            # `$emails` would be the wrong one.
+            return None, Reason.ANONYMOUS_CLASS_SCOPE
 
         resolved, reason = self._receiver_target(site, facts, klass, line, method, index)
+        if resolved is None and facts.calls.receiver_for(line, method)[1] == 0:
+            # Only a line with no member call of this name can be a scoped call. The resolver
+            # hands a scoped site its scope text (`self`, `Helper`) as the receiver, which the
+            # member path refuses and the scoped path answers. A member call that is there is
+            # answered by the member path alone: `Other::foo()` sitting in the argument list
+            # of `$x->foo(...)` must not stand in for a receiver that could not be typed.
+            resolved, reason = self._scoped_target(facts, klass, line, method)
         if resolved is None:
-            resolved, scoped_reason = self._scoped_target(facts, klass, line, method)
-            if resolved is None:
-                # The member-call reason is the more informative of the two whenever the site
-                # was a member call at all; the scope reason only applies when it was not.
-                return None, reason if reason != Reason.CALL_SITE_NOT_FOUND else scoped_reason
+            return None, reason
         class_fqn, confidence, via = resolved
 
         if class_fqn in DISPATCH_BARRIER_TYPES:
@@ -319,8 +334,9 @@ class TreeSitterSource:
             return None, Reason.UNRESOLVABLE_SCOPE
         return (target, Confidence.EXTRACTED, "class-scope"), ""
 
-
-    def _receiver(self, site: CallSite, facts: FileFacts, line: int, method: str) -> tuple[str | None, str]:
+    def _receiver(
+        self, site: CallSite, facts: FileFacts, line: int, method: str
+    ) -> tuple[str | None, str]:
         """The receiver expression for this site, read from the tree when the site has none.
 
         graphify's PHP branch never fills the field — `extractors/engine.py:6152-6157` sets

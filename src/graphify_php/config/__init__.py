@@ -13,7 +13,7 @@ registered in `default_readers`; nothing else changes.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from .discovery import ConfigFileFinder
 from .document import DocumentNodeFactory, file_key
@@ -25,10 +25,20 @@ from .ports import ConfigFactReader
 from .safe_yaml import SafeDocumentParser
 
 __all__ = [
-    "ConfigDocument", "ConfigEdge", "ConfigFactReader", "ConfigFileFinder", "ConfigNode",
-    "DocumentNodeFactory", "file_key",
-    "EnvReferenceReader", "FactSet", "GraphWriter", "MessageRoutingReader", "NodeRef",
-    "SafeDocumentParser", "default_readers",
+    "ConfigDocument",
+    "ConfigEdge",
+    "ConfigFactReader",
+    "ConfigFileFinder",
+    "ConfigNode",
+    "DocumentNodeFactory",
+    "file_key",
+    "EnvReferenceReader",
+    "FactSet",
+    "GraphWriter",
+    "MessageRoutingReader",
+    "NodeRef",
+    "SafeDocumentParser",
+    "default_readers",
 ]
 
 

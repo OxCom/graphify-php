@@ -46,12 +46,17 @@ DEFAULT_STATUS_PATH = "graphify-out/.graphify-php-status.json"
 @dataclass
 class ResolverStatus:
     name: str
-    state: str = "started"          # started | completed | skipped | failed
-    reason: str = ""                # why it skipped, or the exception text
+    state: str = "started"  # started | completed | skipped | failed
+    reason: str = ""  # why it skipped, or the exception text
     files_seen: int = 0
-    eligible_sites: int = 0         # member calls this resolver could have resolved
-    resolved_sites: int = 0         # ... and did
+    eligible_sites: int = 0  # member calls this resolver could have resolved
+    resolved_sites: int = 0  # ... and did
     edges_added: int = 0
+    # Target records bound to an external stub node instead of being dropped as
+    # `target_not_in_graph`, and the stub nodes and edges that produced. Zero with the flag off.
+    external_stubbed: int = 0
+    stub_nodes_added: int = 0
+    stub_edges_added: int = 0
     # reason -> count. The unit differs by reason: source reasons count sites, `probe:` reasons
     # count candidate names, `scoped_method_*` count scoped groups, and the graph-lookup reasons
     # (`target_not_in_graph`, `self_call`) count target records, so a two-arm site can appear twice.
@@ -83,9 +88,15 @@ def write(records: list[ResolverStatus]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     existing: dict[str, dict] = {}
     if path.exists():
+        # This runs inside the resolver's `finally`. A file that is not a record — a list,
+        # a row without a name — must not raise here and replace the resolver's own exception.
         try:
-            existing = {r["name"]: r for r in json.loads(path.read_text()).get("resolvers", [])}
-        except (ValueError, OSError):
+            previous = json.loads(path.read_text())
+            rows = previous.get("resolvers", []) if isinstance(previous, dict) else []
+            existing = {
+                r["name"]: r for r in rows if isinstance(r, dict) and isinstance(r.get("name"), str)
+            }
+        except (ValueError, OSError, TypeError, AttributeError, KeyError):
             existing = {}
     for record in records:
         existing[record.name] = asdict(record)
@@ -99,6 +110,7 @@ def read() -> dict:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text())
+        record = json.loads(path.read_text())
     except (ValueError, OSError):
         return {}
+    return record if isinstance(record, dict) else {}

@@ -7,7 +7,6 @@
 .serena/
 
 docs/
-tests/
 eval/fixtures/
 build/
 dist/

@@ -1,4 +1,3 @@
-<!-- Superseded by SwarmVault vault page: raw/agentscopex/graphify-php/reference/phpstan-call-graph-extension.md -->
 # PHPStan call-graph extension
 
 A PHPStan collector and rule that write one JSON record per resolved method call. It knows
@@ -55,7 +54,7 @@ Verified against PHPStan 2.2.8 on PHP 8.4.
 in the working directory. One JSON object per line:
 
 ```json
-{"callerClass":"App\\Controller","callerMethod":"run","calleeClass":"App\\Mailer","calleeMethod":"send","calleeKind":"interface","line":21,"file":"/srv/app/src/Controller.php","callPos":148}
+{"callerClass":"App\\Controller","callerMethod":"run","calleeClass":"App\\Mailer","calleeMethod":"send","calleeKind":"interface","line":21,"file":"/srv/app/src/Controller.php","callPos":148,"calleeFile":"/srv/app/src/Mailer.php"}
 ```
 
 `callPos` is the token offset of the called method's name, `-1` when the parser did not record
@@ -67,7 +66,13 @@ contract, not a body: there is no code behind `App\Mailer::send`, and a consumer
 as a call into an implementation acquires a path that was never executed.
 
 `calleeClass` is the *declaring* class, not the receiver. An inherited method lives in the
-parent, and an edge to the child would point at a body that does not exist there.
+parent, and an edge to the child would point at a body that does not exist there. When the
+body lives in a trait, `calleeClass` is the trait: PHPStan's declaring class for a trait
+method is the class using it, whose file holds no such body.
+
+`calleeFile` is the file that declares `calleeClass`, `''` when PHPStan has no file for it (a
+built-in class). A consumer uses it to tell a `vendor/` class from project code the graph left
+out, without guessing from the namespace.
 
 ## What it refuses to report
 
@@ -80,7 +85,14 @@ produce no record:
   from a typed constructor parameter: PHPStan reports `missingType.property` rather than
   inferring it. Give the property a native type or a `@var` docblock and the call resolves.
 - a dynamic method name, `$obj->$method()`;
-- a receiver on a class the analysis cannot load.
+- a receiver on a class the analysis cannot load;
+- an intersection receiver (`A&B`) whose constituents resolve to more than one declaring class
+  for the method. One object, two declarations: the type does not say which body runs, so
+  neither is emitted. This matches the parser layer's `ambiguous-intersection` refusal. A union
+  receiver (`A|B`) is different: one of two objects, so every arm is emitted, and each arm is
+  decided on its own — `(A&B)|C` emits `C` and drops the ambiguous intersection, `(A&B)|null`
+  emits nothing. The parser layer is stricter there and refuses `(A&B)|C` wholesale as
+  `union-type`.
 
 Also out of scope in this version, by omission rather than by refusal: `?->` nullsafe calls,
 `Foo::bar()` static calls, and `new Foo` construction edges. Each is a different node type and

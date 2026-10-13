@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # pip-audit answers a question no push can ask: a CVE gets published against
+  # a dependency tree that has not changed. The nightly run keeps that check
+  # alive on a repository that stands still.
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request makes the run in flight
+# pointless, so cancel it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Three stages in order: security, tests, build. Jobs inside a stage run in
+# parallel; the stages are sequential, so a leaked secret stops the run before
+# anything is tested and a failing test stops it before anything is built.
+#
+# No smoke stage: tests/test_cli_end_to_end.py already runs the real graphify
+# in-process against a generated PHP project, so a separate end-to-end job
+# would repeat what the test matrix proves on every Python version.
+jobs:
+  security:
+    uses: ./.github/workflows/stage-security.yml
+
+  tests:
+    needs: security
+    uses: ./.github/workflows/stage-tests.yml
+
+  build:
+    needs: tests
+    uses: ./.github/workflows/stage-build.yml
