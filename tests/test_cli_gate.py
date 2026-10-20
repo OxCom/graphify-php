@@ -259,3 +259,61 @@ def test_check_is_pure_and_needs_no_build():
     bad, message = cli.check({"resolvers": [{"name": "r", "state": "failed"}]}, ["r"])
     assert bad == cli.EXIT_RESOLVER_FAILED
     assert "no reason recorded" in message
+
+
+def _snapshot(root):
+    return {
+        p: (p.read_bytes() if p.is_file() else None, p.stat().st_mtime_ns)
+        for p in sorted(root.rglob("*"))
+    }
+
+
+def test_version_touches_no_file_and_needs_no_graphify(tmp_path, monkeypatch, capsys):
+    """graphify-mesh probes the build with `--version`; it used to reach graphify and unlink."""
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    for name in ("graph.json", "manifest.json", ".graphify-php-status.json"):
+        (out / name).write_text("{}")
+    before = _snapshot(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(status.STATUS_PATH_ENV, raising=False)
+    monkeypatch.setitem(sys.modules, "graphify", None)
+    monkeypatch.setattr(sys, "argv", ["graphify-php-build", "--version"])
+
+    with pytest.raises(SystemExit) as stop:
+        cli._console_main()
+
+    assert stop.value.code == 0
+    assert _snapshot(tmp_path) == before
+    line = capsys.readouterr().out.strip()
+    assert line == (
+        f"graphify-php {status.installed_version('graphify-php')} "
+        f"(graphify {status.installed_version('graphifyy')})"
+    )
+
+
+@pytest.mark.parametrize("argv", [["--version"], ["--version", "--", "update", "."]])
+def test_main_version_never_runs_graphify(argv, capsys):
+    def boom(args):
+        raise AssertionError("graphify ran for --version")
+
+    assert cli.main(argv, run_graphify=boom) == cli.EXIT_OK
+    assert capsys.readouterr().out.startswith("graphify-php ")
+
+
+def test_version_reports_unknown_without_metadata(monkeypatch, capsys):
+    def missing(name):
+        raise status.PackageNotFoundError(name)
+
+    monkeypatch.setattr(status, "_package_version", missing)
+
+    assert cli.main(["--version"]) == cli.EXIT_OK
+    assert capsys.readouterr().out.strip() == "graphify-php unknown (graphify unknown)"
+
+
+def test_status_record_names_its_producer(build, monkeypatch):
+    monkeypatch.setattr(status, "_package_version", lambda name: {"graphify-php": "9.8.7"}[name])
+
+    status.write([status.ResolverStatus(name="r", state="completed")])
+
+    assert status.read()["producer"] == {"name": "graphify-php", "version": "9.8.7"}

@@ -141,13 +141,35 @@ def _parser() -> argparse.ArgumentParser:
         help="resolver that must report (repeatable, default: every resolver "
         "this package registers)",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="print this package's and graphify's versions and exit, touching no file",
+    )
     return parser
+
+
+def _wants_version(ours: Sequence[str], passthrough: Sequence[str]) -> bool:
+    """`--version` before `--`, or alone: a bare flag lands in graphify's half by the split rule."""
+    return "--version" in ours or (not ours and list(passthrough) == ["--version"])
+
+
+def version_line() -> str:
+    """One line a caller can parse: `graphify-php <ver> (graphify <ver>)`."""
+    ours = status.installed_version(status.PRODUCER_NAME)
+    graphify = status.installed_version(status.GRAPHIFY_DISTRIBUTION)
+    return f"{status.PRODUCER_NAME} {ours} (graphify {graphify})"
 
 
 def main(
     argv: Sequence[str] | None = None, run_graphify: Callable[[Sequence[str]], int] | None = None
 ) -> int:
     ours, passthrough = _split_argv(sys.argv[1:] if argv is None else argv)
+    # Before any path is computed or unlinked: graphify-mesh probes the build interpreter with
+    # this, and it used to fall through to graphify and delete the status record in the cwd.
+    if _wants_version(ours, passthrough):
+        print(version_line())
+        return EXIT_OK
     opts = _parser().parse_args(ours)
     expected = opts.expect or [RESOLVER_NAME, RESOLVER_NAME_ROUTES, RESOLVER_NAME_CONFIG]
     graph = opts.graph or default_graph_path()
@@ -161,9 +183,10 @@ def main(
     had_previous = graph.exists()
     if had_previous:
         shutil.copy2(graph, backup)
-    # graphify's incremental `update` trusts the manifest to say which files are already in the
-    # graph. A graph rolled back without its manifest would be skipped over next build, so the
-    # shrink guard snapshots and restores the pair together.
+    # graphify 0.9.89/0.9.92 `update` re-extracts every code file and ignores the manifest. The
+    # manifest is still snapshotted and restored with the graph, so the pair stays consistent
+    # and a graphify version with a truly incremental `update` does not skip files a rolled-back
+    # graph lacks.
     manifest = graph.parent / "manifest.json"
     manifest_backup = manifest.with_suffix(manifest.suffix + ".graphify-php-prev")
     had_manifest = manifest.exists()
@@ -318,6 +341,9 @@ def _console_main() -> None:
     ):
         _parser().print_help()
         sys.exit(0)
+    # `register` imports graphify and binds the resolvers; a version probe needs neither.
+    if _wants_version(ours, passthrough):
+        sys.exit(main())
 
     from . import register
 

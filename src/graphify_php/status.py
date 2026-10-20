@@ -35,12 +35,26 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _package_version
 from pathlib import Path
 
 # The build writes here; the wrapper reads it. An environment variable rather than a fixed
 # path because one machine indexes ~20 repositories and their builds must not share a file.
 STATUS_PATH_ENV = "GRAPHIFY_PHP_STATUS"
 DEFAULT_STATUS_PATH = "graphify-out/.graphify-php-status.json"
+
+# Distribution names, not import names: graphify is published on PyPI as `graphifyy`.
+PRODUCER_NAME = "graphify-php"
+GRAPHIFY_DISTRIBUTION = "graphifyy"
+
+
+def installed_version(distribution: str) -> str:
+    """Installed version of `distribution`, or "unknown" when it carries no metadata."""
+    try:
+        return _package_version(distribution)
+    except (PackageNotFoundError, ValueError):
+        return "unknown"
 
 
 @dataclass
@@ -100,7 +114,13 @@ def write(records: list[ResolverStatus]) -> Path:
             existing = {}
     for record in records:
         existing[record.name] = asdict(record)
-    payload = {"schema": 1, "written_at": time.time(), "resolvers": list(existing.values())}
+    payload = {
+        "schema": 1,
+        "written_at": time.time(),
+        # Which build of this package wrote the record, so a reader can tell an upgrade apart.
+        "producer": {"name": PRODUCER_NAME, "version": installed_version(PRODUCER_NAME)},
+        "resolvers": list(existing.values()),
+    }
     path.write_text(json.dumps(payload, indent=2))
     return path
 
