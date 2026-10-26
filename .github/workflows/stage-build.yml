@@ -2,6 +2,13 @@ name: stage-build
 
 on:
   workflow_call:
+    inputs:
+      expected_version:
+        description: >
+          PEP 440 version the built wheel must carry, without a leading "v".
+          Empty (the default) skips the check: a pull request has no tag.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -11,14 +18,17 @@ jobs:
   # from src/ and never builds anything. A package left out of
   # [tool.hatch.build.targets.wheel] or a console script removed from
   # [project.scripts] produces a wheel that installs cleanly and does nothing.
-  # This job is the gate for that. The version is static in pyproject.toml, so
-  # there is no tag to compare against and no need for git history.
+  # This job is the gate for that.
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # hatch-vcs derives the version from `git describe`. A shallow clone
+          # has no tags and would build the fallback version instead.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -29,6 +39,20 @@ jobs:
         run: |
           python -m pip install --upgrade build
           python -m build
+
+      - name: Built version matches the release tag
+        # PyPI never accepts the same version twice, so a wheel that does not
+        # carry the tag's version must stop here, before anything ships.
+        if: inputs.expected_version != ''
+        env:
+          EXPECTED: ${{ inputs.expected_version }}
+        run: |
+          built=$(ls dist/*.whl | grep -oP 'graphify_php-\K[^-]+(?=-py3)')
+          echo "expected=${EXPECTED} built=${built}"
+          if [ "$built" != "$EXPECTED" ]; then
+            echo "::error::Built version '${built}' does not match the tag version '${EXPECTED}'."
+            exit 1
+          fi
 
       - name: Install the built wheel into a clean venv and run the entry point
         # A fresh venv outside the checkout has no src/ on sys.path, so the

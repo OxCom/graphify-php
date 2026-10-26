@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "graphify-php"
-version = "0.1.0"
+dynamic = ["version"]
 description = "PHP member-call resolution for graphify: binds $this->service->method() to the method node it calls."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -36,6 +36,16 @@ lint = ["ruff>=0.15"]
 [project.scripts]
 graphify-php-build = "graphify_php.cli:_console_main"
 graphify-shrink-check = "graphify_php.shrink_cli:_console_main"
+
+[tool.hatch.version]
+# The release tag (vX.Y.Z) is the only version source, so a tag and the wheel it builds cannot
+# disagree. `graphify-php-build --version` reads the installed metadata, not a module constant.
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# A clone without a reachable v* tag (shallow CI checkout, tarball) builds as this version
+# instead of failing. A tagged build always overrides it.
+fallback_version = "0.0.4"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/graphify_php"]

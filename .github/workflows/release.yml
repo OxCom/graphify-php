@@ -25,37 +25,29 @@ jobs:
       contents: read
     uses: ./.github/workflows/stage-tests.yml
 
-  # The version is static in pyproject.toml. PyPI never accepts the same version
-  # twice, so a tag that disagrees with it must stop here, before anything ships.
+  # stage-build takes a bare PEP 440 version, not a tag, so that it stays usable
+  # from ci.yml where no tag exists. Stripping the leading "v" needs a shell:
+  # GitHub's expression syntax has no substring operator.
   version:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    permissions: {}
+    outputs:
+      value: ${{ steps.strip.outputs.value }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Tag matches pyproject.toml version
+      - id: strip
         env:
           TAG: ${{ github.ref_name }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import sys
-          import tomllib
-
-          tag = os.environ["TAG"].removeprefix("v")
-          with open("pyproject.toml", "rb") as fh:
-              version = tomllib.load(fh)["project"]["version"]
-          if tag != version:
-              sys.exit(f"tag v{tag} does not match pyproject.toml version {version}")
-          print(f"releasing {version}")
-          PY
+        run: echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: [tests, version]
     permissions:
       contents: read
     uses: ./.github/workflows/stage-build.yml
+    with:
+      # Turns on the check that the version hatch-vcs computed from git history
+      # equals the tag being released.
+      expected_version: ${{ needs.version.outputs.value }}
 
   # Trusted publishing: PyPI trusts this workflow and the `pypi` environment
   # through OIDC, so no API token is stored in the repository.
