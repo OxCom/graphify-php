@@ -24,11 +24,11 @@ Without PHP or PHPStan the build still works. The member-call resolver then uses
 tree-sitter source alone and counts the calls PHPStan would have taken under
 `phpstan:phpstan-unavailable`.
 
-## Why a clone, not a wheel
+## The PHPStan extension
 
-The PHPStan source passes `php/autoload.php` to PHPStan. The package looks for that file in the
-repository checkout next to `src/`, and the wheel ships only `src/graphify_php`. Install the
-clone in editable mode (`-e`), so the package keeps running from the checkout and finds `php/`.
+The PHPStan source passes `php/autoload.php` to PHPStan. The wheel ships `php/` inside the
+package as `graphify_php/php/`, and an editable install of a clone uses the top-level `php/`.
+Both layouts find it.
 
 ## Option A: pipx (recommended)
 

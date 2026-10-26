@@ -40,6 +40,11 @@ graphify-shrink-check = "graphify_php.shrink_cli:_console_main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/graphify_php"]
 
+# The PHPStan source passes php/autoload.php to PHPStan, so the wheel carries php/ inside the
+# package. A checkout still uses the top-level php/ directly.
+[tool.hatch.build.targets.wheel.force-include]
+"php" = "graphify_php/php"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

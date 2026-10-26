@@ -46,3 +46,30 @@ jobs:
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/wheelenv/bin/python" -c "import graphify_php; print(graphify_php.__name__)"
           "$RUNNER_TEMP/wheelenv/bin/graphify-php-build" --help
+
+      - name: The wheel carries the PHPStan extension
+        # Without php/ in the wheel the PHPStan source finds no autoload file and
+        # drops out quietly, leaving tree-sitter alone. The lookup must resolve
+        # inside the installed package, not in this checkout.
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheelenv/bin/python" - <<'PY'
+          from graphify_php.sources.phpstan_source import extension_autoload_file
+
+          path = extension_autoload_file()
+          assert path is not None, "php/autoload.php is missing from the wheel"
+          assert "site-packages" in str(path), path
+          assert (path.parent / "src" / "CallGraph").is_dir(), path
+          print(path)
+          PY
+
+      - name: Upload dist artifacts
+        # release.yml publishes these files rather than building its own copy,
+        # so what a release ships is the artifact this job just proved
+        # installable.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Default deny; each job below requests only what it needs.
+permissions: {}
+
+# No `concurrency` block, unlike ci.yml: cancelling a publish half-way is worse
+# than paying for the runner.
+
+# The same three stage workflows ci.yml runs, with the publish on top, so a
+# release passes exactly the checks a pull request does.
+jobs:
+  security:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/stage-security.yml
+
+  tests:
+    needs: security
+    permissions:
+      contents: read
+    uses: ./.github/workflows/stage-tests.yml
+
+  # The version is static in pyproject.toml. PyPI never accepts the same version
+  # twice, so a tag that disagrees with it must stop here, before anything ships.
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Tag matches pyproject.toml version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          tag = os.environ["TAG"].removeprefix("v")
+          with open("pyproject.toml", "rb") as fh:
+              version = tomllib.load(fh)["project"]["version"]
+          if tag != version:
+              sys.exit(f"tag v{tag} does not match pyproject.toml version {version}")
+          print(f"releasing {version}")
+          PY
+
+  build:
+    needs: [tests, version]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/stage-build.yml
+
+  # Trusted publishing: PyPI trusts this workflow and the `pypi` environment
+  # through OIDC, so no API token is stored in the repository.
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      # The files stage-build produced and installed from a clean venv. Nothing
+      # is rebuilt here: a second build could differ from the one the gates ran.
+      - name: Download dist artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to PyPI
+        run: |
+          python3 -m pip install "uv==0.12.5"
+          python3 -m uv publish --trusted-publishing always dist/*

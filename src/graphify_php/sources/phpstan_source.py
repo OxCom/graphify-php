@@ -263,9 +263,14 @@ def extension_autoload_file() -> Path | None:
     services block fails with "Class 'CallGraph\\JsonLinesWriter' not found". Verified against
     PHPStan 2.2.8.
     """
-    candidate = Path(__file__).resolve().parents[3] / "php" / "autoload.php"
-    if candidate.is_file():
-        return candidate
+    # The wheel ships php/ inside the package; a checkout keeps it next to src/.
+    here = Path(__file__).resolve()
+    for candidate in (
+        here.parents[1] / "php" / "autoload.php",
+        here.parents[3] / "php" / "autoload.php",
+    ):
+        if candidate.is_file():
+            return candidate
     return None
 
 
