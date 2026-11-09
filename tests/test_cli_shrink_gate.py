@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from graphify_php import cli, status
+from graphify_php import cli, core_guard, shrink, status
 
 MANIFEST = {"b.py": {"mtime": 0, "ast_hash": "h", "semantic_hash": "h"}}
 
@@ -48,7 +48,12 @@ def publishing(build, new_graph, new_manifest=None):
         status.write(
             [
                 status.ResolverStatus(name=name, state="completed")
-                for name in (cli.RESOLVER_NAME, cli.RESOLVER_NAME_ROUTES, cli.RESOLVER_NAME_CONFIG)
+                for name in (
+                    cli.RESOLVER_NAME,
+                    cli.RESOLVER_NAME_ROUTES,
+                    cli.RESOLVER_NAME_CONFIG,
+                    cli.RESOLVER_NAME_CORE_GUARD,
+                )
             ]
         )
         return 0
@@ -237,3 +242,123 @@ def test_repo_root_is_resolved_through_a_symlink(build, tmp_path, monkeypatch):
 
     assert cli.repo_root_from(["update", str(link)]) == str(build["repo"].resolve())
     assert cli.repo_root_from(["update"]) == str(build["repo"].resolve())
+
+
+# --- attribution sidecar -----------------------------------------------------------------------
+
+
+def suppressed_pair():
+    """Old: the ten-node chain plus a core call b0 -> b9. New: core's b0 -> b9 is gone and
+    graphify-php's proof b0 -> b1 stands; the sidecar records the removal."""
+    old, new = chain(10), chain(10)
+    old["links"].append({"source": "b0", "target": "b9", "relation": "calls"})
+    new["links"][0]["_resolver"] = "graphify-php"
+    record = {
+        "schema": 1,
+        "producer": "graphify-php",
+        "external_stubs": "on",
+        "removed_edges": [
+            {
+                "source": "b0",
+                "target": "b9",
+                "relation": "calls",
+                "reason": shrink.REASON_CORE_SUPPRESSED,
+                "proof": {"source": "b0", "target": "b1"},
+            }
+        ],
+        "counts": {shrink.REASON_CORE_SUPPRESSED: 1},
+    }
+    return old, new, record
+
+
+def sidecar_path():
+    return shrink.attribution_path(status.status_path())
+
+
+def recording(run, rows):
+    """`run`, then the core guard's record carrying `rows`, as a real build's guard writes it."""
+
+    def run_and_record(args):
+        code = run(args)
+        status.write(
+            [
+                core_guard.CoreGuardStatus(
+                    name=cli.RESOLVER_NAME_CORE_GUARD, state="completed", suppressed_edge_rows=rows
+                )
+            ]
+        )
+        return code
+
+    return run_and_record
+
+
+def test_sidecar_written_by_the_build_explains_its_loss(build, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_SHRINK_TOLERANCE", "0")
+    old, new, record = suppressed_pair()
+    build["graph"].write_text(json.dumps(old))
+    run = recording(publishing(build, new), record["removed_edges"])
+
+    code = cli.main(["--", "update", str(build["repo"])], run_graphify=run)
+
+    assert code == cli.EXIT_OK
+    assert json.loads(build["graph"].read_text()) == new
+    written = json.loads(sidecar_path().read_text())
+    assert written["removed_edges"] == record["removed_edges"]
+    assert written["counts"][shrink.REASON_CORE_SUPPRESSED] == 1
+
+
+def test_a_build_that_recorded_no_removal_refuses_the_same_loss(build, capsys, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_SHRINK_TOLERANCE", "0")
+    old, new, _ = suppressed_pair()
+    build["graph"].write_text(json.dumps(old))
+
+    code = cli.main(["--", "update", str(build["repo"])], run_graphify=publishing(build, new))
+
+    assert code == cli.EXIT_SHRINK_REFUSED
+    assert json.loads(sidecar_path().read_text())["removed_edges"] == []
+
+
+def test_without_the_sidecar_the_same_loss_refuses(build, capsys, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_SHRINK_TOLERANCE", "0")
+    old, new, record = suppressed_pair()
+    build["graph"].write_text(json.dumps(old))
+
+    def broken(record):
+        raise RuntimeError("cannot build the sidecar")
+
+    monkeypatch.setattr(cli, "attribution_document", broken)
+    run = recording(publishing(build, new), record["removed_edges"])
+
+    code = cli.main(["--", "update", str(build["repo"])], run_graphify=run)
+
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_SHRINK_REFUSED
+    assert "attribution sidecar not written (RuntimeError" in err
+    assert "attribution sidecar" in err and "missing" in err
+    assert not sidecar_path().exists()
+
+
+def test_stale_sidecar_is_unlinked_at_build_start_and_explains_nothing(build, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_SHRINK_TOLERANCE", "0")
+    old, new, record = suppressed_pair()
+    build["graph"].write_text(json.dumps(old))
+    stale = sidecar_path()
+    stale.write_text(json.dumps(record))  # an earlier build's record that would match
+    seen = {}
+
+    def run(args):
+        seen["sidecar_at_start"] = stale.exists()
+        return publishing(build, new)(args)
+
+    code = cli.main(["--", "update", str(build["repo"])], run_graphify=run)
+
+    assert seen["sidecar_at_start"] is False
+    assert code == cli.EXIT_SHRINK_REFUSED
+    assert json.loads(build["graph"].read_text()) == old
+
+
+def test_version_probe_leaves_the_sidecar_alone(build):
+    sidecar_path().write_text("{}")
+
+    assert cli.main(["--version"]) == cli.EXIT_OK
+    assert sidecar_path().exists()

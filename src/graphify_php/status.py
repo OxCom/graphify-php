@@ -39,6 +39,10 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _package_version
 from pathlib import Path
 
+# The sidecar schema (shrink.py) owns the stub vocabulary; the record states it in the same words.
+from .shrink import STUBS_OFF as STUBS_OFF
+from .shrink import STUBS_ON as STUBS_ON
+
 # The build writes here; the wrapper reads it. An environment variable rather than a fixed
 # path because one machine indexes ~20 repositories and their builds must not share a file.
 STATUS_PATH_ENV = "GRAPHIFY_PHP_STATUS"
@@ -71,6 +75,25 @@ class ResolverStatus:
     external_stubbed: int = 0
     stub_nodes_added: int = 0
     stub_edges_added: int = 0
+    # Type-engine records on a scoped site's line that no raw call carried (graphify
+    # core bound the member call by bare name), edged from that site's caller. Not a resolved
+    # site: they are counted here and never in `resolved_sites`.
+    unsent_calls_added: int = 0
+    # graphify's engine binds `$x->m()` by bare name to a node in the caller's own file. Of
+    # those edges (`engine_sites_total`, the denominator), how many a type proof contradicted
+    # on the edge's line, how many were dropped, how many of the drops rested on an interface
+    # target, and how many proved edges replaced them. Every kept edge is counted once in
+    # `engine_kept` (reason -> count), so dropped + kept sums to the total.
+    engine_sites_total: int = 0
+    engine_contradicted: int = 0
+    engine_dropped: int = 0
+    engine_dropped_interface: int = 0
+    engine_proved_added: int = 0
+    engine_kept: dict = field(default_factory=dict)
+    # One row per dropped edge: {source, target, relation, reason, proof: {source, target}},
+    # `proof.target` None when the proved body has no node. Uncapped: one row per dropped edge,
+    # about 345 on the reference application.
+    engine_dropped_edges: list = field(default_factory=list)
     # reason -> count. The unit differs by reason: source reasons count sites, `probe:` reasons
     # count candidate names, `scoped_method_*` count scoped groups, and the graph-lookup reasons
     # (`target_not_in_graph`, `self_call`) count target records, so a two-arm site can appear twice.
@@ -85,6 +108,33 @@ class ResolverStatus:
         list for the next version, and a histogram of unique strings is not a work list.
         """
         self.unresolved[reason] = self.unresolved.get(reason, 0) + count
+
+
+@dataclass
+class MemberCallStatus(ResolverStatus):
+    """The member-call record (`php_member_calls`), plus the nullsafe pass's counters.
+
+    `nullsafe_sites_total` is every `?->` call a parser found, refused ones included;
+    `nullsafe_calls_added` is how many of them got a target into the graph (an edge, a stub
+    edge, or a pair the graph already held). Neither is counted in `eligible_sites`.
+    """
+
+    nullsafe_sites_total: int = 0
+    nullsafe_calls_added: int = 0
+    # Whether this pass minted external stubs (`STUBS_ON`/`STUBS_OFF`), decided in the build's
+    # process. "" until decided. The attribution sidecar reads it from here and nowhere else.
+    external_stubs: str = ""
+    # graphify's cross-file pass case-folds `new Type(...)` onto a method `type()`. Of the
+    # graphify `calls` edges to a method node whose line creates that name (`new_site_edges_total`,
+    # the denominator; an unreadable line counts too), how many were dropped. Every kept one is
+    # counted once in `new_site_kept` (reason -> count), so dropped + kept sums to the total.
+    new_site_edges_total: int = 0
+    new_site_edges_dropped: int = 0
+    new_site_kept: dict = field(default_factory=dict)
+    # One row per dropped edge: {source, target, source_location}. Audit only: no proof edge
+    # stands behind a drop, so it is not in the attribution sidecar and the shrink guard sees
+    # it as unexplained loss once; the edge does not come back.
+    new_site_dropped_edges: list = field(default_factory=list)
 
 
 def status_path() -> Path:

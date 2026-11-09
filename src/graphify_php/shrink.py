@@ -8,10 +8,32 @@ it indexes. Only loss nothing on disk explains counts against the tolerance.
 
 Stdlib only and free of graphify imports, because graphify-mesh runs it out of process through
 `graphify-shrink-check` and this package must stay importable without graphify.
+
+Attribution sidecar
+-------------------
+Some loss is caused by graphify-php itself and leaves no trace on disk: core edges withheld at a
+site graphify-php proved, engine edges a proof contradicts, external stubs switched off. The build
+records that loss in `.graphify-php-attribution.json`, next to the status record
+(`attribution_path(status.status_path())`). This module owns its schema; the writer imports the
+constants below. Schema 1:
+
+    {"schema": 1, "producer": "graphify-php", "external_stubs": "on" | "off",
+     "removed_edges": [{"source": str, "target": str, "relation": str,
+                        "reason": "core-suppressed-at-proved-site" | "engine-contradicts-proof",
+                        "proof": {"source": str, "target": str}}],
+     "counts": {"<reason>": int >= 0}}
+
+The guard trusts it only as far as the new graph confirms it. A lost edge is attributed when it
+carries no `_resolver` marker, its (source, target, relation) is listed, and the cited proof edge
+is in the new graph with the same source and relation and a `_resolver` marker. Each reason is
+capped at its count. `external_stubs: "off"` attributes lost stub nodes and their edges only when
+the new graph holds no stub at all. A malformed document is ignored whole, and the verdict is
+the one without a sidecar; the reason is noted in `reasons` after the verdict is taken.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
@@ -39,6 +61,19 @@ CLASS_UNCHANGED = "unchanged"
 # An unchanged file the new producer no longer indexes at all; see classify_loss.
 CLASS_DROPPED_BY_EXTRACTOR = "dropped_by_extractor"
 CLASS_NONE = "none"
+
+# --- attribution sidecar, schema 1 (see the module docstring) ---
+ATTRIBUTION_FILENAME = ".graphify-php-attribution.json"
+ATTRIBUTION_SCHEMA = 1
+ATTRIBUTION_PRODUCER = "graphify-php"
+STUBS_ON = "on"
+STUBS_OFF = "off"
+REASON_CORE_SUPPRESSED = "core-suppressed-at-proved-site"
+REASON_ENGINE_CONTRADICTS = "engine-contradicts-proof"
+# The reasons a writer may put in `removed_edges` and `counts`.
+REMOVAL_REASONS = (REASON_CORE_SUPPRESSED, REASON_ENGINE_CONTRADICTS)
+# The guard's own reason for stub loss under `external_stubs: "off"`; never written by a build.
+REASON_STUBS_DISABLED = "stubs-disabled"
 
 
 @dataclass
@@ -147,6 +182,92 @@ def _classify_file(rel: str, root: Path, old_manifest: Mapping, new_manifest: Ma
     return CLASS_UNCHANGED
 
 
+class AttributionError(ValueError):
+    """The sidecar does not match schema 1; it is ignored whole."""
+
+
+@dataclass(frozen=True)
+class _Attribution:
+    external_stubs: str
+    # (source, target, relation) of a lost edge -> [(reason, (proof source, proof target))]
+    removed: dict[tuple, list[tuple[str, tuple[str, str]]]]
+    counts: dict[str, int]
+
+
+def attribution_path(status_path: Path | str) -> Path:
+    """Where the build writes its attribution sidecar: next to the status record."""
+    return Path(status_path).parent / ATTRIBUTION_FILENAME
+
+
+def read_attribution(path: Path | str) -> tuple[object | None, str | None]:
+    """The sidecar's JSON document, or None plus the reason it is unusable.
+
+    Only reads; `classify_loss` validates the shape, so every caller gets the same checks.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None, f"attribution sidecar {path} missing; no loss attributed"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except (OSError, ValueError) as exc:
+        return None, f"attribution sidecar {path} unreadable ({exc}); no loss attributed"
+
+
+def _str(value: object, what: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise AttributionError(f"{what} is not a non-empty string")
+    return value
+
+
+def _parse_attribution(data: object) -> _Attribution:
+    if not isinstance(data, Mapping):
+        raise AttributionError(f"expected a JSON object, got {type(data).__name__}")
+    if data.get("schema") != ATTRIBUTION_SCHEMA or isinstance(data.get("schema"), bool):
+        raise AttributionError(f"schema {data.get('schema')!r}, expected {ATTRIBUTION_SCHEMA}")
+    if data.get("producer") != ATTRIBUTION_PRODUCER:
+        raise AttributionError(f"producer {data.get('producer')!r}")
+    stubs = data.get("external_stubs")
+    if stubs not in (STUBS_ON, STUBS_OFF):
+        raise AttributionError(f"external_stubs {stubs!r}")
+    counts = data.get("counts")
+    if not isinstance(counts, Mapping):
+        raise AttributionError("counts is not an object")
+    for reason, n in counts.items():
+        if reason not in REMOVAL_REASONS:
+            raise AttributionError(f"counts names unknown reason {reason!r}")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            raise AttributionError(f"counts[{reason!r}] is not a non-negative integer")
+    entries = data.get("removed_edges")
+    if not isinstance(entries, list):
+        raise AttributionError("removed_edges is not a list")
+    removed: dict[tuple, list[tuple[str, tuple[str, str]]]] = defaultdict(list)
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise AttributionError(f"removed_edges[{i}] is not an object")
+        reason = entry.get("reason")
+        if reason not in REMOVAL_REASONS:
+            raise AttributionError(f"removed_edges[{i}] has unknown reason {reason!r}")
+        proof = entry.get("proof")
+        if not isinstance(proof, Mapping):
+            raise AttributionError(f"removed_edges[{i}].proof is not an object")
+        key = tuple(_str(entry.get(k), f"removed_edges[{i}].{k}") for k in ("source", "target"))
+        key += (_str(entry.get("relation"), f"removed_edges[{i}].relation"),)
+        cited = (
+            _str(proof.get("source"), f"removed_edges[{i}].proof.source"),
+            _str(proof.get("target"), f"removed_edges[{i}].proof.target"),
+        )
+        removed[key].append((reason, cited))
+    return _Attribution(stubs, dict(removed), {r: int(n) for r, n in counts.items()})
+
+
+def _is_stub(node: Mapping) -> bool:
+    """A body-less external class node graphify-php minted (graph_adapter.GraphStubSink).
+
+    `_resolver` alone also marks the config resolver's file nodes; `external` tells them apart.
+    """
+    return bool(node.get("_resolver")) and bool(node.get("external"))
+
+
 def classify_loss(
     old_graph: dict,
     new_graph: dict,
@@ -157,6 +278,7 @@ def classify_loss(
     policy: str = DEFAULT_POLICY,
     tolerance: float = DEFAULT_TOLERANCE,
     producer_changed: bool = False,
+    attribution: object | None = None,
 ) -> LossReport:
     """Compare two builds of the same repository and say whether the new one may publish.
 
@@ -166,11 +288,17 @@ def classify_loss(
     lose every node, as when graphify stops indexing data JSON, but only if no old edge left that
     file: a vanished cross-file relation is real knowledge loss whatever the extractor did.
 
-    Edge figures: `lost = explained + unexplained + resolver_lost`, where `resolver_lost` counts
-    lost `_resolver` edges whose endpoints both survived and whose files did not change. An edit
-    that deleted or rewrote the edge's file, or the file of its calling node, can remove the call,
-    so that loss is explained. In an unchanged file, or one that left the corpus with no producer
-    change, nothing on disk accounts for a resolver dropping a call between two surviving nodes.
+    Edge figures: `lost = explained + unexplained + resolver_lost + attributed_total`, where
+    `resolver_lost` counts lost `_resolver` edges whose source survived, whose target survived or
+    was a graphify-php stub that vanished, and whose files did not change. An edit that deleted or
+    rewrote the edge's file, or the file of its calling node, can remove the call, so that loss is
+    explained. In an unchanged file, or one that left the corpus with no producer change, nothing
+    on disk accounts for a resolver dropping a call. `attributed` counts, per reason, loss the
+    `attribution` sidecar (module docstring) recorded and the new graph confirms.
+
+    Node figures: `lost = orphan + explained + unexplained + attributed_total`. A lost stub node
+    belongs to no file; it is explained when every lost edge touching it was explained or
+    attributed, and attributed under `stubs-disabled` when stubs were switched off.
     """
     if policy not in POLICIES:
         raise ValueError(f"unknown shrink policy {policy!r}; expected one of {', '.join(POLICIES)}")
@@ -188,7 +316,29 @@ def classify_loss(
     if policy != POLICY_ATTRIBUTED:
         return _counted(policy, tolerance, old_nodes, new_nodes, old_edges, new_edges, lost_ids)
 
+    # Notes on the sidecar go into `reasons` only after the verdict is taken: attribution can
+    # only remove loss from the unexplained count, never refuse a build by itself.
+    notes: list[str] = []
+    parsed: _Attribution | None = None
+    if attribution is not None:
+        try:
+            parsed = _parse_attribution(attribution)
+        except AttributionError as exc:
+            notes.append(f"attribution ignored: {exc}")
+
     orphans = {i for i in lost_ids if old_degree[i] == 0 and old_nodes[i].get("external")}
+    stub_ids = {i for i, n in old_nodes.items() if _is_stub(n)}
+    lost_stubs = {i for i in lost_ids if i in stub_ids and i not in orphans}
+    new_stubs = sum(1 for n in new_nodes.values() if _is_stub(n))
+    stubs_disabled = False
+    if parsed is not None and parsed.external_stubs == STUBS_OFF:
+        if new_stubs == 0:
+            stubs_disabled = True
+        else:
+            notes.append(
+                f"external_stubs is off but the new graph holds {new_stubs} stub nodes; "
+                "stub loss not attributed"
+            )
     old_manifest = _normalise_manifest(old_manifest, root)
     new_manifest = _normalise_manifest(new_manifest, root)
 
@@ -197,11 +347,14 @@ def classify_loss(
 
     # Orphans are left out of the old per-file count too, otherwise a file that only shed its
     # external stubs would look like it lost real nodes under the unchanged-file count rule.
-    old_per_file = Counter(file_of(n) for i, n in old_nodes.items() if i not in orphans)
-    new_per_file = Counter(file_of(n) for n in new_nodes.values())
+    # graphify-php's stubs belong to no file; they are judged by their edges further down.
+    old_per_file = Counter(
+        file_of(n) for i, n in old_nodes.items() if i not in orphans and i not in stub_ids
+    )
+    new_per_file = Counter(file_of(n) for n in new_nodes.values() if not _is_stub(n))
     lost_per_file: dict[str, list[str]] = defaultdict(list)
     for i in lost_ids:
-        if i not in orphans:
+        if i not in orphans and i not in lost_stubs:
             lost_per_file[file_of(old_nodes[i])].append(i)
 
     classes: dict[str, str] = {}
@@ -263,15 +416,6 @@ def classify_loss(
                 "with no producer change to explain it"
             )
 
-    base = sum(1 for i in old_nodes if old_degree[i] >= 1)
-    floor = shrink_floor(base, tolerance)
-    if base - unexplained < floor:
-        reasons.insert(
-            0,
-            f"unexplained node loss {unexplained} exceeds tolerance {tolerance:g} "
-            f"of {base} connected nodes (floor {floor})",
-        )
-
     def edited(rel: str) -> bool:
         cls = class_of(rel)
         return cls in (CLASS_DELETED, CLASS_CHANGED, CLASS_DROPPED_BY_EXTRACTOR) or (
@@ -282,7 +426,7 @@ def classify_loss(
         caller = old_nodes.get(edge.get("source")) or {}
         return edited(_relative(edge.get("source_file"), root)) or edited(file_of(caller))
 
-    edge_figures, edge_reasons = _attribute_edges(
+    edge_figures, edge_reasons, stubs_unexplained, edge_notes = _attribute_edges(
         old_edges,
         new_edges,
         new_nodes,
@@ -290,12 +434,36 @@ def classify_loss(
         tolerance,
         lambda edge: class_of(_relative(edge.get("source_file"), root)),
         resolver_call_edited,
+        lost_stubs,
+        stubs_disabled,
+        parsed,
     )
+    notes.extend(edge_notes)
+
+    node_attributed: Counter = Counter()
+    for i in lost_stubs:
+        if stubs_disabled:
+            node_attributed[REASON_STUBS_DISABLED] += 1
+        elif i in stubs_unexplained:
+            unexplained += 1
+        else:
+            explained += 1
+
+    base = sum(1 for i in old_nodes if old_degree[i] >= 1)
+    floor = shrink_floor(base, tolerance)
+    if base - unexplained < floor:
+        reasons.insert(
+            0,
+            f"unexplained node loss {unexplained} exceeds tolerance {tolerance:g} "
+            f"of {base} connected nodes (floor {floor})",
+        )
     reasons.extend(edge_reasons)
+    verdict = "refuse" if reasons else "accept"
+    reasons.extend(notes)
 
     files.sort(key=lambda f: (-f["lost"], f["file"]))
     return LossReport(
-        verdict="refuse" if reasons else "accept",
+        verdict=verdict,
         policy=policy,
         tolerance=tolerance,
         nodes={
@@ -307,6 +475,8 @@ def classify_loss(
             "unexplained": unexplained,
             "base": base,
             "floor": floor,
+            "attributed": dict(sorted(node_attributed.items())),
+            "attributed_total": sum(node_attributed.values()),
         },
         edges=edge_figures,
         reasons=reasons,
@@ -314,23 +484,67 @@ def classify_loss(
     )
 
 
+def _proved(entries, edge, new_resolver_keys) -> str | None:
+    """The reason of the first listed entry whose cited proof the new graph holds."""
+    source, relation = edge.get("source"), edge.get("relation")
+    for reason, (proof_source, proof_target) in entries:
+        if proof_source == source and (proof_source, proof_target, relation) in new_resolver_keys:
+            return reason
+    return None
+
+
 def _attribute_edges(
-    old_edges, new_edges, new_nodes, explained_ids, tolerance, class_of, resolver_call_edited
+    old_edges,
+    new_edges,
+    new_nodes,
+    explained_ids,
+    tolerance,
+    class_of,
+    resolver_call_edited,
+    lost_stubs,
+    stubs_disabled,
+    attribution,
 ):
     new_keys = {_edge_key(e) for e in new_edges}
+    new_resolver_keys = {_edge_key(e) for e in new_edges if e.get("_resolver")}
     resolver_old = sum(1 for e in old_edges if e.get("_resolver"))
+    removed = attribution.removed if attribution is not None else {}
     lost = explained = unexplained = protected = 0
+    attributed: Counter = Counter()
+    over_cap: Counter = Counter()
+    unproved = listed_resolver = 0
+    # A lost stub is explained only when every lost edge touching it is explained or attributed.
+    stubs_unexplained: set = set()
     for edge in old_edges:
-        if _edge_key(edge) in new_keys:
+        key = _edge_key(edge)
+        if key in new_keys:
             continue
         lost += 1
         source, target = edge.get("source"), edge.get("target")
-        if edge.get("_resolver") and source in new_nodes and target in new_nodes:
+        ours = bool(edge.get("_resolver"))
+        to_lost_stub = target in lost_stubs
+        if ours and key in removed:
+            listed_resolver += 1
+        if ours and to_lost_stub and stubs_disabled:
+            attributed[REASON_STUBS_DISABLED] += 1
+            continue
+        if ours and source in new_nodes and (target in new_nodes or to_lost_stub):
             if resolver_call_edited(edge):
                 explained += 1
             else:
                 protected += 1
-        elif (
+                stubs_unexplained.add(target)
+            continue
+        if not ours and key in removed:
+            reason = _proved(removed[key], edge, new_resolver_keys)
+            if reason is None:
+                unproved += 1
+            elif attributed[reason] < attribution.counts.get(reason, 0):
+                attributed[reason] += 1
+                continue
+            else:
+                over_cap[reason] += 1
+        if (
             source in explained_ids
             or target in explained_ids
             or class_of(edge) in (CLASS_DELETED, CLASS_CHANGED, CLASS_DROPPED_BY_EXTRACTOR)
@@ -338,6 +552,7 @@ def _attribute_edges(
             explained += 1
         else:
             unexplained += 1
+            stubs_unexplained.update(x for x in (source, target) if x in lost_stubs)
 
     reasons = []
     if _below_floor(resolver_old, protected, tolerance):
@@ -350,6 +565,21 @@ def _attribute_edges(
             f"unexplained edge loss {unexplained} exceeds tolerance {tolerance:g} "
             f"of {len(old_edges)} edges"
         )
+    notes = []
+    for reason, n in sorted(over_cap.items()):
+        notes.append(
+            f"attribution for {reason} capped at its recorded count "
+            f"{attribution.counts.get(reason, 0)}; {n} more listed edges not attributed"
+        )
+    if unproved:
+        notes.append(
+            f"{unproved} edges listed in the attribution sidecar have no proof in the new graph"
+        )
+    if listed_resolver:
+        notes.append(
+            f"{listed_resolver} lost graphify-php edges listed in the attribution sidecar; "
+            "ignored, the sidecar never explains the resolver's own edges"
+        )
     figures = {
         "old": len(old_edges),
         "new": len(new_edges),
@@ -358,8 +588,10 @@ def _attribute_edges(
         "unexplained": unexplained,
         "resolver_old": resolver_old,
         "resolver_lost": protected,
+        "attributed": dict(sorted(attributed.items())),
+        "attributed_total": sum(attributed.values()),
     }
-    return figures, reasons
+    return figures, reasons, stubs_unexplained, notes
 
 
 def _counted(policy, tolerance, old_nodes, new_nodes, old_edges, new_edges, lost_ids):
@@ -398,6 +630,8 @@ def _counted(policy, tolerance, old_nodes, new_nodes, old_edges, new_edges, lost
             "unexplained": max(0, base - survived),
             "base": base,
             "floor": floor,
+            "attributed": {},
+            "attributed_total": 0,
         },
         edges={
             "old": len(old_edges),
@@ -407,6 +641,8 @@ def _counted(policy, tolerance, old_nodes, new_nodes, old_edges, new_edges, lost
             "unexplained": max(0, len(old_edges) - len(new_edges)),
             "resolver_old": sum(1 for e in old_edges if e.get("_resolver")),
             "resolver_lost": 0,
+            "attributed": {},
+            "attributed_total": 0,
         },
         reasons=reasons,
         files=[],

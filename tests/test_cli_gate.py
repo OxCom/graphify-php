@@ -35,7 +35,11 @@ def runner_writing(state, *, name=cli.RESOLVER_NAME, reason="", graph=None):
             graph.write_text(json.dumps({"nodes": ["fresh"], "links": []}))
         if state is not None:
             records = [status.ResolverStatus(name=name, state=state, reason=reason)]
-            for other in (cli.RESOLVER_NAME_ROUTES, cli.RESOLVER_NAME_CONFIG):
+            for other in (
+                cli.RESOLVER_NAME_ROUTES,
+                cli.RESOLVER_NAME_CONFIG,
+                cli.RESOLVER_NAME_CORE_GUARD,
+            ):
                 # Every resolver this package registers must report, so a test about one of
                 # them still has to satisfy the others or it is testing the wrong refusal.
                 if name != other:
@@ -187,6 +191,24 @@ def test_the_default_gate_requires_the_config_pass_too(build, capsys):
     assert cli.RESOLVER_NAME_CONFIG in capsys.readouterr().err
 
 
+def test_the_default_gate_requires_the_core_guard(build, capsys):
+    """Without its record nothing proves core's PHP pass was kept off our sites."""
+
+    def without_guard(args):
+        status.write(
+            [
+                status.ResolverStatus(name=name, state="completed")
+                for name in (cli.RESOLVER_NAME, cli.RESOLVER_NAME_ROUTES, cli.RESOLVER_NAME_CONFIG)
+            ]
+        )
+        return 0
+
+    code = cli.main([], run_graphify=without_guard)
+
+    assert code == cli.EXIT_RESOLVER_MISSING
+    assert cli.RESOLVER_NAME_CORE_GUARD in capsys.readouterr().err
+
+
 def test_a_status_file_that_is_not_a_record_refuses_and_restores(build, capsys):
     def writes_a_list(args):
         build.write_text(json.dumps({"nodes": ["fresh"], "links": []}))
@@ -317,3 +339,54 @@ def test_status_record_names_its_producer(build, monkeypatch):
     status.write([status.ResolverStatus(name="r", state="completed")])
 
     assert status.read()["producer"] == {"name": "graphify-php", "version": "9.8.7"}
+
+
+FORCED = (
+    "graphify-php-build: running graphify update with --force: incremental update does not "
+    "re-resolve PHP calls from unchanged files"
+)
+
+
+def _recorder(seen):
+    """A stand-in for graphify that keeps its arguments and writes no record, as a no-op run."""
+
+    def run(args):
+        seen.append(list(args))
+        return 0
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "argv", [["--", "update", "."], ["--", "update", ".", "--force"], ["update", "."]]
+)
+def test_update_always_runs_with_force_exactly_once(build, argv):
+    seen = []
+
+    cli.main(argv, run_graphify=_recorder(seen))
+
+    assert len(seen) == 1
+    assert seen[0][:2] == ["update", "."]
+    assert seen[0].count("--force") == 1
+
+
+def test_a_command_other_than_update_gets_no_force(build, capsys):
+    seen = []
+
+    cli.main(["--", "query", "x"], run_graphify=_recorder(seen))
+
+    assert seen == [["query", "x"]]
+    assert FORCED not in capsys.readouterr().err
+
+
+def test_forcing_update_is_announced_on_stderr(build, capsys):
+    cli.main(["--", "update", "."], run_graphify=_recorder([]))
+
+    assert FORCED in capsys.readouterr().err.splitlines()
+
+
+def test_an_update_that_writes_no_record_still_refuses(build, capsys):
+    code = cli.main(["--", "update", "."], run_graphify=_recorder([]))
+
+    assert code == cli.EXIT_RESOLVER_MISSING
+    assert json.loads(build.read_text()) == {"nodes": ["previous"], "links": []}

@@ -17,19 +17,18 @@ jobs:
           fetch-depth: 0
 
       - name: gitleaks — scan git history for hardcoded secrets
-        # Plain OSS gitleaks CLI, not gitleaks/gitleaks-action: that Action now
-        # requires a paid GITLEAKS_LICENSE for GitHub Organizations. The CLI
-        # itself stays free/open-source.
-        # The sha256 below is pinned from the official release checksums file:
-        # https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
-        # .gitleaks.toml at the repository root extends the default rules with
-        # a path allowlist for the planted canaries (see that file).
-        run: |
-          curl -sSfL -o gitleaks_8.30.1_linux_x64.tar.gz \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum -c -
-          tar -xzf gitleaks_8.30.1_linux_x64.tar.gz gitleaks
-          ./gitleaks detect --source . --no-banner --redact
+        # gitleaks-action needs a GITLEAKS_LICENSE only for repositories owned
+        # by a GitHub Organization; OxCom is a personal account, so none is set.
+        # A push scans the pushed commits; the nightly schedule and a manual
+        # dispatch scan the full history. The action runs `gitleaks detect
+        # --redact` and picks up .gitleaks.toml at the repository root, which
+        # allowlists the planted canaries (see that file).
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: "8.30.1"
+          # PR comments need pull-requests: write; this job keeps contents: read.
+          GITLEAKS_ENABLE_COMMENTS: "false"
 
   trufflehog:
     runs-on: ubuntu-latest

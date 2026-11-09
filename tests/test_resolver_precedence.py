@@ -637,3 +637,289 @@ def test_with_the_flag_a_target_with_no_declaring_file_gets_no_stub(monkeypatch)
 
     assert record.unresolved[resolver.REASON_NOT_IN_GRAPH] == 1
     assert nodes == [] and edges == []
+
+
+def _new_bag_call():
+    # graphify 0.9.103 records `new Bag(...)` as a non-member call with `Bag` as the callee.
+    return {
+        "caller_nid": "caller_wrap",
+        "callee": "Bag",
+        "is_member_call": False,
+        "source_file": "src/Service.php",
+        "source_location": "L10",
+    }
+
+
+def test_scoped_candidates_are_marked_so_a_source_can_tell_them_from_member_calls():
+    files = per_file("send")
+    files[0]["raw_calls"].append(_new_bag_call())
+
+    groups = resolver.collect_scoped_groups(files, FakeScopes(["map", "__construct"]))
+
+    assert [(c.method, c.scoped) for g in groups for c in g.candidates] == [
+        ("map", True),
+        ("__construct", True),
+    ]
+    assert [s.scoped for s in resolver.collect_sites(files)] == [False]
+
+
+def test_a_member_call_graphify_flags_php_scoped_is_marked_scoped():
+    """0.9.103 sends `Foo::get()` as a member call carrying `php_scoped: true`."""
+    files = per_file("send", "get")
+    files[0]["raw_calls"][1].update(receiver="Foo", php_scoped=True)
+
+    assert [(s.method, s.scoped) for s in resolver.collect_sites(files)] == [
+        ("send", False),
+        ("get", True),
+    ]
+
+
+class CallerAwareIndex(FakeIndex):
+    def caller_scope(self, caller_nid):
+        return (f"Thing::{caller_nid.removeprefix('caller_')}",)
+
+
+def test_sites_carry_the_callers_class_method_when_the_index_can_name_it():
+    source = FakeSource("precise", claims={"send"})
+
+    resolver.run(
+        per_file("send"), [], [], sources=[source], index=CallerAwareIndex(), sink=FakeSink()
+    )
+
+    assert [s.caller_scope for s in source.offered[0]] == [("Thing::send",)]
+
+
+def test_sites_say_nothing_about_the_caller_when_the_index_cannot():
+    source = FakeSource("precise", claims={"send"})
+
+    resolver.run(per_file("send"), [], [], sources=[source], index=FakeIndex(), sink=FakeSink())
+
+    assert [s.caller_scope for s in source.offered[0]] == [None]
+
+
+class UnsentSource(FakeSource):
+    """Places one `App\\User::getName` record on every anchor that owns its line."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.asked: list[tuple[list[CallSite], list[CallSite]]] = []
+
+    def unsent_calls(self, repo_root, anchors, members):
+        anchors, members = list(anchors), list(members)
+        self.asked.append((anchors, members))
+        return [
+            CallTarget(
+                site=a,
+                class_fqn="App\\User",
+                method="getName",
+                confidence=Confidence.EXTRACTED,
+                via=self.name,
+            )
+            for a in anchors
+            if a.owns_line
+        ]
+
+
+class LineIndex(CallerAwareIndex):
+    def caller_owns_line(self, caller_nid, location):
+        return caller_nid == "caller_wrap" and location == "L10"
+
+
+def test_a_refused_probe_places_records_no_raw_call_carried_and_counts_them_apart(status_file):
+    files = per_file("getId")
+    files[0]["raw_calls"].append(_new_bag_call())
+    source = UnsentSource("precise", claims={"getId"})
+    sink = FakeSink()
+    index = LineIndex(
+        {("App\\User", "getName"): "user_getname", ("App\\GetidService", "getId"): "x"}
+    )
+
+    record = resolver.run(
+        files, [], [], sources=[source], index=index, sink=sink, scopes=FakeScopes(["map", "go"])
+    )
+
+    anchors, members = source.asked[0]
+    assert [(a.caller_nid, a.source_location, a.owns_line) for a in anchors] == [
+        ("caller_wrap", "L10", True)
+    ]
+    assert [m.method for m in members] == ["getId"]
+    assert [(c, n) for c, n, _t in sink.calls] == [
+        ("caller_getId", "x"),
+        ("caller_wrap", "user_getname"),
+    ]
+    # The probe is still refused as a site; the placed record is counted on its own line.
+    assert record.resolved_sites == 1
+    assert record.unresolved[resolver.REASON_SCOPE_NOT_RECOVERED] == 1
+    assert record.unsent_calls_added == 1
+    assert json.loads(status_file.read_text())["resolvers"][0]["unsent_calls_added"] == 1
+
+
+def test_a_scoped_group_that_resolved_still_anchors_its_line():
+    # `Foo::make($this->bar->make())`: core bound `->make()` by bare name and never sent it.
+    files = per_file()
+    files[0]["raw_calls"].append(_new_bag_call())
+    source = UnsentSource("precise", claims={"map"})
+    scopes = FakeScopes(["map"])
+    resolver.run(files, [], [], sources=[source], index=LineIndex(), sink=FakeSink(), scopes=scopes)
+
+    assert [(a.caller_nid, a.method) for a in source.asked[0][0]] == [("caller_wrap", "map")]
+
+
+def test_a_scoped_member_site_anchors_its_line_and_claims_no_record():
+    """0.9.103 sends `Foo::make(...)` as a member call flagged `php_scoped`."""
+    files = per_file("getId", "make")
+    files[0]["raw_calls"][1].update(receiver="Foo", php_scoped=True, caller_nid="caller_wrap")
+    source = UnsentSource("precise", claims={"getId"})
+
+    resolver.run(files, [], [], sources=[source], index=LineIndex(), sink=FakeSink())
+
+    anchors, members = source.asked[0]
+    assert [(a.caller_nid, a.method, a.scoped) for a in anchors] == [("caller_wrap", "make", True)]
+    assert [m.method for m in members] == ["getId"]
+
+
+def _graph_with_a_local_cache(root: str):
+    """`Thing::run` calls `get`; its own file also declares a project class `Cache`."""
+    path = f"{root}/src/Thing.php"
+    nodes = [
+        {"id": "f", "label": "Thing.php", "source_file": path},
+        {"id": "thing", "label": "Thing", "_callable_class": True, "source_file": path},
+        {"id": "cache", "label": "Cache", "_callable_class": True, "source_file": path},
+        {"id": "run", "label": ".run()", "_callable": True, "source_file": path},
+        {"id": "cache_get", "label": ".get()", "_callable": True, "source_file": path},
+    ]
+    edges = [
+        {"source": "f", "target": "thing", "relation": "contains"},
+        {"source": "f", "target": "cache", "relation": "contains"},
+        {"source": "thing", "target": "run", "relation": "method"},
+        {"source": "cache", "target": "cache_get", "relation": "method"},
+    ]
+    raw = {
+        "caller_nid": "run",
+        "callee": "get",
+        "is_member_call": True,
+        "source_file": path,
+        "source_location": "L9",
+    }
+    return nodes, edges, [{"nodes": [], "edges": [], "raw_calls": [raw]}]
+
+
+@pytest.mark.parametrize("stubs", ["0", "1"])
+def test_a_proved_vendor_target_never_binds_to_a_same_named_class_in_the_callers_file(
+    tmp_path, monkeypatch, stubs
+):
+    monkeypatch.setenv(resolver.EXTERNAL_STUBS_ENV, stubs)
+    root = str(tmp_path)
+    nodes, edges, files = _graph_with_a_local_cache(root)
+    source = FileAwareSource(
+        "phpstan", {"get": [("Vendor\\Lib\\Cache", "get")]}, f"{root}/vendor/lib/Cache.php"
+    )
+
+    record = resolver.run(files, nodes, edges, sources=[source], repo_root=root)
+
+    calls = [(e["source"], e["target"]) for e in edges if e.get("relation") == "calls"]
+    assert ("run", "cache_get") not in calls
+    if stubs == "1":
+        assert calls == [("run", "php_external_vendor_lib_cache")]
+        assert record.external_stubbed == 1
+    else:
+        assert calls == []
+        assert record.unresolved[resolver.REASON_NOT_IN_GRAPH] == 1
+    assert record.resolved_sites == 1
+
+
+class NullsafeSource(FakeSource):
+    """Finds the given parser sites and places `App\\User::getName` on each it is handed."""
+
+    def __init__(self, name, found, take=lambda site: True):
+        super().__init__(name)
+        self.found = list(found)
+        self.take = take
+        self.handed: list[CallSite] = []
+
+    def nullsafe_calls(self, repo_root, files):
+        return list(self.found)
+
+    def unsent_calls(self, repo_root, anchors, members, *, nullsafe=()):
+        nullsafe = list(nullsafe)
+        self.handed.extend(nullsafe)
+        return [
+            CallTarget(
+                site=s,
+                class_fqn="App\\User",
+                method=s.method,
+                confidence=Confidence.EXTRACTED,
+                via=self.name,
+            )
+            for s in nullsafe
+            if self.take(s)
+        ]
+
+
+class CallableIndex(CallerAwareIndex):
+    """Callers by start line: `caller_run` starts on L20, nothing else is known."""
+
+    def callable_at(self, source_file, lines, repo_root="."):
+        return "caller_run" if 20 in lines else None
+
+
+def test_a_nullsafe_call_reaches_the_graph_from_the_caller_the_parser_placed(status_file):
+    from graphify_php.ports import NullsafeCall
+
+    found = [
+        NullsafeCall("src/Service/Thing.php", 22, "getName", (20,)),
+        NullsafeCall("src/Service/Thing.php", 23, "getName", (20,)),
+        NullsafeCall("src/Service/Thing.php", 24, "getMail", (20,)),
+        NullsafeCall("src/Service/Thing.php", 30, "getName", (29,)),
+        NullsafeCall("src/Service/Thing.php", 31, "getName", (), "other-call-on-line"),
+    ]
+    source = NullsafeSource("phpstan", found, take=lambda s: s.source_location != "L24")
+    sink = FakeSink()
+    index = CallableIndex({("App\\User", "getName"): "user_getname"})
+
+    record = resolver.run(per_file(), [], [], sources=[source], index=index, sink=sink)
+
+    assert [(s.caller_nid, s.source_location, s.caller_scope) for s in source.handed] == [
+        ("caller_run", "L22", ("Thing::run",)),
+        ("caller_run", "L23", ("Thing::run",)),
+        ("caller_run", "L24", ("Thing::run",)),
+    ]
+    assert [(c, n, t.site.source_location) for c, n, t in sink.calls] == [
+        ("caller_run", "user_getname", "L22"),
+        ("caller_run", "user_getname", "L23"),
+    ]
+    assert record.nullsafe_sites_total == 5
+    assert record.nullsafe_calls_added == 2
+    assert record.unresolved == {
+        "nullsafe:phpstan:other-call-on-line": 1,
+        "nullsafe:" + resolver.REASON_NULLSAFE_CALLER_NOT_IN_GRAPH: 1,
+        "nullsafe:" + resolver.REASON_NULLSAFE_NO_RECORD: 1,
+    }
+    # Nothing here stands for a raw call, so no site was eligible or resolved.
+    assert (record.eligible_sites, record.resolved_sites, record.unsent_calls_added) == (0, 0, 0)
+    written = json.loads(status_file.read_text())["resolvers"][0]
+    assert (written["nullsafe_sites_total"], written["nullsafe_calls_added"]) == (5, 2)
+
+
+def test_a_nullsafe_target_missing_from_the_graph_is_counted_under_the_nullsafe_prefix():
+    from graphify_php.ports import NullsafeCall
+
+    source = NullsafeSource("phpstan", [NullsafeCall("src/Thing.php", 22, "getName", (20,))])
+
+    record = resolver.run(
+        per_file(), [], [], sources=[source], index=CallableIndex(), sink=FakeSink()
+    )
+
+    assert record.nullsafe_calls_added == 0
+    assert record.unresolved == {"nullsafe:" + resolver.REASON_NOT_IN_GRAPH: 1}
+
+
+def test_without_a_parser_or_a_caller_lookup_no_nullsafe_site_is_counted():
+    from graphify_php.ports import NullsafeCall
+
+    source = NullsafeSource("phpstan", [NullsafeCall("src/Thing.php", 22, "getName", (20,))])
+
+    record = resolver.run(per_file(), [], [], sources=[source], index=FakeIndex(), sink=FakeSink())
+
+    assert (record.nullsafe_sites_total, record.nullsafe_calls_added) == (0, 0)
+    assert source.handed == []

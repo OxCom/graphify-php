@@ -31,7 +31,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from graphify_php.ports import CallSite, CallTarget, Confidence, Resolution
+from graphify_php.ports import CallSite, CallTarget, Confidence, LineProof, Resolution
 
 _BINARY = "vendor/bin/phpstan"
 
@@ -54,6 +54,20 @@ REASON_NOT_TYPED = "phpstan-receiver-not-typed"
 # Two calls of one method on one line share a site key. Without `callPos` their records look
 # like the arms of a union receiver; with it, calls that prove different targets are refused.
 REASON_SAME_LINE_COLLISION = "same-line-collision"
+# The collector records `MethodCall` only, so a scoped call or probe can only ever match some
+# other call on its line. Refused before PHPStan runs.
+REASON_NOT_A_METHOD_CALL = "phpstan-not-a-method-call"
+# The record on the site's line was made inside another method than the site's caller.
+REASON_CALLER_MISMATCH = "phpstan-caller-mismatch"
+# The site's caller is no class method the graph can name (a function, an anonymous class's
+# method, a closure it cannot place), so no record can be shown to belong to it.
+REASON_CALLER_UNNAMED = "phpstan-caller-unnamed"
+# The record names the caller's method, but the file's records give that spelling two classes
+# (`A\Foo` and `B\Foo`, or a lost class's method name declared in two classes).
+REASON_CALLER_AMBIGUOUS = "phpstan-caller-ambiguous"
+# The site's class is unknown (`::name`) and the record was made in another file's class: a
+# trait body analysed in a using class, or a record that does not say where it was made.
+REASON_CALLER_OTHER_FILE = "phpstan-caller-other-file"
 # The wrapper is written into the run's own temporary directory, so this fires only when that
 # directory is unwritable or the project config vanished mid-build — never for an ordinary
 # project that simply does not register the collector itself.
@@ -126,6 +140,8 @@ class PhpStanCall:
     line: int
     call_pos: int | None = None
     callee_file: str = ""
+    # The file of the class the body was analysed in; differs from `file` for a trait body.
+    caller_file: str = ""
 
     @staticmethod
     def from_json(raw: object) -> PhpStanCall | None:
@@ -159,6 +175,7 @@ class PhpStanCall:
             line=line,
             call_pos=call_pos,
             callee_file=str(raw.get("calleeFile") or ""),
+            caller_file=str(raw.get("callerFile") or ""),
         )
 
     @property
@@ -181,6 +198,8 @@ class RunOutcome:
     ok: bool
     reason: str = ""
     stderr_line: str = ""
+    # None when the process never exited on its own (not launched, timed out).
+    exit_code: int | None = None
 
 
 class EnvironmentProbe:
@@ -367,13 +386,13 @@ class PhpStanRunner:
 
         stderr_line = _first_line(stderr)
         if process.returncode == 0:
-            return RunOutcome(True, "", stderr_line)
+            return RunOutcome(True, "", stderr_line, 0)
 
         # A non-zero exit is the normal outcome on any project that has analysis errors of its
         # own, and the collector's file is complete by then regardless. So the exit code alone
         # decides nothing; whether records arrived does. The caller treats an empty file as the
         # source being unavailable for this build rather than as a crash.
-        return RunOutcome(False, REASON_RUN_FAILED, stderr_line)
+        return RunOutcome(False, REASON_RUN_FAILED, stderr_line, process.returncode)
 
 
 class PhpStanSource:
@@ -390,17 +409,24 @@ class PhpStanSource:
     ) -> None:
         self._probe = probe or EnvironmentProbe()
         self._runner = runner or PhpStanRunner(self._probe)
+        # The last run's records, so `unsent_calls` can read them without a second analysis.
+        self._last_run: tuple[str, list[PhpStanCall]] | None = None
 
     def available(self, repo_root: str) -> tuple[bool, str]:
         return self._probe.check(repo_root)
 
     def resolve(self, repo_root: str, sites: Iterable[CallSite]) -> Resolution:
-        wanted = list(sites)
+        offered = list(sites)
+        wanted = [site for site in offered if not site.scoped]
+        probes = len(offered) - len(wanted)
+        if not wanted:
+            return Resolution([], {REASON_NOT_A_METHOD_CALL: probes} if probes else {}, 0)
         ok, code, _message = self._probe.inspect(repo_root)
         if not ok:
-            return Resolution([], {code or REASON_UNAVAILABLE: len(wanted)}, 0)
-        if not wanted:
-            return Resolution([], {}, 0)
+            unavailable = {code or REASON_UNAVAILABLE: len(wanted)}
+            if probes:
+                unavailable[REASON_NOT_A_METHOD_CALL] = probes
+            return Resolution([], unavailable, 0)
 
         with tempfile.TemporaryDirectory(prefix="graphify-php-") as workdir:
             output_path = Path(workdir) / "calls.jsonl"
@@ -408,10 +434,16 @@ class PhpStanSource:
             text = _read(output_path)
 
         unresolved: dict[str, int] = {}
+        if probes:
+            unresolved[REASON_NOT_A_METHOD_CALL] = probes
         if outcome.stderr_line:
             unresolved[STDERR_PREFIX + outcome.stderr_line] = 1
 
         calls, malformed = _parse(text)
+        # Only a run that finished writing feeds `unsent_calls`. A truncated tail line, a timeout
+        # or a crash means a partial file; exit 1 is PHPStan reporting the project's own errors.
+        finished = outcome.ok or (outcome.reason == REASON_RUN_FAILED and outcome.exit_code == 1)
+        self._last_run = (repo_root, calls) if finished and not malformed else None
         if malformed:
             unresolved[REASON_MALFORMED] = malformed
 
@@ -419,16 +451,148 @@ class PhpStanSource:
             unresolved[_failure_reason(outcome)] = len(wanted)
             return Resolution([], unresolved, 0)
 
-        targets, collisions = _match(wanted, calls, repo_root)
-        if collisions:
-            unresolved[REASON_SAME_LINE_COLLISION] = collisions
+        targets, refused = _match(wanted, calls, repo_root)
+        for reason, count in refused.items():
+            unresolved[reason] = unresolved.get(reason, 0) + count
         # CallSite is frozen and hashable, so the set counts distinct sites that got at
         # least one target; a site with two targets is one site, not two.
-        missed = len(wanted) - len({target.site for target in targets}) - collisions
+        missed = len(wanted) - len({target.site for target in targets}) - sum(refused.values())
         if missed > 0:
             unresolved[REASON_NOT_TYPED] = missed
 
         return Resolution(targets, unresolved, len({call.file for call in calls}))
+
+    def unsent_calls(
+        self,
+        repo_root: str,
+        anchors: Iterable[CallSite],
+        members: Iterable[CallSite],
+        *,
+        nullsafe: Iterable[CallSite] = (),
+    ) -> list[CallTarget]:
+        """Records on an anchor's line that no raw call carried, as targets of the anchor.
+
+        graphify core binds some member calls by bare name and never sends them, so
+        `new Msg($user->getName())` arrives as the `new` probe alone. The record is taken only
+        when the caller check places it in the anchor's caller, the anchor owns its line, and
+        no member site on that line names its method: such a site's fate is its own.
+
+        `nullsafe` sites are `$x?->m()` calls graphify never sends at all. A parser already
+        placed each in its innermost caller and found no other call of that name on the line
+        that is not nullsafe, so a site takes the records of its own method name that the
+        caller check places in its caller, and needs no anchor.
+        """
+        if self._last_run is None or self._last_run[0] != repo_root:
+            return []
+        calls = self._last_run[1]
+        callers = _Callers(calls, repo_root)
+        by_line: dict[tuple[str, int], list[PhpStanCall]] = {}
+        for call in calls:
+            by_line.setdefault((_path_key(call.file, repo_root), call.line), []).append(call)
+        found = self._anchored(repo_root, anchors, members, callers, by_line)
+        for site in nullsafe:
+            if not site.caller_scope:
+                continue
+            place = (_path_key(site.source_file, repo_root), _line_of(site.source_location))
+            seen: set[tuple[str, str]] = set()
+            for call in by_line.get(place, ()):
+                if call.callee_method.lower() != site.method.lower():
+                    continue
+                if callers.verdict(site, call):
+                    continue
+                arm = (_class_key(call.callee_class), call.callee_method.lower())
+                if arm in seen:
+                    continue
+                seen.add(arm)
+                found.append(_target(site, call))
+        return found
+
+    def _anchored(self, repo_root, anchors, members, callers, by_line) -> list[CallTarget]:
+        # A scoped call is never a `MethodCall`, so it has no record to claim.
+        claimed = {
+            (_path_key(m.source_file, repo_root), _line_of(m.source_location), m.method.lower())
+            for m in members
+            if not m.scoped
+        }
+        found: list[CallTarget] = []
+        seen: set[tuple] = set()
+        for anchor in anchors:
+            if not anchor.owns_line or not anchor.caller_scope:
+                continue
+            place = (_path_key(anchor.source_file, repo_root), _line_of(anchor.source_location))
+            for call in by_line.get(place, ()):
+                if (*place, call.callee_method.lower()) in claimed or callers.verdict(anchor, call):
+                    continue
+                key = (anchor.caller_nid, place, call.call_pos, call.callee_class)
+                key += (call.callee_method,)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(_target(anchor, call))
+        return found
+
+    def line_proofs(self, repo_root: str, sites: Iterable[CallSite]) -> dict | None:
+        """`LineProof` per site: the last run's records at its file, line and method name.
+
+        Only records the caller rule places in the site's caller count, and a site whose caller
+        the graph could not name gets an empty proof: what this answers may remove an edge, so
+        "matched on file and line alone" is not good enough here. None when no finished run
+        is held, so the caller can tell "no record" from "no records to ask".
+        """
+        if self._last_run is None or self._last_run[0] != repo_root:
+            return None
+        calls = self._last_run[1]
+        callers = _Callers(calls, repo_root)
+        by_key: dict[tuple[str, int, str], list[PhpStanCall]] = {}
+        for call in calls:
+            key = (_path_key(call.file, repo_root), call.line, call.callee_method.lower())
+            by_key.setdefault(key, []).append(call)
+        proofs: dict[CallSite, LineProof] = {}
+        for site in sites:
+            if not site.caller_scope:
+                proofs[site] = LineProof(targets=(), calls=0)
+                continue
+            key = (
+                _path_key(site.source_file, repo_root),
+                _line_of(site.source_location),
+                site.method.lower(),
+            )
+            matched = [c for c in by_key.get(key, ()) if not callers.verdict(site, c)]
+            targets: list[CallTarget] = []
+            seen: set[tuple[str, str]] = set()
+            for call in matched:
+                arm = (_class_key(call.callee_class), call.callee_method.lower())
+                if arm in seen:
+                    continue
+                seen.add(arm)
+                targets.append(
+                    CallTarget(
+                        site=site,
+                        class_fqn=call.callee_class,
+                        method=call.callee_method,
+                        confidence=Confidence.EXTRACTED,
+                        via=call.via,
+                        declaring_file=call.callee_file,
+                        interface_target=call.callee_is_interface,
+                    )
+                )
+            # A record without a position cannot be told from a union arm: one call at most.
+            proofs[site] = LineProof(
+                targets=tuple(targets), calls=len({call.call_pos for call in matched})
+            )
+        return proofs
+
+
+def _target(site: CallSite, call: PhpStanCall) -> CallTarget:
+    return CallTarget(
+        site=site,
+        class_fqn=call.callee_class,
+        method=call.callee_method,
+        confidence=Confidence.EXTRACTED,
+        via=call.via,
+        declaring_file=call.callee_file,
+        interface_target=call.callee_is_interface,
+    )
 
 
 def _failure_reason(outcome: RunOutcome) -> str:
@@ -560,10 +724,14 @@ def _site_key(path: str, line: int, method: str, repo_root: str) -> tuple[str, i
     method name is in the key as well so that two different calls on one line — a chain — stay
     apart instead of collapsing into whichever the dictionary saw last.
     """
+    return (_path_key(path, repo_root), line, method)
+
+
+def _path_key(path: str, repo_root: str) -> str:
     resolved = Path(path)
     if not resolved.is_absolute():
         resolved = Path(repo_root) / resolved
-    return (os.path.normpath(str(resolved)), line, method)
+    return os.path.normpath(str(resolved))
 
 
 def _line_of(source_location: str) -> int:
@@ -581,8 +749,8 @@ def _line_of(source_location: str) -> int:
 
 def _match(
     sites: list[CallSite], calls: list[PhpStanCall], repo_root: str
-) -> tuple[list[CallTarget], int]:
-    """Targets for each site, and how many sites were refused as same-line collisions.
+) -> tuple[list[CallTarget], dict[str, int]]:
+    """Targets for each site, and the refused sites counted by reason.
 
     A site key is file, line and method, so `$a->get(); $b->get();` on one line lands in one
     bucket together with the arms of a `Emails|Cache` receiver. The arms share the call's token
@@ -590,6 +758,9 @@ def _match(
     it is emitted only when every call in the bucket proves the same target set: the common
     `$a->getId() === $b->getId()` keeps its edge, and two calls proving different targets are
     refused rather than merged into a union that is not in the code.
+
+    A site that names its caller only takes records made inside that caller, and the bucket is
+    counted per caller, so two methods sharing one line no longer collide with each other.
     """
     by_key: dict[tuple[str, int, str], list[PhpStanCall]] = {}
     for call in calls:
@@ -600,27 +771,45 @@ def _match(
     # How many sites share a key. `$a->get() ?? $b->get()` with `$b` untyped yields one call
     # position for two sites, and the one record cannot say which of them it belongs to.
     site_keys = [
-        _site_key(site.source_file, _line_of(site.source_location), site.method, repo_root)
+        (
+            _site_key(site.source_file, _line_of(site.source_location), site.method, repo_root),
+            site.caller_scope,
+        )
         for site in sites
     ]
-    sites_per_key: dict[tuple[str, int, str], int] = {}
+    sites_per_key: dict[tuple[tuple[str, int, str], tuple[str, ...] | None], int] = {}
     for key in site_keys:
         sites_per_key[key] = sites_per_key.get(key, 0) + 1
 
     targets: list[CallTarget] = []
-    collisions = 0
+    refused: dict[str, int] = {}
+    callers = _Callers(calls, repo_root)
+
+    def refuse(reason: str) -> None:
+        refused[reason] = refused.get(reason, 0) + 1
+
     for site, key in zip(sites, site_keys, strict=True):
-        matched = by_key.get(key, ())
+        on_line = by_key.get(key[0], ())
+        if not on_line and site.caller_scope == ():
+            # The collector writes nothing for a function body, so an unnamed caller with no
+            # record is that, not an untyped receiver.
+            refuse(REASON_CALLER_UNNAMED)
+            continue
+        verdicts = [callers.verdict(site, call) for call in on_line]
+        matched = [call for call, verdict in zip(on_line, verdicts, strict=True) if not verdict]
+        if on_line and not matched:
+            refuse(REASON_CALLER_AMBIGUOUS if REASON_CALLER_AMBIGUOUS in verdicts else verdicts[0])
+            continue
         arms_by_call: dict[int | None, set[tuple[str, str]]] = {}
         for call in matched:
             arms_by_call.setdefault(call.call_pos, set()).add(
                 (call.callee_class, call.callee_method)
             )
         if len({frozenset(arms) for arms in arms_by_call.values()}) > 1:
-            collisions += 1
+            refuse(REASON_SAME_LINE_COLLISION)
             continue
         if matched and len(arms_by_call) < sites_per_key[key]:
-            collisions += 1
+            refuse(REASON_SAME_LINE_COLLISION)
             continue
         seen: set[tuple[str, str]] = set()
         for call in matched:
@@ -636,6 +825,71 @@ def _match(
                     confidence=Confidence.EXTRACTED,
                     via=call.via,
                     declaring_file=call.callee_file,
+                    interface_target=call.callee_is_interface,
                 )
             )
-    return targets, collisions
+    return targets, refused
+
+
+class _Callers:
+    """Whether a record was made inside a site's caller, judged against the whole file.
+
+    The graph labels classes by short name, so `Foo::run` is matched on the short name and
+    accepted only when the file's records give that short name one FQN. `::run` (the graph
+    lost the class) is accepted only when the file's `run` records name one class and the
+    record was made in a class of the site's own file (`callerFile`).
+    """
+
+    def __init__(self, calls: list[PhpStanCall], repo_root: str) -> None:
+        self._root = repo_root
+        self._classes_of_method: dict[tuple[str, str], set[str]] = {}
+        self._fqns_of_short: dict[tuple[str, str], set[str]] = {}
+        for call in calls:
+            path, fqn = _path_key(call.file, repo_root), _class_key(call.caller_class)
+            method_key = (path, call.caller_method.lower())
+            self._classes_of_method.setdefault(method_key, set()).add(fqn)
+            self._fqns_of_short.setdefault((path, _short(fqn)), set()).add(fqn)
+
+    def verdict(self, site: CallSite, call: PhpStanCall) -> str:
+        """`""` when the record belongs to the site's caller, else the refusal reason.
+
+        `None` is a site no index described, matched on file and line as before. PHP names
+        are case-insensitive.
+        """
+        if site.caller_scope is None:
+            return ""
+        if not site.caller_scope:
+            return REASON_CALLER_UNNAMED
+        path, fqn = _path_key(call.file, self._root), _class_key(call.caller_class)
+        method = call.caller_method.lower()
+        ambiguous = other_file = False
+        for spelled in site.caller_scope:
+            cls, _, name = spelled.rpartition("::")
+            if name.lower() != method or (cls and _class_key(cls) != _short(fqn)):
+                continue
+            if not cls and (
+                not call.caller_file or _path_key(call.caller_file, self._root) != path
+            ):
+                # Only the class proves an unnamed caller; a class from another file's context
+                # (a trait body) cannot. A function has no record, so it never gets past this.
+                other_file = True
+                continue
+            classes = (
+                self._fqns_of_short.get((path, _short(fqn)), ())
+                if cls
+                else self._classes_of_method.get((path, method), ())
+            )
+            if len(classes) == 1:
+                return ""
+            ambiguous = True
+        if ambiguous:
+            return REASON_CALLER_AMBIGUOUS
+        return REASON_CALLER_OTHER_FILE if other_file else REASON_CALLER_MISMATCH
+
+
+def _class_key(name: str) -> str:
+    return name.strip().lstrip("\\").lower()
+
+
+def _short(class_key: str) -> str:
+    return class_key.rsplit("\\", 1)[-1]

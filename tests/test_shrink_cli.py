@@ -66,6 +66,8 @@ def test_accept_exits_0_with_the_report_on_stdout(builds, capsys):
         "unexplained",
         "base",
         "floor",
+        "attributed",
+        "attributed_total",
     }
     assert set(out["edges"]) == {
         "old",
@@ -75,6 +77,8 @@ def test_accept_exits_0_with_the_report_on_stdout(builds, capsys):
         "unexplained",
         "resolver_old",
         "resolver_lost",
+        "attributed",
+        "attributed_total",
     }
     assert out["verdict"] == "accept" and out["policy"] == "attributed"
     assert out["tolerance"] == 0.10 and out["reasons"] == []
@@ -211,3 +215,62 @@ def test_runs_as_a_module_with_the_same_contract(builds):
 
     assert done.returncode == 1, done.stderr
     assert json.loads(done.stdout)["verdict"] == "refuse"
+
+
+def attribution_builds(b):
+    """Old: the chain plus a core call b0 -> b9; new: that call gone, graphify-php's proof
+    b0 -> b1 in place. Tolerance 0, so the one lost edge refuses unless attributed."""
+    old = json.loads(b["old"].read_text())
+    new = json.loads(b["new"].read_text())
+    old["links"].append({"source": "b0", "target": "b9", "relation": "calls"})
+    new["links"][0]["_resolver"] = "graphify-php"
+    record = {
+        "schema": 1,
+        "producer": "graphify-php",
+        "external_stubs": "on",
+        "removed_edges": [
+            {
+                "source": "b0",
+                "target": "b9",
+                "relation": "calls",
+                "reason": "core-suppressed-at-proved-site",
+                "proof": {"source": "b0", "target": "b1"},
+            }
+        ],
+        "counts": {"core-suppressed-at-proved-site": 1},
+    }
+    write(b["old"], old)
+    write(b["new"], new)
+    return write(b["tmp"] / "attribution.json", record)
+
+
+def test_attribution_flag_reaches_the_classifier(builds, capsys):
+    sidecar = attribution_builds(builds)
+    base = argv(builds, **{"--tolerance": 0})
+
+    assert shrink_cli.main(base) == 1
+    capsys.readouterr()
+    assert shrink_cli.main([*base, "--attribution", str(sidecar)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["edges"]["attributed"] == {"core-suppressed-at-proved-site": 1}
+    assert out["edges"]["attributed_total"] == 1
+
+
+def test_missing_attribution_file_is_a_reason_not_an_error(builds, capsys):
+    attribution_builds(builds)
+    args = argv(builds, **{"--tolerance": 0, "--attribution": builds["tmp"] / "none.json"})
+
+    assert shrink_cli.main(args) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["edges"]["attributed_total"] == 0
+    assert any("missing" in r for r in out["reasons"])
+
+
+def test_malformed_attribution_file_gives_the_verdict_without_one(builds, capsys):
+    attribution_builds(builds)
+    bad = write(builds["tmp"] / "bad.json", {"schema": 1})
+
+    assert shrink_cli.main(argv(builds, **{"--attribution": bad})) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "accept"
+    assert any(r.startswith("attribution ignored:") for r in out["reasons"])

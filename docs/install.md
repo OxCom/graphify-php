@@ -133,7 +133,7 @@ composer require --dev phpstan/phpstan
    ```
 
 Exit code `0` means every expected resolver reported. The record lists `php_member_calls`,
-`php_routes` and `php_symfony_config`. Each has a `state` of `completed`, or `skipped` with a
+`php_routes`, `php_symfony_config` and `php_core_guard`. Each has a `state` of `completed`, or `skipped` with a
 `reason`. Under `php_member_calls`, `resolved_sites` out of `eligible_sites` is the coverage
 figure.
 

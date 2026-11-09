@@ -184,10 +184,11 @@ def test_the_package_registration_includes_this_pass(monkeypatch):
     """`graphify_php.register()` is the only registration a real build makes, so a pass it
     leaves out never runs — which is how this one sat dead in every published graph."""
     registry = pytest.importorskip("graphify.resolver_registry")
+    pytest.importorskip("graphify.extract")  # core registers into the real registry, not ours
     import graphify_php
+    from graphify_php import core_guard
 
     monkeypatch.setattr(registry, "_REGISTRY", [])
-    monkeypatch.setattr(graphify_php, "_registered", False)
 
     assert graphify_php.register(repo_root="/nonexistent") is True
     names = [r.name for r in registry.registered_resolvers()]
@@ -195,7 +196,70 @@ def test_the_package_registration_includes_this_pass(monkeypatch):
         graphify_php.RESOLVER_NAME,
         graphify_php.RESOLVER_NAME_ROUTES,
         cr.RESOLVER_NAME,
+        core_guard.RESOLVER_NAME,
     ]
+
+
+def test_a_foreign_resolver_with_our_name_does_not_stop_registration(monkeypatch):
+    """graphify 0.9.103 registers its own `php_member_calls` when `graphify.extract` imports."""
+    registry = pytest.importorskip("graphify.resolver_registry")
+    pytest.importorskip("graphify.extract")
+    import graphify_php
+    from graphify_php import core_guard
+
+    foreign = registry.LanguageResolver(
+        graphify_php.RESOLVER_NAME, frozenset({".php"}), lambda *_args: None
+    )
+    monkeypatch.setattr(registry, "_REGISTRY", [foreign])
+
+    assert graphify_php.register(repo_root="/nonexistent") is True
+    names = [r.name for r in registry.registered_resolvers()]
+    assert names == [
+        graphify_php.RESOLVER_NAME,
+        graphify_php.RESOLVER_NAME_ROUTES,
+        cr.RESOLVER_NAME,
+        # Not ours, so it is core wherever it lives: filtered, and moved behind our passes.
+        core_guard.CORE_NAME,
+    ]
+    assert core_guard.original_of(registry.registered_resolvers()[3].resolve) is foreign.resolve
+
+
+def test_registering_twice_adds_nothing_the_second_time(monkeypatch):
+    registry = pytest.importorskip("graphify.resolver_registry")
+    pytest.importorskip("graphify.extract")
+    import graphify_php
+
+    monkeypatch.setattr(registry, "_REGISTRY", [])
+
+    assert graphify_php.register(repo_root="/nonexistent") is True
+    first = registry.registered_resolvers()
+    assert graphify_php.register(repo_root="/nonexistent") is False
+    assert registry.registered_resolvers() == first
+
+
+def test_each_of_our_passes_is_checked_on_its_own(monkeypatch):
+    """A registry holding only our routes pass still gets the other two."""
+    registry = pytest.importorskip("graphify.resolver_registry")
+    pytest.importorskip("graphify.extract")
+    import graphify_php
+    from graphify_php import core_guard
+
+    monkeypatch.setattr(registry, "_REGISTRY", [])
+    graphify_php.register(repo_root="/nonexistent")
+    routes = [
+        r for r in registry.registered_resolvers() if r.name == graphify_php.RESOLVER_NAME_ROUTES
+    ]
+    monkeypatch.setattr(registry, "_REGISTRY", routes)
+
+    assert graphify_php.register(repo_root="/nonexistent") is True
+    assert sorted(r.name for r in registry.registered_resolvers()) == sorted(
+        [
+            graphify_php.RESOLVER_NAME,
+            graphify_php.RESOLVER_NAME_ROUTES,
+            cr.RESOLVER_NAME,
+            core_guard.RESOLVER_NAME,
+        ]
+    )
 
 
 def test_missing_pyyaml_is_a_recorded_skip_not_a_raise(tmp_path, monkeypatch):

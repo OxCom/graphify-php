@@ -24,6 +24,7 @@ from .shrink import (
     POLICY_ATTRIBUTED,
     POLICY_COUNT,
     classify_loss,
+    read_attribution,
 )
 
 EXIT_ACCEPT = 0
@@ -95,6 +96,13 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="graphify or its config changed, so files may legitimately leave the corpus",
     )
+    parser.add_argument(
+        "--attribution",
+        type=Path,
+        default=None,
+        help="graphify-php attribution sidecar (.graphify-php-attribution.json); a missing or "
+        "malformed file attributes nothing and is noted in reasons",
+    )
     return parser
 
 
@@ -115,6 +123,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         unjudgeable = not old_manifest and policy == POLICY_ATTRIBUTED
         if unjudgeable:
             policy = POLICY_COUNT
+        attribution, attribution_note = (
+            read_attribution(opts.attribution) if opts.attribution else (None, None)
+        )
         report = classify_loss(
             load_json(opts.old_graph, missing_ok=False),
             load_json(opts.new_graph, missing_ok=False),
@@ -124,7 +135,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             policy=policy,
             tolerance=tolerance,
             producer_changed=opts.producer_changed,
+            attribution=attribution,
         )
+        if attribution_note:
+            report.reasons.append(attribution_note)
         if unjudgeable:
             report.reasons.append(NO_MANIFEST_REASON)
     except (InputError, ValueError) as exc:

@@ -9,17 +9,12 @@ are not calls.
 WHY THE SUFFIX GATE SAYS `.php` WHILE THIS READS `.yaml`
 
 graphify activates a registered resolver only when the corpus it is building holds a file with
-one of the resolver's suffixes (`resolver_registry.run_language_resolvers`). YAML is not in that
-corpus: `detect.py:45` lists `.yaml` and `.yml` in `DOC_EXTENSIONS`, so a YAML file takes the
-document path and never reaches the code extractor. Measured on a fixture of one PHP file and one
-`config/packages/messenger.yaml`, built with two probe resolvers registered: the `.php`-gated
-probe ran, the `.yaml`-gated probe did not, and the published graph held 3 nodes, none of them
-from the YAML file.
-
-So a `.yaml` gate would never fire and this pass would be dead code that looks registered. The
-gate is `.php` — "this is a PHP repository, so it may be a Symfony application" — and the files
-are found by walking `config/` under the repository root rather than by reading the corpus. The
-two are deliberately about different files.
+one of the resolver's suffixes (`resolver_registry.run_language_resolvers`). Since graphify
+0.9.95 YAML is in that corpus (`detect.py:48` lists `.yaml` and `.yml` in `CODE_EXTENSIONS`),
+but a `.yaml` gate would add nothing: `graphify-php-build` runs every `update` with `--force`,
+so `.php` is always in the change set of a PHP repository. The gate stays `.php` — "this is a
+PHP repository, so it may be a Symfony application" — and the files are still found by walking
+`config/` under the repository root rather than by reading the corpus.
 """
 
 from __future__ import annotations
@@ -29,7 +24,6 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 from . import status
-from .resolver import PHP_SUFFIXES
 
 if TYPE_CHECKING:
     from .config import ConfigFileFinder, GraphWriter, SafeDocumentParser
@@ -141,24 +135,3 @@ def make_resolver(
 
     resolve.__name__ = RESOLVER_NAME
     return resolve
-
-
-def register(repo_root: str = ".") -> bool:
-    """Register this pass with graphify. Returns whether this call did the registering.
-
-    Idempotent by name: graphify runs its registry in order without deduplicating, so a double
-    registration would run the pass twice and the second run would find every node already
-    present and report a build that did nothing.
-    """
-    from graphify import resolver_registry
-
-    if any(r.name == RESOLVER_NAME for r in resolver_registry.registered_resolvers()):
-        return False
-    resolver_registry.register(
-        resolver_registry.LanguageResolver(
-            name=RESOLVER_NAME,
-            suffixes=PHP_SUFFIXES,
-            resolve=make_resolver(repo_root),
-        )
-    )
-    return True

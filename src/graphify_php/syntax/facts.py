@@ -52,8 +52,15 @@ class MethodScope:
     # Every local this method writes to, whether or not the write produced a usable type.
     # A second write is what revokes a binding, so the ones that produced nothing still count.
     assigned: set = field(default_factory=set)
+    # Set once a construct writes locals by a name no static read can resolve (`$$n = ...`,
+    # `extract(...)`). From then on every local of this method is refused, including ones
+    # recorded later in document order.
+    revoked_all: str | None = None
 
     def record_local(self, name: str, fact: TypeFact) -> None:
+        if self.revoked_all is not None:
+            self.refusals[name] = self.revoked_all
+            return
         existing = self.locals.get(name)
         if existing is not None and existing.precedence <= fact.precedence:
             return
@@ -86,6 +93,14 @@ class MethodScope:
             return
         self.locals.pop(name, None)
         self.refusals[name] = reason
+
+    def revoke_all(self, reason: str) -> None:
+        """Refuse every local of this method, known now or recorded later."""
+        if self.revoked_all is None:
+            self.revoked_all = reason
+        for name in list(self.locals):
+            self.locals.pop(name)
+            self.refusals[name] = self.revoked_all
 
     def contains(self, line: int) -> bool:
         return self.start_line <= line <= self.end_line

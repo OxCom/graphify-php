@@ -7,6 +7,7 @@ and a silent drop is the failure mode the reason vocabulary exists to make visib
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from graphify_php.ports import CallSite, CallTargetSource, Confidence  # noqa: E
 from graphify_php.sources.tree_sitter_source import (  # noqa: E402
     Reason,
     TreeSitterSource,
+    _scope_key,
     classify_receiver,
     line_of,
 )
@@ -1698,7 +1700,411 @@ class C extends Base {
     result = resolve(
         tmp_path,
         php,
-        CallSite("nid:1", scope_text, "tidy", "Subject.php", f"L{line_with(php, written)}"),
+        CallSite(
+            "nid:1", scope_text, "tidy", "Subject.php", f"L{line_with(php, written)}", scoped=True
+        ),
     )
     assert result.unresolved == {}
     assert [(t.class_fqn, t.via) for t in result.targets] == [(expected_fqn, f"tree_sitter:{via}")]
+
+
+# --- graphify 0.9.103 fills `receiver` with a bare name ------------------------------------
+
+
+def test_a_bare_property_name_as_receiver_is_reread_from_the_line(tmp_path):
+    """0.9.103 sends `emails` for `$this->emails`: not an expression this source can classify."""
+    declare(
+        tmp_path,
+        "App\\Service\\Messages",
+        {"Emails": ["reminderSubmitWeek", "reminderSubmitMonth", "send"]},
+    )
+    line = line_with(REFERENCE, "reminderSubmitWeek")
+    subject = CallSite("nid:1", "emails", "reminderSubmitWeek", "Subject.php", f"L{line}")
+    result = resolve(tmp_path, REFERENCE, subject)
+
+    assert result.unresolved == {}
+    assert [(t.class_fqn, t.via) for t in result.targets] == [
+        ("App\\Service\\Messages\\Emails", "tree_sitter:promoted-parameter")
+    ]
+
+
+def test_a_bare_local_name_as_receiver_is_reread_from_the_line(tmp_path):
+    php = r"""<?php
+namespace App;
+class C {
+    public function run(): void {
+        $mailer = new Mailer();
+        $mailer->send();
+    }
+}
+"""
+    declare(tmp_path, "App", {"Mailer": ["send"]})
+    line = line_with(php, "$mailer->send()")
+    result = resolve(tmp_path, php, CallSite("nid:1", "mailer", "send", "Subject.php", f"L{line}"))
+
+    assert result.unresolved == {}
+    assert [t.class_fqn for t in result.targets] == ["App\\Mailer"]
+
+
+def test_a_scoped_probe_never_takes_a_member_call_on_its_line(tmp_path):
+    """`new Bag(... $i->map() ...)` probed as `Bag::map`: the `$i->map()` is another call."""
+    php = r"""<?php
+namespace App;
+class Service {
+    public function wrap(array $items): Bag {
+        $i = new Item();
+        return new Bag(array_map(fn () => $i->map(), $items));
+    }
+}
+"""
+    declare(tmp_path, "App", {"Item": ["map"], "Bag": ["map"]})
+    line = line_with(php, "new Bag(")
+    probe = CallSite("nid:1", "Bag", "map", "Subject.php", f"L{line}", scoped=True)
+    result = resolve(tmp_path, php, probe)
+
+    assert result.targets == []
+    assert result.unresolved == {Reason.CALL_SITE_NOT_FOUND: 1}
+
+
+# Every method on one line, so the line alone cannot say which method a call belongs to.
+_ONE_LINE_CLASS = (
+    "class OneLine { private Bar $bar;",
+    "public function __construct() { $this->bar = new Bar(); }",
+    "public function first(): int { return $this->bar->get(); }",
+    "public function second(): int { return Foo::get(); } }",
+)
+ONE_LINE = "<?php\nnamespace App;\n" + " ".join(_ONE_LINE_CLASS) + "\n"
+
+
+def test_a_scoped_site_only_takes_a_call_written_with_its_own_scope(tmp_path):
+    """The `new Bar()` probe for `get` must not take `Foo::get()` from another method."""
+    declare(tmp_path, "App", {"Bar": ["get"], "Foo": ["get"]})
+    line = line_with(ONE_LINE, "class OneLine")
+    probe = CallSite("nid:1", "Bar", "get", "Subject.php", f"L{line}", scoped=True)
+
+    refuses(tmp_path, ONE_LINE, probe, Reason.SCOPE_MISMATCH)
+
+
+def test_a_scoped_member_site_from_graphify_resolves_through_its_scope(tmp_path):
+    """0.9.103 sends `Foo::get()` as a member call with `php_scoped` and `Foo` as receiver."""
+    declare(tmp_path, "App", {"Bar": ["get"], "Foo": ["get"]})
+    line = line_with(ONE_LINE, "class OneLine")
+    result = resolve(
+        tmp_path, ONE_LINE, CallSite("nid:1", "Foo", "get", "Subject.php", f"L{line}", scoped=True)
+    )
+
+    assert result.unresolved == {}
+    assert [(t.class_fqn, t.via) for t in result.targets] == [
+        ("App\\Foo", "tree_sitter:class-scope")
+    ]
+
+
+def test_a_bare_receiver_naming_another_receiver_is_refused(tmp_path):
+    declare(tmp_path, "App", {"Bar": ["get"], "Foo": ["get"]})
+    line = line_with(ONE_LINE, "class OneLine")
+
+    refuses(
+        tmp_path,
+        ONE_LINE,
+        CallSite("nid:1", "baz", "get", "Subject.php", f"L{line}"),
+        Reason.RECEIVER_MISMATCH,
+    )
+
+
+def test_a_bare_receiver_is_never_answered_by_a_scoped_call(tmp_path):
+    php = r"""<?php
+namespace App;
+class C {
+    private Bar $bar;
+    public function run(): int { return Foo::get(); }
+}
+"""
+    declare(tmp_path, "App", {"Bar": ["get"], "Foo": ["get"]})
+    line = line_with(php, "Foo::get()")
+
+    refuses(
+        tmp_path,
+        php,
+        CallSite("nid:1", "bar", "get", "Subject.php", f"L{line}"),
+        Reason.CALL_SITE_NOT_FOUND,
+    )
+
+
+# Two methods on one line, each binding `$b` to another class.
+_ONE_LINE_LOCALS = (
+    "class OneLine {",
+    "public function first() { $b = new Bar(); return 1; }",
+    "public function second() { $b = new Baz(); return $b->get(); } }",
+)
+ONE_LINE_LOCALS = "<?php\nnamespace App;\n" + " ".join(_ONE_LINE_LOCALS) + "\n"
+
+
+def test_a_local_on_a_line_two_methods_share_is_refused_without_the_caller(tmp_path):
+    declare(tmp_path, "App", {"Bar": ["get"], "Baz": ["get"]})
+    line = line_with(ONE_LINE_LOCALS, "$b->get()")
+
+    refuses(
+        tmp_path,
+        ONE_LINE_LOCALS,
+        CallSite("nid:1", "$b", "get", "Subject.php", f"L{line}"),
+        Reason.SHARED_LINE_SCOPE,
+    )
+
+
+def test_a_local_on_a_line_two_methods_share_is_read_in_the_caller_the_site_names(tmp_path):
+    declare(tmp_path, "App", {"Bar": ["get"], "Baz": ["get"]})
+    line = line_with(ONE_LINE_LOCALS, "$b->get()")
+    site = CallSite(
+        "nid:1", "$b", "get", "Subject.php", f"L{line}", caller_scope=("oneline::SECOND",)
+    )
+    result = resolve(tmp_path, ONE_LINE_LOCALS, site)
+
+    assert result.unresolved == {}
+    assert [t.class_fqn for t in result.targets] == ["App\\Baz"]
+
+
+# Two classes on one line, each typing `$x` as another class; the call is in `B`.
+_TWO_CLASSES = (
+    "class B { private Baz $x; public function run() { return $this->x->get(); } }",
+    "class A { private Bar $x; }",
+)
+TWO_CLASSES = "<?php\nnamespace App;\n" + " ".join(_TWO_CLASSES) + "\n"
+
+
+def test_a_property_on_a_line_two_classes_share_is_refused_without_the_caller(tmp_path):
+    declare(tmp_path, "App", {"Bar": ["get"], "Baz": ["get"]})
+    line = line_with(TWO_CLASSES, "$this->x->get()")
+
+    refuses(
+        tmp_path,
+        TWO_CLASSES,
+        CallSite("nid:1", "$this->x", "get", "Subject.php", f"L{line}"),
+        Reason.SHARED_LINE_SCOPE,
+    )
+
+
+def test_a_property_on_a_line_two_classes_share_is_read_in_the_class_the_site_names(tmp_path):
+    declare(tmp_path, "App", {"Bar": ["get"], "Baz": ["get"]})
+    line = line_with(TWO_CLASSES, "$this->x->get()")
+    site = CallSite("nid:1", "$this->x", "get", "Subject.php", f"L{line}", caller_scope=("B::run",))
+    result = resolve(tmp_path, TWO_CLASSES, site)
+
+    assert result.unresolved == {}
+    assert [t.class_fqn for t in result.targets] == ["App\\Baz"]
+
+
+def test_scope_key_ignores_a_leading_backslash_and_case():
+    assert _scope_key("\\App\\Foo") == _scope_key(" app\\FOO ") == "app\\foo"
+
+
+@pytest.mark.parametrize(
+    ("written", "sent"), [("\\App\\Foo::get()", "App\\Foo"), ("FOO::get()", "Foo")]
+)
+def test_a_scope_spelled_differently_from_the_site_still_names_the_same_class(
+    tmp_path, written, sent
+):
+    php = r"""<?php
+namespace App;
+class C {
+    public function run(): int { return CALL; }
+}
+""".replace("CALL", written)
+    declare(tmp_path, "App", {"Foo": ["get"]})
+    line = line_with(php, written)
+    site = CallSite("nid:1", sent, "get", "Subject.php", f"L{line}", scoped=True)
+    result = resolve(tmp_path, php, site)
+
+    # The class keeps its written spelling; the graph lookup folds case as PHP does.
+    assert result.unresolved == {}
+    assert [t.class_fqn.lower() for t in result.targets] == ["app\\foo"]
+
+
+SITES_OF_GET = r"""<?php
+namespace App;
+class C {
+    public function run(): void
+    {
+        $this->cache->get('a');
+        $a->GET(1); $b?->get(2);
+        $fn = function () use ($c) { return $c->get(3); };
+        $this->other();
+        Foo::get();
+        get();
+    }
+
+    public function next(): void
+    {
+        $this->cache->get('z');
+    }
+}
+"""
+
+
+def test_member_call_lines_counts_every_member_call_of_the_method_in_the_callers_span(tmp_path):
+    write(tmp_path, SITES_OF_GET)
+    lines = SOURCE.member_call_lines(str(tmp_path), "Subject.php", "L4", "get").lines
+
+    # A nested closure's call counts against the method around it: more sites, never fewer.
+    # A static call and a function call are not member calls, and `next` is another caller.
+    assert lines == {6: 1, 7: 2, 8: 1}
+
+
+def test_member_call_lines_finds_a_closure_caller_by_its_own_start_line(tmp_path):
+    write(tmp_path, SITES_OF_GET)
+
+    assert SOURCE.member_call_lines(str(tmp_path), "Subject.php", "L8", "get").lines == {8: 1}
+
+
+@pytest.mark.parametrize("location", ["L5", "", "nowhere"])
+def test_member_call_lines_says_nothing_when_no_callable_starts_on_the_line(tmp_path, location):
+    write(tmp_path, SITES_OF_GET)
+
+    assert SOURCE.member_call_lines(str(tmp_path), "Subject.php", location, "get") is None
+
+
+def test_member_call_lines_says_nothing_for_an_unreadable_file(tmp_path):
+    assert SOURCE.member_call_lines(str(tmp_path), "Missing.php", "L4", "get") is None
+
+
+def test_member_call_lines_marks_a_nested_closures_lines_and_other_call_kinds(tmp_path):
+    write(tmp_path, SITES_OF_GET)
+    sites = SOURCE.member_call_lines(str(tmp_path), "Subject.php", "L4", "get")
+
+    # Line 8's call is the closure's; `Foo::get()` and `get()` are calls of the name too.
+    assert (sites.foreign, sites.other_kinds) == (frozenset({8}), True)
+
+
+def test_member_call_lines_marks_the_method_call_on_a_closures_last_line(tmp_path):
+    write(
+        tmp_path,
+        """<?php
+class C {
+    public function run($a, $b) {
+        array_map(function () use ($b) {
+            return $b->get();
+        }, [$a->get()]);
+    }
+}
+""",
+    )
+    sites = SOURCE.member_call_lines(str(tmp_path), "Subject.php", "L4", "get")
+
+    # The closure's span ends on line 6, which holds the method's `$a->get()`.
+    assert sites.lines == {5: 1, 6: 1}
+    assert (sites.foreign, sites.other_kinds) == (frozenset({6}), False)
+
+
+def test_member_call_lines_says_nothing_for_a_file_that_does_not_parse(tmp_path):
+    write(tmp_path, "<?php\nclass C {\n    public function run() {\n        $a->get(;\n    }\n}\n")
+
+    assert SOURCE.member_call_lines(str(tmp_path), "Subject.php", "L3", "get") is None
+
+
+DECLARATIONS = """<?php
+function helper() {}
+class C {
+    public function helper() {}
+    public function run() {
+        $x = new class { public function getData() {} };
+    }
+}
+"""
+
+
+@pytest.mark.parametrize(
+    ("location", "name", "expected"),
+    [
+        ("L2", "helper", False),
+        ("L4", "helper", True),
+        ("L6", "getData", True),
+        ("L5", "nope", None),
+    ],
+)
+def test_method_declared_at_tells_a_method_from_a_function(tmp_path, location, name, expected):
+    write(tmp_path, DECLARATIONS)
+
+    assert SOURCE.method_declared_at(str(tmp_path), "Subject.php", location, name) is expected
+
+
+NULLSAFE_SITES = r"""<?php
+namespace App;
+class C {
+    #[Attr]
+    public function run(?Mailer $m, ?Mailer $n): void
+    {
+        $m?->send();
+        $m?->send(); $n->send();
+        $f = function () use ($m) { return $m?->send(); };
+        $m?->send(fn () => $n?->send());
+        $m?->$name();
+        $m?->get() ?? $n?->GET();
+        $m?->send(Foo::send());
+        $m?->send($x->$dynamic());
+    }
+}
+$top?->send();
+"""
+
+
+def test_nullsafe_calls_names_each_site_and_the_lines_its_caller_starts_on(tmp_path):
+    write(tmp_path, NULLSAFE_SITES)
+
+    found = SOURCE.nullsafe_calls(str(tmp_path), ["Subject.php"])
+
+    assert [(c.line, c.method, c.caller_lines, c.refusal) for c in found] == [
+        (7, "send", (4, 5), ""),
+        (8, "send", (), "other-call-on-line"),
+        (9, "send", (9,), ""),
+        (10, "send", (), "callers-differ"),
+        (10, "send", (), "callers-differ"),
+        (11, "", (), "dynamic-name"),
+        (12, "get", (4, 5), ""),
+        (12, "GET", (4, 5), ""),
+        (13, "send", (), "other-call-on-line"),
+        (14, "send", (), "other-call-on-line"),
+        (17, "send", (), "outside-callable"),
+    ]
+    assert {c.source_file for c in found} == {"Subject.php"}
+
+
+def test_nullsafe_calls_refuses_a_caller_whose_start_line_another_callable_shares(tmp_path):
+    write(tmp_path, "<?php\nclass C {\n    public function a() { return fn () => $x?->go(); }\n}\n")
+
+    found = SOURCE.nullsafe_calls(str(tmp_path), ["Subject.php"])
+
+    assert [(c.line, c.refusal) for c in found] == [(3, "caller-line-shared")]
+
+
+def test_nullsafe_calls_reads_each_file_once_and_skips_what_it_cannot_read(tmp_path):
+    write(tmp_path, NULLSAFE_SITES)
+    full = str(tmp_path / "Subject.php")
+
+    found = SOURCE.nullsafe_calls(str(tmp_path), ["Subject.php", full, "Missing.php"])
+
+    assert len(found) == 11
+
+
+def test_a_parser_target_names_the_corpus_file_that_declares_its_class(tmp_path):
+    declare(tmp_path, "App\\Service", {"Emails": ["send"]}, name="Emails.php")
+    write(
+        tmp_path,
+        "<?php\nnamespace App;\nuse App\\Service\\Emails;\nuse Vendor\\Lib\\Cache;\n"
+        "class C {\n"
+        "    public function __construct(private Emails $emails, private Cache $cache) {}\n"
+        "    public function run(): void { $this->emails->send(); }\n"
+        "    public function load(): void { $this->cache->get(); }\n"
+        "}\n",
+    )
+    sites = [call("$this->emails", "send", 7), call("$this->cache", "get", 8)]
+
+    result = SOURCE.resolve(str(tmp_path), sites, ["Subject.php", "Emails.php"])
+
+    # A class no corpus file declares has no file to name: the graph cannot hold it either.
+    files = {t.class_fqn: t.declaring_file for t in result.targets}
+    emails = os.path.realpath(tmp_path / "Emails.php")
+    assert files == {"App\\Service\\Emails": emails, "Vendor\\Lib\\Cache": ""}
+    outside = {t.class_fqn: t.outside_corpus for t in result.targets}
+    assert outside == {"App\\Service\\Emails": False, "Vendor\\Lib\\Cache": True}
+    # Without a corpus only the site files were read, so absence proves nothing.
+    bare = SOURCE.resolve(str(tmp_path), sites)
+    assert not any(t.outside_corpus for t in bare.targets)

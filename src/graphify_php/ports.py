@@ -18,7 +18,7 @@ and one guessed from a declaration must not arrive looking alike.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
@@ -43,6 +43,17 @@ class CallSite:
     method: str
     source_file: str
     source_location: str
+    # Not a `$receiver->method()`: a scoped call `X::m()`, or a probe guessing a method NAME
+    # for a non-member call (on graphify 0.9.103 also `new X(...)`). `receiver` holds the scope.
+    scoped: bool = False
+    # `Class::method` spellings a type engine may report for code inside the caller: the
+    # method's class, every class mixing in its trait, the method enclosing a closure. `()` when
+    # no class method can be named for it, `None` when no index was asked. `::method` (no
+    # class) is a method whose class the graph lost: the source must prove the class itself.
+    caller_scope: tuple[str, ...] | None = None
+    # No other callable starts between the caller's first line and this site's line, so a
+    # call on that line that the type engine places in the caller is in the caller's own body.
+    owns_line: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,6 +68,106 @@ class CallTarget:
     # Where the declaring class lives, '' when the source does not know. Lets the graph layer
     # tell a vendor target from a project class the build left out, without guessing from the FQN.
     declaring_file: str = ""
+    # The target names an interface method: a contract, not a body.
+    interface_target: bool = False
+    # The source read every file the build parsed and none declares the class, so no graph
+    # node can hold it, however a short name or an alias matches.
+    outside_corpus: bool = False
+
+
+@dataclass(frozen=True)
+class LineProof:
+    """Every type-engine target for one method name on one line, made inside one caller.
+
+    `calls` is how many distinct calls those targets belong to: the arms of a union receiver
+    are one call, `$a->get(); $b->get();` are two. Empty when the source has no such record.
+    """
+
+    targets: tuple[CallTarget, ...]
+    calls: int
+
+
+@dataclass(frozen=True)
+class NullsafeCall:
+    """One `$x?->method()` a parser found. graphify never sends these as raw calls.
+
+    `caller_lines` are the lines the innermost function, method or closure around the call
+    starts on (its declaration, and its name when that differs), which is how the graph layer
+    finds the caller node. `refusal` is a fixed reason when the parser cannot vouch for the
+    site, and then `caller_lines` is empty.
+    """
+
+    source_file: str  # spelled as the corpus spells it
+    line: int
+    method: str
+    caller_lines: tuple[int, ...] = ()
+    refusal: str = ""
+
+
+@dataclass(frozen=True)
+class EngineCall:
+    """A `calls` edge graphify's engine bound by bare method name to a node in the caller's file.
+
+    The engine keeps one edge per (caller, target) and the FIRST site's line, so the edge may
+    stand for several `->method(` sites in the caller. `edge` is graphify's own dict, opaque
+    here, carried so the sink can take that exact object out of the list.
+    """
+
+    caller_nid: str
+    target_nid: str
+    method: str  # the target's bare name
+    source_file: str
+    source_location: str
+    caller_location: str  # where the caller starts, to find its body
+    edge: object = field(default=None, compare=False, repr=False)
+    # The graph proves the target a class method (a `method` edge, a `.m()` label). False for a
+    # dot-less node a file contains: a free function and an anonymous class's method look alike.
+    target_is_method: bool = False
+    target_location: str = ""  # where the target is declared, for a parser to tell which
+
+
+@dataclass(frozen=True)
+class CallerSites:
+    """What a parser read in one caller about calls of one name.
+
+    `lines`: every `->name(` and `?->name(` in the caller's span, nested callables included, as
+    {line: count}. `foreign`: lines among those where a member call of that name sits outside
+    the caller's own body yet inside the method a type engine files the caller's calls under.
+    `other_kinds`: a function or scoped call of that name sits in the caller's span.
+    """
+
+    lines: dict[int, int]
+    foreign: frozenset[int] = frozenset()
+    other_kinds: bool = False
+
+
+@dataclass(frozen=True)
+class MethodBoundCall:
+    """A `calls` edge graphify bound by name from a PHP line to a method node; not one of ours.
+
+    The shape a cross-file bare-name pass leaves when it case-folds `new Type(...)` onto a
+    method `type()`. `edge` is graphify's own dict, opaque here, as on `EngineCall`.
+    """
+
+    caller_nid: str
+    target_nid: str
+    method: str  # the target's bare name
+    source_file: str
+    source_location: str
+    edge: object = field(default=None, compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class NewSiteLine:
+    """What a parser read on one line about one name.
+
+    `creates`: a `new X(...)` whose class name's last segment is the name, case-insensitive,
+    starts on the line. `calls_name`: a member, nullsafe, scoped or function call of that name,
+    or one whose name is dynamic, sits on the line.
+    """
+
+    creates: bool
+    calls_name: bool
 
 
 @runtime_checkable

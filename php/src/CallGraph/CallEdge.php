@@ -27,6 +27,7 @@ final class CallEdge
         private readonly string $file,
         private readonly int $callPos,
         private readonly string $calleeFile,
+        private readonly string $callerFile = '',
     ) {
     }
 
@@ -50,10 +51,15 @@ final class CallEdge
     }
 
     /**
+     * `$contextFile` is the file the analyser was in. It is the body's file too, except for a
+     * trait body: the collector then names the trait's file, and the class's file is kept apart.
+     *
      * @param array<string, mixed> $raw
      */
-    public static function fromArray(array $raw, string $file): self
+    public static function fromArray(array $raw, string $contextFile): self
     {
+        $file = (string) ($raw['file'] ?? '');
+
         return new self(
             (string) ($raw['callerClass'] ?? ''),
             (string) ($raw['callerMethod'] ?? ''),
@@ -61,9 +67,10 @@ final class CallEdge
             (string) ($raw['calleeMethod'] ?? ''),
             (string) ($raw['calleeKind'] ?? self::RECEIVER_CLASS),
             (int) ($raw['line'] ?? 0),
-            $file,
+            $file !== '' ? $file : $contextFile,
             (int) ($raw['callPos'] ?? -1),
             (string) ($raw['calleeFile'] ?? ''),
+            $contextFile,
         );
     }
 
@@ -86,6 +93,9 @@ final class CallEdge
             // Where the declaring class lives, '' for a built-in. The consumer tells a vendor
             // class from a project class by this path, never by guessing from the namespace.
             'calleeFile' => $this->calleeFile,
+            // The file of the class the body was analysed in. Equal to `file` except for a trait
+            // body, which is analysed once per using class; a consumer must not place it there.
+            'callerFile' => $this->callerFile,
         ];
     }
 }

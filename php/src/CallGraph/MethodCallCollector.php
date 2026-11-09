@@ -27,6 +27,9 @@ use PHPStan\Type\UnionType;
  * A name-only fallback — matching `->get()` to any class owning a `get` — manufactures edges
  * that look identical to real ones, and a wrong edge is worse than a missing one.
  *
+ * A nullsafe `$x?->m()` needs no collector of its own: PHPStan hands this one a `MethodCall` for
+ * it too, with the receiver's type including `null`, whose arm has no class reflection and drops.
+ *
  * @implements Collector<MethodCall, list<array<string, mixed>>>
  */
 final class MethodCallCollector implements Collector
@@ -58,6 +61,21 @@ final class MethodCallCollector implements Collector
             return null;
         }
 
+        // A trait body is analysed once per using class, and the analyser's file is that class's
+        // file while the line is the trait's. The record names the trait's file and method, so
+        // file, line and method describe one body; the rule keeps the class's file as callerFile.
+        $file = '';
+
+        if ($scope->isInTrait()) {
+            $trait = $scope->getTraitReflection();
+            $callerMethod = $this->traitMethodName($callerClass, $trait, $callerMethod);
+            $file = (string) $trait->getFileName();
+
+            if ($callerMethod === null || $file === '') {
+                return null;
+            }
+        }
+
         $methodName = $node->name->toString();
         $receiverType = $scope->getType($node->var);
         $edges = [];
@@ -69,7 +87,7 @@ final class MethodCallCollector implements Collector
         $arms = $receiverType instanceof UnionType ? $receiverType->getTypes() : [$receiverType];
 
         foreach ($arms as $arm) {
-            foreach ($this->armEdges($arm, $methodName, $callerClass->getName(), $callerMethod, $node, $scope) as $record) {
+            foreach ($this->armEdges($arm, $methodName, $callerClass->getName(), $callerMethod, $file, $node, $scope) as $record) {
                 $edges[] = $record;
             }
         }
@@ -79,6 +97,32 @@ final class MethodCallCollector implements Collector
         }
 
         return $edges;
+    }
+
+    /**
+     * The name the trait itself gives the method being analysed, or null when it cannot be told.
+     *
+     * `use T { run as traitRun; }` analyses T's `run` under the name `traitRun`, which no
+     * declaration in the trait's file carries. An alias set by an intermediate trait is not in
+     * the class's alias table, so it is refused rather than guessed.
+     */
+    private function traitMethodName(ClassReflection $class, ClassReflection $trait, string $analysed): ?string
+    {
+        foreach ($class->getNativeReflection()->getTraitAliases() as $alias => $original) {
+            if (strcasecmp($alias, $analysed) !== 0) {
+                continue;
+            }
+
+            $parts = explode('::', $original, 2);
+
+            if (count($parts) !== 2 || strcasecmp(ltrim($parts[0], '\\'), $trait->getName()) !== 0) {
+                return null;
+            }
+
+            return $parts[1];
+        }
+
+        return $trait->hasNativeMethod($analysed) ? $analysed : null;
     }
 
     /**
@@ -96,6 +140,7 @@ final class MethodCallCollector implements Collector
         string $methodName,
         string $callerClass,
         string $callerMethod,
+        string $file,
         MethodCall $node,
         Scope $scope,
     ): array {
@@ -103,7 +148,7 @@ final class MethodCallCollector implements Collector
         $declaringClasses = [];
 
         foreach ($arm->getObjectClassReflections() as $receiver) {
-            $edge = $this->edgeTo($receiver, $methodName, $callerClass, $callerMethod, $node, $scope);
+            $edge = $this->edgeTo($receiver, $methodName, $callerClass, $callerMethod, $file, $node, $scope);
 
             if ($edge === null) {
                 continue;
@@ -129,6 +174,7 @@ final class MethodCallCollector implements Collector
         string $methodName,
         string $callerClass,
         string $callerMethod,
+        string $file,
         MethodCall $node,
         Scope $scope,
     ): ?CallEdge {
@@ -153,7 +199,7 @@ final class MethodCallCollector implements Collector
             $methodName,
             $declaring->isInterface(),
             $node->getStartLine(),
-            '',
+            $file,
             // The method name's token, not the expression's: in a chain `$a->get()->get()` every
             // link starts at `$a`, and the name is the one token each call owns alone.
             $node->name->getStartTokenPos(),

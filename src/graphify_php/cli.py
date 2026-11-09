@@ -28,6 +28,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -36,6 +37,7 @@ from pathlib import Path
 
 from . import shrink, shrink_cli, status
 from .config_resolver import RESOLVER_NAME as RESOLVER_NAME_CONFIG
+from .core_guard import RESOLVER_NAME as RESOLVER_NAME_CORE_GUARD
 from .resolver import RESOLVER_NAME, RESOLVER_NAME_ROUTES
 
 EXIT_OK = 0
@@ -171,13 +173,34 @@ def main(
         print(version_line())
         return EXIT_OK
     opts = _parser().parse_args(ours)
-    expected = opts.expect or [RESOLVER_NAME, RESOLVER_NAME_ROUTES, RESOLVER_NAME_CONFIG]
+    # The guard reports on every PHP build in every outcome, so its silence means core's PHP
+    # pass may have run unfiltered over sites graphify-php proved.
+    expected = opts.expect or [
+        RESOLVER_NAME,
+        RESOLVER_NAME_ROUTES,
+        RESOLVER_NAME_CONFIG,
+        RESOLVER_NAME_CORE_GUARD,
+    ]
     graph = opts.graph or default_graph_path()
+
+    if passthrough[:1] == ["update"] and "--force" not in passthrough:
+        # Incremental `update` feeds resolvers raw calls from changed files only (graphify
+        # extract.py: "raw_calls come solely from `paths`"), so unchanged callers keep stale
+        # edges. `--force` also waives graphify's shrink check; ours or graphify-mesh's judges.
+        passthrough = [*passthrough, "--force"]
+        print(
+            "graphify-php-build: running graphify update with --force: incremental update does "
+            "not re-resolve PHP calls from unchanged files",
+            file=sys.stderr,
+        )
 
     # A record from an earlier build would satisfy this build's gate, which is the one failure
     # the gate exists to catch. Start from nothing so silence stays visible as silence.
     record_path = status.status_path()
     record_path.unlink(missing_ok=True)
+    # The attribution sidecar is this build's record too: one left by an earlier build would
+    # explain loss this build never recorded.
+    shrink.attribution_path(record_path).unlink(missing_ok=True)
 
     backup = graph.with_suffix(graph.suffix + ".graphify-php-prev")
     had_previous = graph.exists()
@@ -205,6 +228,9 @@ def main(
         except Exception as exc:  # a record the gate cannot read is a record that proves nothing
             code, message = EXIT_RESOLVER_MISSING, f"status record unreadable: {exc}"
         if code == EXIT_OK:
+            # Before the shrink gate, and so before its managed skip: graphify-mesh runs the same
+            # check out of process and reads this file too.
+            write_attribution(status.read())
             return _shrink_gate(
                 graph,
                 backup if had_previous else None,
@@ -229,6 +255,94 @@ def main(
         for left in (backup, manifest_backup):
             if left.exists():
                 left.unlink(missing_ok=True)
+
+
+# Where each removal reason's rows come from: (resolver record, its row field).
+_ROW_SOURCES = (
+    (RESOLVER_NAME_CORE_GUARD, "suppressed_edge_rows", shrink.REASON_CORE_SUPPRESSED),
+    (RESOLVER_NAME, "engine_dropped_edges", shrink.REASON_ENGINE_CONTRADICTS),
+)
+
+
+def _row(entry: object, reason: str) -> dict | None:
+    """The sidecar row for a status row, or None when it cannot be attributed.
+
+    The reader ignores the whole sidecar on one malformed row, so a row is checked here: a
+    `proof.target` of None (the proved body has no node) can never be confirmed, and leaves.
+    """
+    if not isinstance(entry, dict) or entry.get("reason") != reason:
+        return None
+    proof = entry.get("proof")
+    if not isinstance(proof, dict):
+        return None
+    fields = [entry.get(k) for k in ("source", "target", "relation")]
+    cited = [proof.get("source"), proof.get("target")]
+    if not all(isinstance(v, str) and v for v in fields + cited) or cited[0] != fields[0]:
+        return None
+    source, target, relation = fields
+    return {
+        "source": source,
+        "target": target,
+        "relation": relation,
+        "reason": reason,
+        "proof": {"source": cited[0], "target": cited[1]},
+    }
+
+
+def attribution_document(record: dict) -> dict:
+    """The attribution sidecar (shrink.py, schema 1) for this build's status record.
+
+    Rows come only from a resolver that `completed`. `external_stubs` is the decision the
+    member-call record states. A record that states none gives "on", under which the guard
+    attributes no stub loss.
+    """
+    resolvers = {r.get("name"): r for r in (record.get("resolvers") or []) if isinstance(r, dict)}
+    rows: list[dict] = []
+    seen: set[tuple] = set()
+    for name, key, reason in _ROW_SOURCES:
+        entry = resolvers.get(name) or {}
+        if entry.get("state") != "completed" or not isinstance(entry.get(key), list):
+            continue
+        for row in (_row(e, reason) for e in entry[key]):
+            ident = row and (row["source"], row["target"], row["relation"], reason)
+            if row is not None and ident not in seen:
+                seen.add(ident)
+                rows.append(row)
+    stubs = (resolvers.get(RESOLVER_NAME) or {}).get("external_stubs")
+    if stubs not in (shrink.STUBS_ON, shrink.STUBS_OFF):
+        stubs = shrink.STUBS_ON
+    return {
+        "schema": shrink.ATTRIBUTION_SCHEMA,
+        "producer": shrink.ATTRIBUTION_PRODUCER,
+        "external_stubs": stubs,
+        "removed_edges": rows,
+        "counts": {r: sum(row["reason"] == r for row in rows) for r in shrink.REMOVAL_REASONS},
+    }
+
+
+def write_attribution(record: dict) -> Path | None:
+    """Write the sidecar next to the status record, atomically. Never fails the build.
+
+    No sidecar only makes the shrink guard stricter, so a write that fails is reported and the
+    build goes on to the guard.
+    """
+    path = shrink.attribution_path(status.status_path())
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(attribution_document(record), indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+    except Exception as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(
+            f"graphify-php-build: attribution sidecar not written ({type(exc).__name__}: "
+            f"{exc}); the shrink guard attributes no loss",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _restore_manifest(manifest: Path, manifest_backup: Path | None) -> None:
@@ -276,6 +390,9 @@ def _shrink_gate(
         policy = shrink.POLICY_COUNT
 
     try:
+        attribution, attribution_note = shrink.read_attribution(
+            shrink.attribution_path(status.status_path())
+        )
         report = shrink.classify_loss(
             shrink_cli.load_json(graph_backup, missing_ok=False),
             shrink_cli.load_json(graph, missing_ok=False),
@@ -284,7 +401,10 @@ def _shrink_gate(
             Path(repo_root_from(passthrough)),
             policy=policy,
             tolerance=shrink_cli.env_tolerance(),
+            attribution=attribution,
         )
+        if attribution_note:
+            report.reasons.append(attribution_note)
         verdict = report.verdict
         summary = (
             f"shrink guard ({policy}) refused: nodes {report.nodes['old']} -> "

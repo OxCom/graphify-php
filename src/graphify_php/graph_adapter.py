@@ -18,9 +18,11 @@ The schema this is written against, read from a real build of the reference appl
 from __future__ import annotations
 
 import hashlib
+import inspect
+import os
 import re
 
-from .ports import CallTarget, Confidence
+from .ports import CallTarget, Confidence, EngineCall, MethodBoundCall
 
 # The marker this package stamps on every edge it adds, so a reader can select ours, count them,
 # or drop them from a published graph without re-running the build.
@@ -64,6 +66,34 @@ def _tail_overlap(a: list[str], b: list[str]) -> int:
             break
         count += 1
     return count
+
+
+_LINE = re.compile(r"\d+")
+
+
+def _line(location: object) -> int | None:
+    """The line in graphify's `L10` location, or None."""
+    found = _LINE.search(str(location or ""))
+    return int(found.group()) if found else None
+
+
+def _name(node: dict) -> str:
+    # `.format()` on a class method, `format()` on one whose class node was lost.
+    return str(node.get("label", "")).strip(". ()")
+
+
+def _real(path: str, repo_root: str) -> str:
+    """One spelling per file: graphify's absolute build paths, PHPStan's, a relative one."""
+    return os.path.realpath(path if os.path.isabs(path) else os.path.join(repo_root, path))
+
+
+# A class method's label: `.format()`. A function or an anonymous class's method has no dot.
+_DOTTED_METHOD = re.compile(r"^\.[A-Za-z_\x80-\uffff][A-Za-z0-9_\x80-\uffff]*\(\)$")
+
+
+def _is_closure(node: dict) -> bool:
+    # graphify labels closures and arrow functions `{closure#N}()`.
+    return str(node.get("label", "")).startswith("{closure")
 
 
 class GraphNodeIndex:
@@ -141,6 +171,19 @@ class GraphNodeIndex:
             if edge.get("relation") in ("imports", "imports_from"):
                 self._imported_by.setdefault(edge.get("source"), set()).add(edge.get("target"))
 
+        # `mixes_in` runs from the using class to the trait, so this maps a trait to its users.
+        self._node_by_id = node_by_id
+        self._mixed_into: dict[str, list[str]] = {}
+        for edge in all_edges:
+            trait, user = edge.get("target"), edge.get("source")
+            if edge.get("relation") == "mixes_in" and trait and user:
+                self._mixed_into.setdefault(trait, []).append(user)
+        # Built on first use: the route pass builds this index too and never asks.
+        self._callables_by_file: dict[str, list[tuple[int | None, str]]] | None = None
+        # The same, keyed by real path, for a caller named by a parser's file spelling.
+        self._callables_by_real: dict[str, list[tuple[int | None, str]]] | None = None
+        self._caller_scopes: dict[str, tuple[str, ...]] = {}
+
     def method_node(self, class_fqn: str, method: str) -> str | None:
         class_node = self._class_node(class_fqn)
         if class_node is None:
@@ -181,6 +224,57 @@ class GraphNodeIndex:
         if chosen is None:
             return None
         return self._methods.get((chosen["id"], _key(method)))
+
+    def proved_node_for(
+        self, caller_nid: str, target: CallTarget, repo_root: str = "."
+    ) -> str | None:
+        """The method node holding a proved target's body, or None.
+
+        `method_node_for` lets visibility pick among same-named classes, so a proof of
+        `Vendor\\Lib\\Cache::get` binds to a project `Cache` declared in the caller's own file.
+        A proof that names its declaring file is bound in that file only: the one class of that
+        short name there, and its method of that name. A proof of a class no parsed file
+        declares binds nothing. A proof without a file has nothing to check against and keeps
+        the visibility lookup.
+        """
+        if target.outside_corpus:
+            return None
+        if not target.declaring_file:
+            return self.method_node_for(caller_nid, target.class_fqn, target.method)
+        parts = _fqn_parts(target.class_fqn)
+        if not parts:
+            return None
+        here = _real(target.declaring_file, repo_root)
+        in_file = [
+            c
+            for c in self._classes_by_name.get(_key(parts[-1]), [])
+            if _real(str(c.get("source_file") or ""), repo_root) == here
+        ]
+        if len(in_file) != 1:
+            return None
+        return self._methods.get((in_file[0]["id"], _key(target.method)))
+
+    def callable_at(
+        self, source_file: str, lines: tuple[int, ...], repo_root: str = "."
+    ) -> str | None:
+        """The one callable node of that file starting on one of `lines`, else None.
+
+        A parser names a call's innermost function, method or closure by where it starts; the
+        graph carries the same start line on each callable node. Two nodes on those lines (a
+        one-line class, nested closures) cannot be told apart, so neither is the answer.
+        """
+        if self._callables_by_real is None:
+            self._callables_by_real = {}
+            for path, found in self._callables().items():
+                if path:
+                    self._callables_by_real.setdefault(_real(path, repo_root), []).extend(found)
+        wanted = set(lines)
+        matched = [
+            nid
+            for start, nid in self._callables_by_real.get(_real(source_file, repo_root), ())
+            if start in wanted
+        ]
+        return matched[0] if len(matched) == 1 else None
 
     @staticmethod
     def _outscored(chosen: dict, candidates: list[dict], namespace: list[str]) -> bool:
@@ -223,9 +317,273 @@ class GraphNodeIndex:
             return None
         return self._methods.get((chosen["id"], _key(method)))
 
+    def engine_calls(self, all_edges: list[dict]) -> list[EngineCall]:
+        """`calls` edges graphify's engine bound by bare name to a node in the caller's file.
+
+        The engine writes them with no score and no marker (`extractors/engine.py`, the
+        `seen_call_pairs` block); graphify's other passes score theirs and ours carry
+        `EDGE_MARKER`. The target is recognised by its node and file, never by label shape: an
+        anonymous class's method is labelled `getData()`, without the dot. A free function
+        carries the same schema (contained by its file, no dot, no `method` edge), so such a
+        target is listed with `target_is_method` False for a parser to settle.
+        """
+        found: list[EngineCall] = []
+        for edge in all_edges:
+            if edge.get("relation") != "calls" or EDGE_MARKER in edge:
+                continue
+            if "confidence_score" in edge:
+                continue
+            path = str(edge.get("source_file") or "")
+            if not path.endswith(".php"):
+                continue
+            caller = self._node_by_id.get(edge.get("source"))
+            target = self._node_by_id.get(edge.get("target"))
+            if caller is None or target is None or target.get("_callable_class"):
+                continue
+            if str(target.get("source_file") or "") != path or _is_closure(target):
+                continue
+            method = _name(target)
+            if not method:
+                continue
+            found.append(
+                EngineCall(
+                    caller_nid=caller["id"],
+                    target_nid=target["id"],
+                    method=method,
+                    source_file=path,
+                    source_location=str(edge.get("source_location") or ""),
+                    caller_location=str(caller.get("source_location") or ""),
+                    edge=edge,
+                    target_is_method=self.is_method_node(target["id"]),
+                    target_location=str(target.get("source_location") or ""),
+                )
+            )
+        return found
+
+    def is_method_node(self, nid: str) -> bool:
+        """Whether `nid` is a class's method: a `method` edge owns it, or it is labelled `.m()`.
+
+        Never a class node. An anonymous class's method (`getData()`, no dot, no `method`
+        edge) cannot be told from a function and is not one.
+        """
+        node = self._node_by_id.get(nid)
+        if node is None or node.get("_callable_class") or _is_closure(node):
+            return False
+        return nid in self._owner_of or bool(_DOTTED_METHOD.match(str(node.get("label", ""))))
+
+    def method_bound_calls(self, all_edges: list[dict]) -> list[MethodBoundCall]:
+        """`calls` edges from PHP lines to a method node, written by graphify and not by us."""
+        found: list[MethodBoundCall] = []
+        for edge in all_edges:
+            if edge.get("relation") != "calls" or EDGE_MARKER in edge:
+                continue
+            path = str(edge.get("source_file") or "")
+            if not path.endswith(".php"):
+                continue
+            source, target = edge.get("source"), edge.get("target")
+            if not isinstance(source, str) or not isinstance(target, str):
+                continue
+            if not self.is_method_node(target):
+                continue
+            method = _name(self._node_by_id[target])
+            if not method:
+                continue
+            found.append(
+                MethodBoundCall(
+                    caller_nid=source,
+                    target_nid=target,
+                    method=method,
+                    source_file=path,
+                    source_location=str(edge.get("source_location") or ""),
+                    edge=edge,
+                )
+            )
+        return found
+
+    def names_node(self, target_nid: str, target: CallTarget, repo_root: str = ".") -> bool | None:
+        """Whether a proved target is the body `target_nid` is, by file and class.
+
+        False when the proof's body is in another file, or is another class's method in the
+        same file. None when that cannot be told: no declaring file, or no single class of
+        that short name in the file (`class@anonymous`, two namespaces sharing one name).
+        """
+        node = self._node_by_id.get(target_nid)
+        if node is None or not target.declaring_file or not node.get("source_file"):
+            return None
+        here = _real(str(node["source_file"]), repo_root)
+        if _real(target.declaring_file, repo_root) != here:
+            return False
+        parts = _fqn_parts(target.class_fqn)
+        if not parts:
+            return None
+        in_file = [
+            c
+            for c in self._classes_by_name.get(_key(parts[-1]), [])
+            if _real(str(c.get("source_file") or ""), repo_root) == here
+        ]
+        if len(in_file) != 1:
+            return None
+        method_nid = self._methods.get((in_file[0]["id"], _key(target.method)))
+        if method_nid is None:
+            return None
+        return method_nid == target_nid
+
+    def method_missing_in_declaring_file(self, target: CallTarget, repo_root: str = ".") -> bool:
+        """Whether the proof's declaring file holds its class and no method node of that name.
+
+        The shape of a method a docblock `@method` or `__call` provides: the type engine names
+        the class, the graph has the class and no node for the body. Never True for a proof
+        without a file or with two classes of that short name in the file.
+        """
+        parts = _fqn_parts(target.class_fqn)
+        if not parts or not target.declaring_file:
+            return False
+        here = _real(target.declaring_file, repo_root)
+        in_file = [
+            c
+            for c in self._classes_by_name.get(_key(parts[-1]), [])
+            if _real(str(c.get("source_file") or ""), repo_root) == here
+        ]
+        return len(in_file) == 1 and (in_file[0]["id"], _key(target.method)) not in self._methods
+
+    def closure_starts_on(self, caller_nid: str, source_location: str) -> bool:
+        """Whether the caller is a closure starting on this line.
+
+        A type engine files a closure's calls under the method around it, so the method's own
+        calls on the closure's first line arrive with the same caller and cannot be told apart.
+        """
+        node = self._node_by_id.get(caller_nid)
+        line = _line(source_location)
+        return (
+            node is not None
+            and _is_closure(node)
+            and line is not None
+            and _line(node.get("source_location")) == line
+        )
+
     def owner_class(self, method_nid: str) -> str | None:
         """The class node a method node hangs off, by its `method` edge."""
         return self._owner_of.get(method_nid)
+
+    def caller_scope(self, caller_nid: str) -> tuple[str, ...]:
+        """`Class::method` spellings a type engine may report for a call inside this caller.
+
+        PHPStan names the class it analysed the body in, so a trait method is reported under
+        each class using it and a closure under the method it sits in. `()` means no class
+        method can be named, and a source matching on file and line must then refuse.
+        """
+        found = self._caller_scopes.get(caller_nid)
+        if found is None:
+            found = self._scope_of(caller_nid)
+            self._caller_scopes[caller_nid] = found
+        return found
+
+    def _scope_of(self, caller_nid: str) -> tuple[str, ...]:
+        node = self._node_by_id.get(caller_nid)
+        if node is None:
+            return ()
+        method_nid = self._enclosing_callable(node) if _is_closure(node) else caller_nid
+        if method_nid is None:
+            return ()
+        method = _name(self._node_by_id[method_nid])
+        owner = self._owner_of.get(method_nid)
+        if owner is None:
+            # A class lost to a parse error, an anonymous class's method: the graph cannot name
+            # the class, so the method goes alone and the source must prove the class.
+            return (f"::{method}",) if method and self._name_unique_in_file(method_nid) else ()
+        if self._short_name_shared_in_file(owner):
+            # `A\Foo` and `B\Foo` in one file both label `Foo`; a record cannot be told apart.
+            return ()
+        return tuple(f"{label}::{method}" for label in self._class_and_users(owner))
+
+    def _callables(self) -> dict[str, list[tuple[int | None, str]]]:
+        """Every callable but a class, per file, with its start line (None when unknown)."""
+        if self._callables_by_file is None:
+            self._callables_by_file = {}
+            for nid, node in self._node_by_id.items():
+                if not node.get("_callable") or node.get("_callable_class"):
+                    continue
+                path = str(node.get("source_file") or "")
+                start = _line(node.get("source_location"))
+                self._callables_by_file.setdefault(path, []).append((start, nid))
+        return self._callables_by_file
+
+    def _name_unique_in_file(self, nid: str) -> bool:
+        node = self._node_by_id[nid]
+        key = _key(_name(node))
+        same = [
+            other
+            for _start, other in self._callables().get(str(node.get("source_file") or ""), ())
+            if _key(_name(self._node_by_id[other])) == key
+        ]
+        return same == [nid]
+
+    def _short_name_shared_in_file(self, class_nid: str) -> bool:
+        node = self._node_by_id.get(class_nid, {})
+        home = self._file_of.get(class_nid)
+        return any(
+            other["id"] != class_nid and self._file_of.get(other["id"]) == home
+            for other in self._classes_by_name.get(_key(node.get("label", "")), ())
+        )
+
+    def _enclosing_callable(self, closure: dict) -> str | None:
+        """The nearest non-closure callable starting at or above the closure, in its file.
+
+        graphify links a closure to its file only. A closure outside every method body gets no
+        PHPStan record at all, so the nearest method is the one a record can name; a tie is
+        refused, and so is a line one callable may end on and the next starts on.
+        """
+        line = _line(closure.get("source_location"))
+        if line is None:
+            return None
+        above = [
+            (start, nid)
+            for start, nid in self._callables().get(str(closure.get("source_file") or ""), ())
+            if start is not None and start <= line and not _is_closure(self._node_by_id[nid])
+        ]
+        if not above:
+            return None
+        nearest = max(start for start, _ in above)
+        at_nearest = [nid for start, nid in above if start == nearest]
+        if len(at_nearest) != 1:
+            return None
+        if nearest == line and len(above) > 1:
+            # The graph carries no end lines: `} public function b() { fn () => ...` may be
+            # the last line of the method above as well as the first of `b`.
+            return None
+        return at_nearest[0]
+
+    def caller_owns_line(self, caller_nid: str, source_location: str) -> bool:
+        """Whether a call on this line placed in the caller's method is in the caller's body.
+
+        True only when no other callable starts between the caller's first line and this one.
+        A closure nested in the caller, or a neighbour on a one-line class, would start there,
+        and a type engine names the same enclosing method for all of them.
+        """
+        node = self._node_by_id.get(caller_nid)
+        line = _line(source_location)
+        start = _line(node.get("source_location")) if node is not None else None
+        if node is None or line is None or start is None or start > line:
+            return False
+        return not any(
+            other != caller_nid and (begins is None or start <= begins <= line)
+            for begins, other in self._callables().get(str(node.get("source_file") or ""), ())
+        )
+
+    def _class_and_users(self, owner: str) -> list[str]:
+        """The owner's label, then every class reaching it through `mixes_in`, transitively."""
+        order, seen = [owner], {owner}
+        for current in order:
+            for user in self._mixed_into.get(current, ()):
+                if user not in seen:
+                    seen.add(user)
+                    order.append(user)
+        labels: list[str] = []
+        for nid in order:
+            label = str(self._node_by_id.get(nid, {}).get("label", ""))
+            if label and label not in labels:
+                labels.append(label)
+        return labels
 
     def scope_methods(self, caller_nid: str, scope: str) -> list[str]:
         """Method names a scoped call `<scope>::?()` from this caller could be naming.
@@ -359,6 +717,94 @@ class GraphEdgeSink:
             edge["_refines"] = owner
         self._all_edges.append(edge)
         self.added += 1
+
+    def remove_edges(self, edges: list) -> int:
+        """Take these exact edge objects out of the list, in place, and say how many went.
+
+        Slice assignment, so whoever holds the list sees the removal. Matched by identity: two
+        equal dicts are two edges, and only the one handed over is meant.
+        """
+        doomed = {id(edge) for edge in edges}
+        kept = [edge for edge in self._all_edges if id(edge) not in doomed]
+        removed = len(self._all_edges) - len(kept)
+        if removed:
+            self._all_edges[:] = kept
+            self._pairs = {(e.get("source"), e.get("target")) for e in kept}
+            self._class_calls = {
+                (e.get("source"), e.get("target")) for e in kept if e.get("relation") == "calls"
+            }
+        return removed
+
+
+def holds_build_edges(all_edges: list) -> bool:
+    """Whether `all_edges` is the list graphify's build keeps, not a scratch copy of it.
+
+    A full build hands resolvers its own list (extract.py, `run_language_resolvers(paths,
+    per_file, all_nodes, all_edges)`). An incremental one hands a copy with the unchanged
+    corpus appended and keeps only the copy's tail, so a removal there is silently lost. The
+    only proof available is the driver's caller holding this same object as `all_edges`;
+    anything else, a test harness included, answers False.
+    """
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            if (
+                frame.f_code.co_name == "run_language_resolvers"
+                and frame.f_globals.get("__name__") == "graphify.resolver_registry"
+            ):
+                caller = frame.f_back
+                return caller is not None and caller.f_locals.get("all_edges") is all_edges
+            frame = frame.f_back
+        return False
+    finally:
+        del frame
+
+
+def _method_key(label: object) -> str:
+    # The key core matches a callee by: `.get()` -> `get`, case-insensitive like PHP.
+    return str(label or "").strip().removeprefix(".").removesuffix("()").lower()
+
+
+class SiteProofs:
+    """graphify-php `calls` edges by the site they prove: (caller, location, method key).
+
+    A method target is named by its node label; a vendor stub target by `_external_target`
+    (`Class::method`). Two proofs at one site (a union receiver) keep the smallest target id,
+    so the choice does not depend on edge order. Core's withheld edges are matched against it.
+    """
+
+    def __init__(self, all_nodes: list[dict], all_edges: list[dict]) -> None:
+        self._label = {n.get("id"): n.get("label") for n in all_nodes if isinstance(n, dict)}
+        self._index: dict[tuple, str] = {}
+        for edge in all_edges:
+            if edge.get(EDGE_MARKER) != EDGE_ORIGIN or edge.get("relation") != "calls":
+                continue
+            source, target = edge.get("source"), edge.get("target")
+            if (
+                not isinstance(source, str)
+                or not isinstance(target, str)
+                or not source
+                or not target
+            ):
+                continue
+            external = edge.get("_external_target")
+            name = str(external).rsplit("::", 1)[-1] if external else self._label.get(target)
+            key = (source, str(edge.get("source_location") or ""), _method_key(name))
+            if key not in self._index or target < self._index[key]:
+                self._index[key] = target
+
+    def proof_for(self, edge: dict) -> tuple[str, str, str, str] | None:
+        """(source, target, relation, proof target) when one of our edges proves `edge`'s site.
+
+        Matched on the same caller, location and method name. None without a proof, or when
+        `edge` has no usable target.
+        """
+        source, target = edge.get("source"), edge.get("target")
+        key = (source, str(edge.get("source_location") or ""), _method_key(self._label.get(target)))
+        proof = self._index.get(key)
+        if proof is None or not isinstance(target, str) or not target:
+            return None
+        return source, target, str(edge.get("relation") or "calls"), proof
 
 
 STUB_ID_PREFIX = "php_external_"

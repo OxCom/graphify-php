@@ -30,8 +30,10 @@ graphify_php.register()
 ```
 
 `register()` adds three resolvers to graphify's resolver registry: `php_member_calls`,
-`php_routes` and `php_symfony_config`. It is idempotent by name. It imports graphify lazily, so
-importing the package never requires graphify.
+`php_routes` and `php_symfony_config`. It also replaces graphify core's own `php_member_calls`
+entry with a filter that withholds the call sites graphify-php proved and reports as
+`php_core_guard`. It is idempotent. It imports graphify lazily, so importing the package never
+requires graphify.
 
 `graphify-php-build` calls `register()` for you. Call it yourself only when you drive graphify
 from your own Python code.

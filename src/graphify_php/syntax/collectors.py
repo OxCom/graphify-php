@@ -15,6 +15,8 @@ The four here, in the precedence they settle conflicts by (lowest number wins):
    constructor declares `Emails $x`. The case pure declaration reading misses; it predates
    promoted properties, so it is common in older code rather than exotic.
 4. `new` bindings for locals — `$mailer = new Emails();`.
+5. Typed parameters of a method — `run(Emails $m)`, bound as a local of that method. Ranked
+   last on purpose: a later write to the parameter must be able to revoke it (see the class).
 
 Docblocks are not read at all in this version. A `@var` that contradicts a native type is a
 bug in the code, and resolving one correctly needs scope tracking these collectors do not do.
@@ -33,6 +35,7 @@ from .facts import TypeFact
 # refusal decided at the call site cannot drift into two spellings of the same thing.
 UNION_TYPE = "union-type"
 REASSIGNED_LOCAL = "reassigned-local"
+VARIABLE_VARIABLES = "variable-variables"
 
 
 @dataclass
@@ -266,6 +269,45 @@ class LocalConstructionCollector:
         ctx.method.record_local(local, _fact(self, ctx.names.resolve(created)))
 
 
+class TypedParameterCollector:
+    """`run(Emails $m) { $m->send(); }`: a method's own typed parameter binds the local.
+
+    Registered on the method declaration rather than on `formal_parameters`, for the same
+    reason as the constructor-assignment collector: a closure's parameter list is also a
+    `formal_parameters` node, and the scope it binds in is the closure's, which has no scope
+    of its own here. A closure's or arrow function's parameters are therefore never bound; they
+    only revoke, through `LocalRebindCollector`, so a method parameter shadowed by a closure
+    parameter of another type is refused rather than kept.
+
+    Promoted parameters are left to `PromotedParameterCollector`, and a variadic one is an
+    array inside the method, which owns no methods.
+
+    Ranked BELOW the `new` binding although it is a declaration: `MethodScope.refuse_local`
+    keeps a fact of strictly stronger rank, and a parameter written again inside the body must
+    lose its declared type exactly as a `new` binding loses its own. The confidence stays
+    EXTRACTED because the type is written in the signature.
+    """
+
+    node_kind = "method_declaration"
+    via = "typed-parameter"
+    confidence = Confidence.EXTRACTED
+    precedence = 50
+
+    def collect(self, node, ctx: ScanContext) -> None:
+        if ctx.method is None:
+            return
+        params = nodes.child(node, "formal_parameters")
+        for param in nodes.children(params, "simple_parameter"):
+            name = nodes.variable_of(param)
+            if not name or name == "this":
+                continue
+            fqn, members, refusal = _declared_type(self, param, ctx)
+            if refusal:
+                ctx.method.refuse_local(name, refusal, self.precedence)
+            elif fqn or members:
+                ctx.method.record_local(name, _fact(self, fqn or "", members))
+
+
 class LocalRebindCollector:
     """A construct that binds a local without an `=`: it revokes a `new` binding all the same.
 
@@ -327,17 +369,126 @@ def _bound_names(node) -> list[str]:
     return names
 
 
+class LocalWriteCollector:
+    """A write to a local that is not `$x = ...`, one instance per grammar node kind.
+
+    `$x ??= ...` and `$x .= ...` (`augmented_assignment_expression`), `$x++` (`update_expression`),
+    `$x = &$y` (`reference_assignment_expression`, both sides: the alias writes through),
+    `global $x`, `static $x` (`function_static_declaration`) and `unset($x)`. Each one makes the
+    earlier type of the name unreliable, so they revoke exactly as a second `=` does.
+    """
+
+    via = "rebinding"
+    confidence = Confidence.INFERRED
+    precedence = LocalConstructionCollector.precedence
+
+    def __init__(self, node_kind: str) -> None:
+        self.node_kind = node_kind
+
+    def collect(self, node, ctx: ScanContext) -> None:
+        if ctx.method is None:
+            return
+        for name in self._targets(node):
+            ctx.method.note_write(name, REASSIGNED_LOCAL, self.precedence)
+
+    def _targets(self, node) -> list[str]:
+        if node.type == "function_static_declaration":
+            holders = nodes.children(node, "static_variable_declaration")
+            variables = [v for h in holders for v in nodes.children(h, "variable_name")[:1]]
+        elif node.type == "augmented_assignment_expression":
+            variables = nodes.children(node, "variable_name")[:1]
+        else:
+            # update, reference assignment (both sides), global, unset
+            variables = nodes.children(node, "variable_name")
+        names = [nodes.node_text(v).lstrip("$") for v in variables]
+        return [n for n in names if n and n != "this"]
+
+
+class DynamicVariableCollector:
+    """`$$n = 1;`, `${'x'} = 1;`: a write to a local whose name is computed.
+
+    Any local of the method may be the target, so all of them are refused. A
+    `dynamic_variable_name` that is only read (`$a = $$n;`) writes nothing and is left alone.
+    """
+
+    node_kind = "dynamic_variable_name"
+    via = "rebinding"
+    confidence = Confidence.INFERRED
+    precedence = LocalConstructionCollector.precedence
+
+    _WRITE_PARENTS = (
+        "assignment_expression",
+        "augmented_assignment_expression",
+        "reference_assignment_expression",
+    )
+    _TARGET_PARENTS = ("foreach_statement", "by_ref", "pair", "list_literal")
+
+    def collect(self, node, ctx: ScanContext) -> None:
+        if ctx.method is None:
+            return
+        parent = node.parent
+        if parent is None:
+            return
+        if parent.type == "update_expression" or parent.type in self._TARGET_PARENTS:
+            ctx.method.revoke_all(VARIABLE_VARIABLES)
+        elif parent.type in self._WRITE_PARENTS and parent.children[0].id == node.id:
+            ctx.method.revoke_all(VARIABLE_VARIABLES)
+
+
+class ImplicitLocalWriteCollector:
+    """`extract($arr)` and `parse_str($s)` create or overwrite locals by computed name.
+
+    Only a call to the global function counts; `$this->extract()` and `Util::extract()` are
+    other node kinds. `extract` revokes every local whatever its arguments, `parse_str` only in
+    its one-argument form. With two arguments `parse_str` writes just the second, a variable.
+    """
+
+    node_kind = "function_call_expression"
+    via = "rebinding"
+    confidence = Confidence.INFERRED
+    precedence = LocalConstructionCollector.precedence
+
+    def collect(self, node, ctx: ScanContext) -> None:
+        if ctx.method is None:
+            return
+        callee = nodes.child(node, "name", "qualified_name")
+        if callee is None:
+            return
+        function = nodes.node_text(callee).lstrip("\\").lower()
+        args = nodes.children(nodes.child(node, "arguments"), "argument")
+        if function == "extract":
+            ctx.method.revoke_all(VARIABLE_VARIABLES)
+        elif function == "parse_str":
+            if len(args) == 1:
+                ctx.method.revoke_all(VARIABLE_VARIABLES)
+            elif len(args) >= 2:
+                target = nodes.child(args[1], "variable_name")
+                if target is not None:
+                    name = nodes.node_text(target).lstrip("$")
+                    if name and name != "this":
+                        ctx.method.note_write(name, REASSIGNED_LOCAL, self.precedence)
+
+
 # The registry. Adding a type source means adding a class above and one entry here.
 COLLECTORS: list[TypeCollector] = [
     PromotedParameterCollector(),
     TypedPropertyCollector(),
     ConstructorAssignmentCollector(),
     LocalConstructionCollector(),
+    TypedParameterCollector(),
     LocalRebindCollector("formal_parameters"),
     LocalRebindCollector("anonymous_function_use_clause"),
     LocalRebindCollector("foreach_statement"),
     LocalRebindCollector("catch_clause"),
     LocalRebindCollector("list_literal"),
+    LocalWriteCollector("augmented_assignment_expression"),
+    LocalWriteCollector("update_expression"),
+    LocalWriteCollector("reference_assignment_expression"),
+    LocalWriteCollector("global_declaration"),
+    LocalWriteCollector("function_static_declaration"),
+    LocalWriteCollector("unset_statement"),
+    DynamicVariableCollector(),
+    ImplicitLocalWriteCollector(),
 ]
 
 

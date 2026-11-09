@@ -52,7 +52,7 @@ shared namespace would break when graphify adds a flag the wrapper already uses.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--graph PATH` | `$GRAPHIFY_OUT/graph.json` | Graph artifact to protect |
-| `--expect RESOLVER` | `php_member_calls`, `php_routes`, `php_symfony_config` | Resolver that must report. Repeatable. Any `--expect` replaces the whole default list |
+| `--expect RESOLVER` | `php_member_calls`, `php_routes`, `php_symfony_config`, `php_core_guard` | Resolver that must report. Repeatable. Any `--expect` replaces the whole default list |
 | `-h`, `--help` | | Print help. Works without graphify installed |
 
 ## Exit codes
@@ -92,7 +92,57 @@ the second of three resolvers still leaves the first two on disk. An entry holds
 Counters always carry the denominator. "Resolved 400 calls" means nothing without "out of how
 many", and a regression that halves coverage still produces a large number.
 
+The member-call record (`php_member_calls`) adds these fields:
+
+| Field | Meaning |
+|---|---|
+| `unsent_calls_added` | Edges added for member calls graphify never sent. Not part of `resolved_sites` |
+| `nullsafe_sites_total`, `nullsafe_calls_added` | `?->` calls a parser found, and how many got a target into the graph |
+| `engine_sites_total` | Edges graphify's engine bound by bare name inside the caller's file (the denominator) |
+| `engine_contradicted`, `engine_dropped`, `engine_dropped_interface` | Edges a PHPStan record contradicted, edges dropped, and drops that rested on an interface target |
+| `engine_proved_added` | Proved edges added in place of the dropped ones |
+| `engine_kept` | Reason to count for each edge kept. Dropped plus kept equals the total |
+| `engine_dropped_edges` | One row per dropped edge: `source`, `target`, `relation`, `reason`, `proof` |
+| `new_site_edges_total`, `new_site_edges_dropped`, `new_site_kept` | Edges graphify's cross-file pass bound from `new X(...)` to a method of that name, how many were dropped, and the reasons for the rest |
+| `new_site_dropped_edges` | One row per dropped edge. Audit only, not in the sidecar |
+| `external_stubs` | `on` or `off`, the stub decision of this build |
+
+The engine and `new X(...)` passes remove edges only on a full build, where graphify hands over
+its own edge list. On an incremental build they remove and add nothing. `unresolved` also carries
+`engine:`-prefixed and `nullsafe:`-prefixed reasons for sites the passes refused.
+
+The `php_core_guard` record adds `core_sites_total`, `suppressed_sites`, `proved_not_found`,
+`suppressed_edges` (edges core's dry run would have added at proved sites),
+`suppressed_edges_listed`, `suppressed_unlisted` (reason to count), `suppressed_edge_rows` and
+`dry_run_seconds`.
+
 The unit of an `unresolved` count depends on the reason. Source reasons count sites. `probe:`
 reasons count candidate names. `scoped_method_*` reasons count scoped groups. The graph-lookup
 reasons `target_not_in_graph` and `self_call` count target records, so a two-arm site can appear
 twice.
+
+## Attribution sidecar
+
+After the resolver gate passes, `graphify-php-build` writes `.graphify-php-attribution.json` next
+to the status record (the same directory, so `GRAPHIFY_PHP_STATUS` moves both). It lists the edges
+this package removed on purpose: core edges withheld at a proved site
+(`core-suppressed-at-proved-site`) and engine edges a proof contradicts
+(`engine-contradicts-proof`). Each row has `source`, `target`, `relation`, `reason` and the proof
+edge. It also records `external_stubs`. The schema is in the `src/graphify_php/shrink.py`
+docstring. A sidecar left by an earlier build is deleted before the build starts. A write that
+fails is reported on stderr and never fails the build.
+
+The shrink guard counts a lost edge as attributed only when the new graph confirms the proof edge,
+and caps each reason at its count. A missing or malformed sidecar attributes nothing, so the
+guard is stricter, not looser.
+
+## Shrink check
+
+```bash
+graphify-shrink-check --old-graph P --new-graph P --old-manifest P --new-manifest P --root DIR \
+  [--policy NAME] [--tolerance X] [--producer-changed] [--attribution PATH]
+```
+
+`--attribution PATH` points at the sidecar. Without it nothing is attributed. The JSON report
+gains `attributed` (reason to count) and `attributed_total`, and
+`lost = explained + unexplained + resolver_lost + attributed_total` for edges.

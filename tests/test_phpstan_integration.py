@@ -274,6 +274,55 @@ def test_a_trait_method_is_recorded_against_the_trait_that_holds_its_body(projec
     ]
 
 
+TRAIT_USERS_PHP = {
+    "Bar.php": "<?php\nnamespace App;\nclass Bar { public function make(): int { return 1; } }\n",
+    "T.php": (
+        "<?php\nnamespace App;\n\ntrait T\n{\n    private Bar $bar;\n\n"
+        "    public function run(): int\n    {\n        return $this->bar->make();\n    }\n}\n"
+    ),
+    "Plain.php": "<?php\nnamespace App;\nclass Plain { use T; }\n",
+    "Alias.php": (
+        "<?php\nnamespace App;\nclass Alias\n{\n    use T { run as traitRun; }\n\n"
+        "    public function run(): int { return 2; }\n}\n"
+    ),
+    "Over.php": (
+        "<?php\nnamespace App;\nclass Over\n{\n    use T;\n\n"
+        "    public function run(): int { return 3; }\n}\n"
+    ),
+}
+
+
+def test_a_trait_body_is_recorded_in_the_trait_file_under_each_using_class(project, tmp_path):
+    """The analyser hands the collector the using class's file for a trait body, while the line
+    is the trait's. An aliased use reports the alias as the method; the trait's name is kept."""
+    (project / "src" / "App.php").unlink()
+    for name, text in TRAIT_USERS_PHP.items():
+        (project / "src" / name).write_text(text)
+    output = tmp_path / "calls.jsonl"
+
+    env = dict(os.environ, PHP_CALL_GRAPH_OUT=str(output))
+    argv = ps.PhpStanRunner().command(str(project), project / "phpstan.neon")
+    subprocess.run(argv, cwd=project, env=env, capture_output=True, timeout=300, check=False)
+
+    records = [json.loads(line) for line in output.read_text().splitlines() if line.strip()]
+    made = {
+        (
+            Path(r["file"]).name,
+            r["line"],
+            r["callerClass"],
+            r["callerMethod"],
+            Path(r["callerFile"]).name,
+        )
+        for r in records
+        if r["calleeMethod"] == "make"
+    }
+    # `Over` declares its own `run`, so the trait body never runs there and is not analysed.
+    assert made == {
+        ("T.php", 10, "App\\Plain", "run", "Plain.php"),
+        ("T.php", 10, "App\\Alias", "run", "Alias.php"),
+    }
+
+
 VENDOR_LIB_PHP = """<?php
 namespace Acme;
 
@@ -350,7 +399,29 @@ def test_a_vendor_target_becomes_one_stub_node_and_one_edge_when_the_flag_is_on(
             ],
         }
     ]
-    nodes, edges = [], []
+    # The caller as graphify emits it: an unnamed caller is refused, so the graph must name
+    # `App\Controller::run`. `App\Emails` is left out on purpose, as excluded project code.
+    nodes = [
+        {"id": "app_php", "label": "App.php", "source_file": path},
+        {
+            "id": "app_controller",
+            "label": "Controller",
+            "_callable_class": True,
+            "source_file": path,
+            "source_location": line_in_fixture("class Controller"),
+        },
+        {
+            "id": "controller_run",
+            "label": ".run()",
+            "_callable": True,
+            "source_file": path,
+            "source_location": line_in_fixture("public function run("),
+        },
+    ]
+    edges = [
+        {"source": "app_php", "target": "app_controller", "relation": "contains"},
+        {"source": "app_controller", "target": "controller_run", "relation": "method"},
+    ]
 
     record = resolver.run(
         per_file, nodes, edges, sources=[ps.PhpStanSource()], repo_root=str(project)
@@ -363,6 +434,46 @@ def test_a_vendor_target_becomes_one_stub_node_and_one_edge_when_the_flag_is_on(
     assert record.stub_edges_added == 1
     assert record.unresolved[resolver.REASON_NOT_IN_GRAPH] == 1, "App\\Emails is not vendor"
     assert [n["label"] for n in nodes if n.get("external")] == ["Acme\\Lib"]
-    assert [(e["source"], e["target"], e["_external_target"]) for e in edges] == [
+    calls = [e for e in edges if e.get("relation") == "calls"]
+    assert [(e["source"], e["target"], e["_external_target"]) for e in calls] == [
         ("controller_run", "php_external_acme_lib", "Acme\\Lib::doIt")
     ]
+
+
+NULLSAFE_PHP = """<?php
+namespace App;
+
+class Foo { public function bar(): void {} public function baz(): void {} }
+
+class Controller {
+    public function typed(?Foo $x): void {
+        $x?->bar();
+    }
+
+    public function untyped($y): void {
+        $y?->baz();
+    }
+}
+"""
+
+
+def test_a_nullsafe_call_is_recorded_for_a_typed_receiver_and_not_for_an_untyped_one(
+    project, tmp_path
+):
+    """`?Foo` is `Foo|null`; the null arm has no class reflection and drops out, `Foo` stays."""
+    (project / "src" / "App.php").write_text(NULLSAFE_PHP)
+    output = tmp_path / "calls.jsonl"
+
+    env = dict(os.environ, PHP_CALL_GRAPH_OUT=str(output))
+    argv = ps.PhpStanRunner().command(str(project), project / "phpstan.neon")
+    subprocess.run(argv, cwd=project, env=env, capture_output=True, timeout=300, check=False)
+
+    records = [json.loads(line) for line in output.read_text().splitlines() if line.strip()]
+    line = next(n for n, text in enumerate(NULLSAFE_PHP.splitlines(), 1) if "$x?->bar(" in text)
+    assert [
+        (r["callerClass"], r["callerMethod"], r["calleeClass"], r["calleeMethod"], r["line"])
+        for r in records
+    ] == [("App\\Controller", "typed", "App\\Foo", "bar", line)]
+    assert records[0]["callPos"] >= 0
+    assert records[0]["callerFile"] == records[0]["file"]
+    assert "baz" not in {r["calleeMethod"] for r in records}, "an untyped receiver is mixed"

@@ -54,8 +54,18 @@ Verified against PHPStan 2.2.8 on PHP 8.4.
 in the working directory. One JSON object per line:
 
 ```json
-{"callerClass":"App\\Controller","callerMethod":"run","calleeClass":"App\\Mailer","calleeMethod":"send","calleeKind":"interface","line":21,"file":"/srv/app/src/Controller.php","callPos":148,"calleeFile":"/srv/app/src/Mailer.php"}
+{"callerClass":"App\\Controller","callerMethod":"run","calleeClass":"App\\Mailer","calleeMethod":"send","calleeKind":"interface","line":21,"file":"/srv/app/src/Controller.php","callPos":148,"calleeFile":"/srv/app/src/Mailer.php","callerFile":"/srv/app/src/Controller.php"}
 ```
+
+`file` and `line` locate the call: the file that holds the body it sits in. `callerClass` and
+`callerMethod` name the method the body was analysed as, and `callerFile` is the file of
+`callerClass`. The two files differ only for a trait body. PHPStan analyses a trait method once
+per class using it, so one call in `src/T.php` yields one record per using class, each with
+`file` `src/T.php`, `callerClass` the using class, and `callerFile` that class's file.
+`callerMethod` is then the name the trait declares. An alias (`use T { run as traitRun; }`) is
+mapped back to `run`, and a body whose name cannot be mapped (an alias set by an intermediate
+trait) produces no record. A class that overrides the trait method never runs the trait body,
+and PHPStan does not analyse it there.
 
 `callPos` is the token offset of the called method's name, `-1` when the parser did not record
 one. A union receiver (`Emails|Cache`) yields one record per arm with the same `callPos`; two
@@ -85,6 +95,9 @@ produce no record:
   from a typed constructor parameter: PHPStan reports `missingType.property` rather than
   inferring it. Give the property a native type or a `@var` docblock and the call resolves.
 - a dynamic method name, `$obj->$method()`;
+- a call outside any class method (a function body), since there is no class to name;
+- a call in a trait method reached through an alias the using class's own alias table does not
+  map back to the trait;
 - a receiver on a class the analysis cannot load;
 - an intersection receiver (`A&B`) whose constituents resolve to more than one declaring class
   for the method. One object, two declarations: the type does not say which body runs, so
@@ -94,9 +107,12 @@ produce no record:
   emits nothing. The parser layer is stricter there and refuses `(A&B)|C` wholesale as
   `union-type`.
 
-Also out of scope in this version, by omission rather than by refusal: `?->` nullsafe calls,
-`Foo::bar()` static calls, and `new Foo` construction edges. Each is a different node type and
-would be a second collector.
+A nullsafe call `$x?->m()` is recorded by the same collector: PHPStan hands it a `MethodCall` for
+it too. The `null` arm of `?Foo` has no class reflection, so it is dropped and `Foo` is kept.
+
+Also out of scope in this version, by omission rather than by refusal: `Foo::bar()` static
+calls and `new Foo` construction edges. Each is a different node type and would be a second
+collector.
 
 ## Cost
 

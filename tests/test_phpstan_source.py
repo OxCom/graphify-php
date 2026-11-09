@@ -245,6 +245,14 @@ class TestRecordParsing:
     def test_callee_file_defaults_to_empty(self, over):
         assert ps.PhpStanCall.from_json(record(**over)).callee_file == ""
 
+    def test_caller_file_is_read_when_present(self):
+        call = ps.PhpStanCall.from_json(record(callerFile="/repo/src/Plain.php"))
+        assert call.caller_file == "/repo/src/Plain.php"
+
+    @pytest.mark.parametrize("over", [{}, {"callerFile": None}])
+    def test_caller_file_defaults_to_empty(self, over):
+        assert ps.PhpStanCall.from_json(record(**over)).caller_file == ""
+
     @pytest.mark.parametrize(
         "raw",
         [
@@ -495,6 +503,526 @@ class TestResolve:
         assert result.unresolved[ps.REASON_MALFORMED] == 1
 
 
+def probe(method: str, line: int, scope: str, caller: tuple[str, ...] | None) -> CallSite:
+    """A scoped-probe candidate as `resolver.collect_scoped_groups` builds it."""
+    return CallSite(
+        caller_nid="n1",
+        receiver=scope,
+        method=method,
+        source_file="src/App.php",
+        source_location=f"L{line}",
+        scoped=True,
+        caller_scope=caller,
+    )
+
+
+def member(method: str, line: int, caller: tuple[str, ...] | None) -> CallSite:
+    return CallSite(
+        caller_nid="n1",
+        receiver="",
+        method=method,
+        source_file="src/App.php",
+        source_location=f"L{line}",
+        caller_scope=caller,
+    )
+
+
+class TestCallerAndCallKind:
+    """The collector records only `MethodCall`, so a record is evidence for a method call alone.
+
+    The three shapes below produced wrong EXTRACTED edges on graphify 0.9.103, where the scoped
+    probes come from `new X(...)`: each probe was matched to a different call on its line.
+    """
+
+    def run(self, root: Path, sites: list[CallSite], records: list[dict]):
+        path = str(root / "src/App.php")
+        lines = [json.dumps(record(file=path, **r)) for r in records]
+        runner = FakeRunner(ps.RunOutcome(True), lines)
+        return runner, source_with(runner).resolve(str(root), sites)
+
+    def test_realistic_new_wrapping_an_arrow_fn_call_is_not_that_call(self, tmp_path):
+        # return new Bag(array_map(fn (Item $i) => $i->map(), $items));
+        root = make_repo(tmp_path)
+        records = [
+            dict(callerClass="App\\Service", callerMethod="wrap", calleeClass="App\\Item")
+            | dict(calleeMethod="map", line=10, callPos=40)
+        ]
+        _runner, result = self.run(root, [probe("map", 10, "Bag", ("Service::wrap",))], records)
+
+        assert result.targets == []
+        assert result.unresolved == {ps.REASON_NOT_A_METHOD_CALL: 1}
+
+    def test_probes_alone_never_launch_phpstan(self, tmp_path):
+        root = make_repo(tmp_path)
+        runner, result = self.run(root, [probe("map", 10, "Bag", ("Service::wrap",))], [])
+
+        assert runner.calls == []
+        assert result.unresolved == {ps.REASON_NOT_A_METHOD_CALL: 1}
+
+    def test_closure_on_a_new_line_keeps_the_closure_edge_and_refuses_the_probe(self, tmp_path):
+        # $f = fn (Bar $b) => $b->make(); return Foo::make($f(new Bar()));
+        root = make_repo(tmp_path)
+        records = [
+            dict(callerClass="App\\Outer", callerMethod="viaClosure", calleeClass="App\\Bar")
+            | dict(calleeMethod="make", line=16, callPos=30)
+        ]
+        closure_site = member("make", 16, ("Outer::viaClosure",))
+        sites = [probe("make", 16, "Bar", ("Outer::viaClosure",)), closure_site]
+        _runner, result = self.run(root, sites, records)
+
+        assert [(t.site, t.class_fqn) for t in result.targets] == [(closure_site, "App\\Bar")]
+        assert result.unresolved == {ps.REASON_NOT_A_METHOD_CALL: 1}
+
+    def test_one_line_class_record_never_crosses_into_another_method(self, tmp_path):
+        # class OneLine { __construct() { $this->bar = new Bar(); } first() { $this->bar->get() } }
+        root = make_repo(tmp_path)
+        records = [
+            dict(callerClass="App\\OneLine", callerMethod="first", calleeClass="App\\Bar")
+            | dict(calleeMethod="get", line=5, callPos=70)
+        ]
+        in_ctor = member("get", 5, ("OneLine::__construct",))
+        in_first = member("get", 5, ("OneLine::first",))
+        sites = [probe("get", 5, "Bar", ("OneLine::__construct",)), in_ctor, in_first]
+        _runner, result = self.run(root, sites, records)
+
+        assert [t.site for t in result.targets] == [in_first]
+        assert result.unresolved == {
+            ps.REASON_NOT_A_METHOD_CALL: 1,
+            ps.REASON_CALLER_MISMATCH: 1,
+        }
+
+    def test_a_caller_no_class_method_encloses_is_refused(self, tmp_path):
+        root = make_repo(tmp_path)
+        records = [dict(callerClass="App\\Controller", callerMethod="run")]
+        _runner, result = self.run(root, [member("send", 16, ())], records)
+
+        assert result.targets == []
+        assert result.unresolved == {ps.REASON_CALLER_UNNAMED: 1}
+
+    def test_a_trait_method_matches_the_class_phpstan_analysed_it_in(self, tmp_path):
+        root = make_repo(tmp_path)
+        records = [dict(callerClass="App\\Command\\RolesAddCommand", callerMethod="grant")]
+        caller = ("UserRolesTrait::grant", "RolesAddCommand::grant")
+        _runner, result = self.run(root, [member("send", 16, caller)], records)
+
+        assert [t.class_fqn for t in result.targets] == ["App\\Emails"]
+        assert result.unresolved == {}
+
+    def test_caller_comparison_ignores_case_as_php_does(self, tmp_path):
+        root = make_repo(tmp_path)
+        records = [dict(callerClass="App\\controller", callerMethod="RUN")]
+        _runner, result = self.run(root, [member("send", 16, ("Controller::run",))], records)
+
+        assert len(result.targets) == 1
+
+    def test_two_callers_on_one_line_each_keep_their_own_record(self, tmp_path):
+        root = make_repo(tmp_path)
+        records = [
+            dict(callerMethod="first", calleeClass="App\\Bar", calleeMethod="get", callPos=10),
+            dict(callerMethod="second", calleeClass="App\\Baz", calleeMethod="get", callPos=20),
+        ]
+        first = member("get", 16, ("Controller::first",))
+        second = member("get", 16, ("Controller::second",))
+        _runner, result = self.run(root, [first, second], records)
+
+        assert sorted((t.site.caller_scope, t.class_fqn) for t in result.targets) == [
+            (("Controller::first",), "App\\Bar"),
+            (("Controller::second",), "App\\Baz"),
+        ]
+        assert result.unresolved == {}
+
+    def test_a_site_with_no_caller_evidence_is_matched_as_before(self, tmp_path):
+        root = make_repo(tmp_path)
+        _runner, result = self.run(root, [member("send", 16, None)], [dict()])
+
+        assert len(result.targets) == 1
+
+    def test_no_caller_evidence_takes_a_record_whatever_caller_made_it(self, tmp_path):
+        root = make_repo(tmp_path)
+        records = [dict(callerClass="App\\Elsewhere", callerMethod="other")]
+        _runner, result = self.run(root, [member("send", 16, None)], records)
+
+        assert [t.class_fqn for t in result.targets] == ["App\\Emails"]
+        assert result.unresolved == {}
+
+    def test_an_unnamed_caller_with_no_record_on_its_line_is_counted_as_unnamed(self, tmp_path):
+        root = make_repo(tmp_path)
+        records = [dict(line=99)]
+        _runner, result = self.run(root, [member("send", 16, ())], records)
+
+        assert result.targets == []
+        assert result.unresolved == {ps.REASON_CALLER_UNNAMED: 1}
+
+    def test_a_closure_the_graph_could_not_place_takes_no_record_from_its_line(self, tmp_path):
+        # `return fn () => $x->send(); } public function second() {` -- the adapter gives `()`.
+        root = make_repo(tmp_path)
+        records = [dict(callerMethod="first")]
+        _runner, result = self.run(root, [member("send", 16, ())], records)
+
+        assert result.targets == []
+        assert result.unresolved == {ps.REASON_CALLER_UNNAMED: 1}
+
+    def test_a_method_whose_class_the_graph_lost_takes_its_records(self, tmp_path):
+        root = make_repo(tmp_path)
+        here = str(root / "src/App.php")
+        records = [
+            dict(callerClass="Tests\\BrokenTest", callerMethod="testFoo", callerFile=here),
+            dict(callerClass="Tests\\BrokenTest", callerMethod="testFoo", line=30),
+        ]
+        _runner, result = self.run(root, [member("send", 16, ("::testfoo",))], records)
+
+        assert [t.class_fqn for t in result.targets] == ["App\\Emails"]
+        assert result.unresolved == {}
+
+    @pytest.mark.parametrize("context", ["src/Plain2.php", None])
+    def test_a_lost_class_method_takes_no_record_made_in_another_files_context(
+        self, tmp_path, context
+    ):
+        # A trait body analysed in `Plain2`: its line is the trait's, the class is Plain2's.
+        # Without `callerFile` nothing shows the record was made where the site is.
+        root = make_repo(tmp_path)
+        extra = {} if context is None else {"callerFile": str(root / context)}
+        records = [dict(callerClass="App\\Plain2", callerMethod="run", **extra)]
+        _runner, result = self.run(root, [member("send", 16, ("::run",))], records)
+
+        assert result.targets == []
+        assert result.unresolved == {ps.REASON_CALLER_OTHER_FILE: 1}
+
+    def test_a_trait_body_record_matches_the_trait_site_from_the_using_class_context(
+        self, tmp_path
+    ):
+        root = make_repo(tmp_path)
+        records = [
+            dict(callerClass="App\\Plain", callerMethod="run", callerFile=str(root / "P.php")),
+            dict(callerClass="App\\Plain2", callerMethod="run", callerFile=str(root / "Q.php")),
+        ]
+        caller = ("T::run", "Plain::run", "Plain2::run")
+        _runner, result = self.run(root, [member("send", 16, caller)], records)
+
+        assert [t.class_fqn for t in result.targets] == ["App\\Emails"]
+        assert result.unresolved == {}
+
+    def test_a_lost_class_method_is_refused_when_two_classes_in_the_file_share_its_name(
+        self, tmp_path
+    ):
+        root = make_repo(tmp_path)
+        here = str(root / "src/App.php")
+        records = [
+            dict(callerClass="Tests\\BrokenTest", callerMethod="testFoo", callerFile=here),
+            dict(callerClass="Tests\\Helper", callerMethod="testFoo", line=40, callerFile=here),
+        ]
+        _runner, result = self.run(root, [member("send", 16, ("::testFoo",))], records)
+
+        assert result.targets == []
+        assert result.unresolved == {ps.REASON_CALLER_AMBIGUOUS: 1}
+
+    def test_a_short_class_name_two_namespaces_share_in_the_file_is_refused(self, tmp_path):
+        root = make_repo(tmp_path)
+        records = [
+            dict(callerClass="App\\A\\Controller", callerMethod="run"),
+            dict(callerClass="\\App\\B\\Controller", callerMethod="other", line=30),
+        ]
+        _runner, result = self.run(root, [member("send", 16, ("Controller::run",))], records)
+
+        assert result.targets == []
+        assert result.unresolved == {ps.REASON_CALLER_AMBIGUOUS: 1}
+
+    def test_one_class_spelled_with_and_without_a_leading_backslash_is_one_class(self, tmp_path):
+        root = make_repo(tmp_path)
+        records = [
+            dict(callerClass="App\\Controller", callerMethod="run"),
+            dict(callerClass="\\app\\controller", callerMethod="other", line=30),
+        ]
+        _runner, result = self.run(root, [member("send", 16, ("Controller::run",))], records)
+
+        assert len(result.targets) == 1
+
+
+def anchor(line: int, caller: tuple[str, ...] | None, owns_line: bool = True) -> CallSite:
+    """A refused `new X(...)` probe, as the resolver hands it over to place unsent records."""
+    site = probe("getName", line, "SyncUserMessage", caller)
+    return dataclasses.replace(site, owns_line=owns_line)
+
+
+class TestUnsentCalls:
+    """graphify core resolves some member calls by bare name and never sends them as raw calls.
+
+    `$task = new SyncUserMessage($legacyUser->getName(), $batch->getId());` arrives as the
+    `new` probe and the `getId` member site only. The `getName` record is still on that line.
+    """
+
+    SYNC = ("SyncUsers::syncUsers",)
+
+    def records(self, root: Path, *extra: dict) -> list[str]:
+        base = dict(callerClass="App\\SyncUsers", callerMethod="syncUsers", line=74)
+        rows = [
+            base | dict(calleeClass="App\\User", calleeMethod="getName", callPos=10),
+            base | dict(calleeClass="App\\CronBatch", calleeMethod="getId", callPos=30),
+            *(base | row for row in extra),
+        ]
+        return [json.dumps(record(file=str(root / "src/App.php"), **row)) for row in rows]
+
+    def run(self, root: Path, anchors, members, *extra: dict, outcome=None, tail=None):
+        lines = self.records(root, *extra) + ([tail] if tail else [])
+        source = source_with(FakeRunner(outcome or ps.RunOutcome(True), lines))
+        source.resolve(str(root), members)
+        return source.unsent_calls(str(root), anchors, members)
+
+    def test_a_record_no_member_site_claims_is_edged_from_the_anchors_caller(self, tmp_path):
+        root = make_repo(tmp_path)
+        place = anchor(74, self.SYNC)
+        found = self.run(root, [place], [member("getId", 74, self.SYNC)])
+
+        assert [(t.site, t.class_fqn, t.method, t.via) for t in found] == [
+            (place, "App\\User", "getName", ps.VIA_CLASS)
+        ]
+
+    def test_a_record_a_member_site_names_stays_with_that_site(self, tmp_path):
+        root = make_repo(tmp_path)
+        members = [member("getId", 74, self.SYNC), member("GETNAME", 74, ("Other::x",))]
+
+        assert self.run(root, [anchor(74, self.SYNC)], members) == []
+
+    def test_a_scoped_site_of_the_same_name_claims_no_record(self, tmp_path):
+        # `Foo::getName($user->getName())`: the static call has no record of its own.
+        root = make_repo(tmp_path)
+        scoped = dataclasses.replace(member("getName", 74, self.SYNC), scoped=True)
+        found = self.run(root, [anchor(74, self.SYNC)], [member("getId", 74, self.SYNC), scoped])
+
+        assert [t.method for t in found] == ["getName"]
+
+    def test_an_anchor_that_may_share_its_line_with_a_nested_callable_gets_nothing(self, tmp_path):
+        root = make_repo(tmp_path)
+        found = self.run(
+            root, [anchor(74, self.SYNC, owns_line=False)], [member("getId", 74, self.SYNC)]
+        )
+
+        assert found == []
+
+    def test_a_record_made_in_another_method_is_not_the_anchors(self, tmp_path):
+        root = make_repo(tmp_path)
+        found = self.run(
+            root, [anchor(74, ("SyncUsers::syncLeads",))], [member("getId", 74, self.SYNC)]
+        )
+
+        assert found == []
+
+    @pytest.mark.parametrize("caller", [None, ()])
+    def test_an_anchor_with_no_caller_evidence_gets_nothing(self, tmp_path, caller):
+        root = make_repo(tmp_path)
+
+        assert self.run(root, [anchor(74, caller)], [member("getId", 74, self.SYNC)]) == []
+
+    def test_two_anchors_of_one_caller_on_one_line_yield_the_record_once(self, tmp_path):
+        root = make_repo(tmp_path)
+        first = anchor(74, self.SYNC)
+        second = dataclasses.replace(first, method="x")
+        found = self.run(root, [first, second], [member("getId", 74, self.SYNC)])
+
+        assert [(t.class_fqn, t.method) for t in found] == [("App\\User", "getName")]
+
+    def test_no_phpstan_run_means_nothing_to_place(self, tmp_path):
+        root = make_repo(tmp_path)
+        source = source_with(FakeRunner(ps.RunOutcome(True), self.records(root)))
+
+        assert source.unsent_calls(str(root), [anchor(74, self.SYNC)], []) == []
+
+    def test_a_lost_class_method_anchor_uses_the_same_caller_rule(self, tmp_path):
+        root = make_repo(tmp_path)
+        here = dict(callerFile=str(root / "src/App.php"))
+        found = self.run(
+            root,
+            [anchor(74, ("::syncUsers",))],
+            [member("getId", 74, self.SYNC)],
+            here | dict(calleeClass="App\\Batch", calleeMethod="getSize", callPos=50),
+        )
+
+        assert [t.method for t in found] == ["getSize"]
+
+    def test_a_lost_class_method_anchor_takes_no_record_made_in_another_files_context(
+        self, tmp_path
+    ):
+        root = make_repo(tmp_path)
+        elsewhere = dict(callerFile=str(root / "src/Plain2.php"))
+        found = self.run(
+            root,
+            [anchor(74, ("::syncUsers",))],
+            [member("getId", 74, self.SYNC)],
+            elsewhere | dict(calleeClass="App\\Batch", calleeMethod="getSize", callPos=50),
+        )
+
+        assert found == []
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            ps.RunOutcome(False, ps.REASON_TIMEOUT),
+            ps.RunOutcome(False, ps.REASON_RUN_FAILED, exit_code=255),
+            ps.RunOutcome(False, ps.REASON_RUN_FAILED),
+        ],
+    )
+    def test_records_of_a_run_that_did_not_finish_place_nothing(self, tmp_path, outcome):
+        root = make_repo(tmp_path)
+        found = self.run(
+            root, [anchor(74, self.SYNC)], [member("getId", 74, self.SYNC)], outcome=outcome
+        )
+
+        assert found == []
+
+    def test_records_of_a_run_that_reported_analysis_errors_are_placed(self, tmp_path):
+        root = make_repo(tmp_path)
+        outcome = ps.RunOutcome(False, ps.REASON_RUN_FAILED, exit_code=1)
+        found = self.run(
+            root, [anchor(74, self.SYNC)], [member("getId", 74, self.SYNC)], outcome=outcome
+        )
+
+        assert [t.method for t in found] == ["getName"]
+
+    def test_a_truncated_output_places_nothing(self, tmp_path):
+        root = make_repo(tmp_path)
+        found = self.run(
+            root, [anchor(74, self.SYNC)], [member("getId", 74, self.SYNC)], tail='{"calleeCl'
+        )
+
+        assert found == []
+
+    def test_a_failed_run_forgets_the_records_of_the_run_before_it(self, tmp_path):
+        root = make_repo(tmp_path)
+        members = [member("getId", 74, self.SYNC)]
+        source = source_with(FakeRunner(ps.RunOutcome(True), self.records(root)))
+        source.resolve(str(root), members)
+        source._runner = FakeRunner(ps.RunOutcome(False, ps.REASON_TIMEOUT))
+        source.resolve(str(root), members)
+
+        assert source.unsent_calls(str(root), [anchor(74, self.SYNC)], members) == []
+
+    def test_a_probes_only_ask_that_runs_nothing_keeps_the_last_runs_records(self, tmp_path):
+        # The resolver asks again for scoped groups; that ask never launches PHPStan.
+        root = make_repo(tmp_path)
+        members = [member("getId", 74, self.SYNC)]
+        source = source_with(FakeRunner(ps.RunOutcome(True), self.records(root)))
+        source.resolve(str(root), members)
+        source.resolve(str(root), [anchor(74, self.SYNC)])
+
+        found = source.unsent_calls(str(root), [anchor(74, self.SYNC)], members)
+        assert [t.method for t in found] == ["getName"]
+
+
+def nullsafe(method: str, line: int, caller: tuple[str, ...] | None) -> CallSite:
+    """A `$x?->m()` the parser placed in a caller node; it needs no anchor and owns no line."""
+    return member(method, line, caller)
+
+
+class TestNullsafeCalls:
+    """`$user?->getName()` reaches no raw call, so the parser's site is offered instead.
+
+    The parser vouched for the caller and for the line holding only nullsafe calls of that
+    name; this side takes the records of that name made inside that caller.
+    """
+
+    SYNC = TestUnsentCalls.SYNC
+
+    def run(self, root: Path, sites, *extra: dict):
+        lines = TestUnsentCalls().records(root, *extra)
+        source = source_with(FakeRunner(ps.RunOutcome(True), lines))
+        source.resolve(str(root), [member("x", 1, self.SYNC)])
+        return source.unsent_calls(str(root), [], [], nullsafe=sites)
+
+    def test_a_record_of_the_sites_name_in_its_caller_is_its_target(self, tmp_path):
+        root = make_repo(tmp_path)
+        site = nullsafe("GETNAME", 74, self.SYNC)
+        found = self.run(root, [site])
+
+        assert [(t.site, t.class_fqn, t.method, t.confidence) for t in found] == [
+            (site, "App\\User", "getName", Confidence.EXTRACTED)
+        ]
+
+    def test_two_records_of_one_call_are_its_union_arms(self, tmp_path):
+        root = make_repo(tmp_path)
+        arm = dict(calleeClass="App\\Admin", calleeMethod="getName", callPos=10)
+        found = self.run(root, [nullsafe("getName", 74, self.SYNC)], arm)
+
+        assert [t.class_fqn for t in found] == ["App\\User", "App\\Admin"]
+
+    def test_a_record_made_in_another_method_is_not_the_sites(self, tmp_path):
+        root = make_repo(tmp_path)
+
+        assert self.run(root, [nullsafe("getName", 74, ("SyncUsers::other",))]) == []
+
+    @pytest.mark.parametrize("caller", [None, ()])
+    def test_a_site_with_no_caller_evidence_gets_nothing(self, tmp_path, caller):
+        root = make_repo(tmp_path)
+
+        assert self.run(root, [nullsafe("getName", 74, caller)]) == []
+
+    def test_a_site_with_no_record_on_its_line_gets_nothing(self, tmp_path):
+        root = make_repo(tmp_path)
+
+        assert self.run(root, [nullsafe("getName", 75, self.SYNC)]) == []
+
+    def test_no_phpstan_run_means_nothing_to_take(self, tmp_path):
+        root = make_repo(tmp_path)
+        source = source_with(FakeRunner(ps.RunOutcome(True)))
+
+        assert source.unsent_calls(str(root), [], [], nullsafe=[nullsafe("x", 74, self.SYNC)]) == []
+
+
+class TestLineProofs:
+    """Records on one line for one method name, made inside the site's caller.
+
+    The resolver checks graphify's name-bound engine edges against these, so the caller rule is
+    the one `resolve` uses and a caller the graph cannot name gets no proof at all.
+    """
+
+    RUN = ("Controller::run",)
+
+    def proofs(self, root: Path, sites, *rows: dict):
+        lines = [json.dumps(record(file=str(root / "src/App.php"), **row)) for row in rows]
+        source = source_with(FakeRunner(ps.RunOutcome(True), lines))
+        source.resolve(str(root), [member("send", 16, self.RUN)])
+        return source.line_proofs(str(root), sites)
+
+    def test_records_of_the_caller_are_the_proof_and_their_calls_are_counted(self, tmp_path):
+        root = make_repo(tmp_path)
+        at = member("get", 16, self.RUN)
+        found = self.proofs(
+            root,
+            [at],
+            dict(calleeClass="App\\Cache", calleeMethod="get", callPos=1, calleeFile="/x/C.php"),
+            dict(calleeClass="App\\Store", calleeMethod="GET", callPos=9),
+            dict(calleeClass="App\\Store", calleeMethod="get", callPos=9),
+            dict(calleeClass="App\\Cache", calleeMethod="get", callerMethod="other", callPos=4),
+        )[at]
+
+        assert [(t.class_fqn, t.declaring_file, t.site) for t in found.targets] == [
+            ("App\\Cache", "/x/C.php", at),
+            ("App\\Store", "", at),
+        ]
+        assert found.calls == 2
+
+    def test_an_interface_record_says_so(self, tmp_path):
+        root = make_repo(tmp_path)
+        at = member("get", 16, self.RUN)
+        row = dict(calleeClass="App\\CacheInterface", calleeMethod="get", calleeKind="interface")
+        (target,) = self.proofs(root, [at], row)[at].targets
+
+        assert target.interface_target is True
+        assert target.via == ps.VIA_INTERFACE
+
+    @pytest.mark.parametrize("caller", [None, ()])
+    def test_a_caller_with_no_scope_gets_no_proof(self, tmp_path, caller):
+        root = make_repo(tmp_path)
+        at = member("get", 16, caller)
+        found = self.proofs(root, [at], dict(calleeClass="App\\Cache", calleeMethod="get"))[at]
+
+        assert (found.targets, found.calls) == ((), 0)
+
+    def test_no_finished_run_means_no_proofs(self, tmp_path):
+        root = make_repo(tmp_path)
+
+        assert source_with(FakeRunner(ps.RunOutcome(True))).line_proofs(str(root), []) is None
+
+
 class TestFailureModes:
     def test_unavailable_repository_yields_a_skip_not_an_exception(self, tmp_path):
         root = make_repo(tmp_path, binary=False)
@@ -592,6 +1120,15 @@ class TestRunner:
 
         assert outcome.ok is False
         assert outcome.reason == ps.REASON_UNAVAILABLE
+
+    @pytest.mark.parametrize("code", [0, 1, 255])
+    def test_the_exit_code_is_kept(self, tmp_path, code):
+        root = make_repo(tmp_path)
+        binary = root / "vendor" / "bin" / "phpstan"
+        binary.write_text(f"#!/bin/sh\nexit {code}\n")
+        binary.chmod(0o755)
+
+        assert ps.PhpStanRunner().run(str(root), tmp_path / "out.jsonl").exit_code == code
 
     def test_timeout_is_overridable_and_falls_back_on_nonsense(self, monkeypatch):
         monkeypatch.setenv(ps._TIMEOUT_ENV, "12.5")

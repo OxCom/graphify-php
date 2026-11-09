@@ -328,7 +328,7 @@ def test_registry_groups_collectors_by_node_kind():
     registry = by_node_kind()
     assert registry["property_promotion_parameter"] == [COLLECTORS[0]]
     assert registry["property_declaration"] == [COLLECTORS[1]]
-    assert registry["method_declaration"] == [COLLECTORS[2]]
+    assert registry["method_declaration"] == [COLLECTORS[2], COLLECTORS[4]]
     assert registry["assignment_expression"] == [COLLECTORS[3]]
 
 

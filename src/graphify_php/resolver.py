@@ -23,6 +23,7 @@ same artifact.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import os
 import re
@@ -30,8 +31,19 @@ import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
-from . import status
-from .ports import CallSite, CallTarget, CallTargetSource, EdgeSink, NodeIndex, ScopeIndex
+from . import core_guard, status
+from .ports import (
+    CallerSites,
+    CallSite,
+    CallTarget,
+    CallTargetSource,
+    EdgeSink,
+    EngineCall,
+    LineProof,
+    MethodBoundCall,
+    NodeIndex,
+    ScopeIndex,
+)
 
 RESOLVER_NAME = "php_member_calls"
 PHP_SUFFIXES = frozenset({".php"})
@@ -48,6 +60,47 @@ REASON_NOT_IN_GRAPH = "target_not_in_graph"
 REASON_SELF_CALL = "self_call"
 REASON_SCOPE_NOT_RECOVERED = "scoped_method_not_recovered"
 REASON_SCOPE_AMBIGUOUS = "scoped_method_ambiguous"
+
+# Why an engine edge (graphify's bare-name binding in the caller's file) was kept, and the one
+# reason it is dropped. Kept reasons are checked in this order and the first that applies wins.
+REASON_ENGINE_NO_PROOFS = "engine-proof-unavailable"  # no source holds per-line records
+REASON_ENGINE_NO_RECORD = "engine-no-record"  # no record in the caller at the edge's line
+REASON_ENGINE_AGREES = "engine-proof-agrees"
+REASON_ENGINE_RECORDS_DISAGREE = "engine-records-disagree"  # some records agree, some do not
+REASON_ENGINE_UNPLACED = "engine-proof-unplaced"  # a record's body cannot be compared
+REASON_ENGINE_SITES_UNKNOWN = "engine-sites-unavailable"  # the caller's sites cannot be listed
+REASON_ENGINE_SITE_NOT_FOUND = "engine-site-not-found"  # no `->m(` on the edge's own line
+REASON_ENGINE_OTHER_SITE = "engine-other-site-unproved"  # a site the edge may stand for stands
+REASON_ENGINE_NOT_OWNED = "engine-edge-list-not-owned"  # removal would not reach the graph
+# graphify binds functions and methods by the same bare name. A dot-less target is a function
+# or an anonymous class's method (or one whose class a parse error lost); a parser tells which.
+REASON_ENGINE_TARGET_NOT_METHOD = "engine-target-not-a-method"  # a function is declared there
+REASON_ENGINE_TARGET_UNKNOWN = "engine-target-kind-unknown"  # no parser, or it cannot tell
+# A function or scoped call of that name in the caller: the edge may stand for it.
+REASON_ENGINE_OTHER_CALL_KIND = "engine-other-call-kind"
+REASON_ENGINE_DROPPED = "engine-contradicts-proof"
+ENGINE_REASON_PREFIX = "engine:"
+# Why a proved target of a dropped engine edge got no edge, under `ENGINE_REASON_PREFIX`. A type
+# engine files a closure's calls under the method around it, so a record on a line the caller
+# does not own alone may be another body's call.
+REASON_ENGINE_PROOF_NESTED = "proof-in-nested-callable"  # a nested callable starts before it
+REASON_ENGINE_PROOF_SHARED_LINE = "proof-on-shared-line"  # another body's call of it is there
+# The declaring file holds the proved class and no method node of that name (`@method`, `__call`).
+REASON_ENGINE_METHOD_NO_NODE = "method-not-in-graph"
+
+# Why a graphify edge from a `new X(` line to a method named x was kept. Checked in this order.
+REASON_NEW_SITE_NOT_LOCATED = "new-site-not-located"  # the line could not be read or parsed
+REASON_NEW_SITE_SHARED_LINE = "new-site-shared-line"  # a call of that name is on the line too
+REASON_NEW_SITE_NOT_OWNED = "new-site-edge-list-not-owned"  # removal would not reach the graph
+
+# The nullsafe pass's own reasons. A parser's refusals arrive as `nullsafe:<source>:<reason>`.
+NULLSAFE_REASON_PREFIX = "nullsafe:"
+REASON_NULLSAFE_CALLER_NOT_IN_GRAPH = "caller-not-in-graph"  # no one graph callable starts there
+REASON_NULLSAFE_NO_RECORD = "no-record-in-caller"  # no type-engine record of it in that caller
+
+
+# The record's schema lives in `status`; the name stays importable from here.
+MemberCallStatus = status.MemberCallStatus
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_\\][A-Za-z0-9_\\]*$")
 
@@ -78,14 +131,13 @@ class ScopedGroup:
     candidates: list[CallSite]
 
 
-def collect_sites(per_file: Sequence[dict]) -> list[CallSite]:
+def collect_sites(per_file: Sequence[dict], raws: list[dict] | None = None) -> list[CallSite]:
     """Every `$receiver->method()` graphify left unresolved, as `CallSite`.
 
-    graphify's PHP extractor sets `is_member_call` and the callee name but leaves `receiver`
-    unset (extractors/engine.py, the `tree_sitter_php` branch of the call walk: unlike the C#,
-    Java and C++ branches it never assigns `member_receiver`). The field is carried through
-    when it is there and left empty when it is not; a source that needs the receiver expression
-    re-reads it from `source_file` at `source_location`, which it must parse anyway.
+    The `receiver` field is carried through verbatim and is not a PHP expression a source can
+    trust: graphify before 0.9.103 left it unset for PHP, and 0.9.103 fills it with a bare name
+    (`mailer` for both `$this->mailer` and `$mailer`). A source that needs the receiver
+    expression re-reads it from `source_file` at `source_location`, which it must parse anyway.
     """
     sites: list[CallSite] = []
     for result in per_file:
@@ -103,12 +155,18 @@ def collect_sites(per_file: Sequence[dict]) -> list[CallSite]:
                     method=callee,
                     source_file=source_file,
                     source_location=raw.get("source_location") or "",
+                    # 0.9.103 sends `Foo::get()` as a member call flagged `php_scoped`.
+                    scoped=bool(raw.get("php_scoped")),
                 )
             )
+            if raws is not None:
+                raws.append(raw)
     return sites
 
 
-def collect_scoped_groups(per_file: Sequence[dict], scopes: ScopeIndex) -> list[ScopedGroup]:
+def collect_scoped_groups(
+    per_file: Sequence[dict], scopes: ScopeIndex, raws: list[dict] | None = None
+) -> list[ScopedGroup]:
     """Scoped calls — `self::`, `parent::`, `static::`, `Class::` — as candidate sites.
 
     graphify records all four with `is_member_call` false and the SCOPE as the callee, the same
@@ -134,11 +192,14 @@ def collect_scoped_groups(per_file: Sequence[dict], scopes: ScopeIndex) -> list[
                     method=name,
                     source_file=source_file,
                     source_location=raw.get("source_location") or "",
+                    scoped=True,
                 )
                 for name in scopes.scope_methods(caller, str(scope))
             ]
             if candidates:
                 groups.append(ScopedGroup(scope=str(scope), candidates=candidates))
+                if raws is not None:
+                    raws.append(raw)
     return groups
 
 
@@ -285,35 +346,468 @@ def _write_edges(
     record: status.ResolverStatus,
     stubs=None,
     repo_root: str = ".",
-) -> None:
-    # `ports.NodeIndex` takes no caller, so an index that can apply the caller's own visibility
-    # offers a wider call and is used when present. The report asks for the caller to be added
-    # to the port; until then this keeps `ports` untouched and fake indexes in tests working.
+    reason_prefix: str = "",
+) -> set[CallSite]:
+    """Write each target's edge, to a method or a vendor stub; return the sites that got one.
+
+    A site whose pair the graph already held still counts: its call is in the graph.
+    """
+    # `ports.NodeIndex` takes no caller, so an index that can check the proof's own file, or
+    # at least the caller's visibility, offers a wider call and is used when present. The
+    # narrow call keeps `ports` untouched and fake indexes in tests working.
+    proved = getattr(index, "proved_node_for", None)
     origin_aware = getattr(index, "method_node_for", None)
+    bound: set[CallSite] = set()
     # Counted per target record, not per site: a union site with one arm missing from the graph
     # still gets its other arm, and the histogram says how many records were lost.
     for target in targets:
-        callee_nid = (
-            origin_aware(target.site.caller_nid, target.class_fqn, target.method)
-            if callable(origin_aware)
-            else index.method_node(target.class_fqn, target.method)
-        )
+        if callable(proved):
+            callee_nid = proved(target.site.caller_nid, target, repo_root)
+        elif callable(origin_aware):
+            callee_nid = origin_aware(target.site.caller_nid, target.class_fqn, target.method)
+        else:
+            callee_nid = index.method_node(target.class_fqn, target.method)
         if callee_nid is None:
             # Only a class proven to live under `vendor/` gets a stub. Project code the build
             # excluded is still project code, and a stub for it would shadow the real class.
             if stubs is not None and is_vendor_file(target.declaring_file, repo_root):
                 stubs.add_call(target.site.caller_nid, stubs.node_for(target.class_fqn), target)
                 record.external_stubbed += 1
+                bound.add(target.site)
                 continue
             # `NodeIndex` answers one question, so a missing class and a missing method arrive
             # here indistinguishable. Widening the port to tell them apart would tie this
             # package to graphify's node schema, which is the part most likely to move.
-            record.unresolvable(REASON_NOT_IN_GRAPH)
+            record.unresolvable(reason_prefix + REASON_NOT_IN_GRAPH)
             continue
         if callee_nid == target.site.caller_nid:
-            record.unresolvable(REASON_SELF_CALL)
+            record.unresolvable(reason_prefix + REASON_SELF_CALL)
             continue
         sink.add_call(target.site.caller_nid, callee_nid, target)
+        bound.add(target.site)
+    return bound
+
+
+def _proved_raws(
+    sites: Sequence[CallSite],
+    site_raws: Sequence[dict],
+    groups: Sequence[ScopedGroup],
+    group_raws: Sequence[dict],
+    claimed: set[CallSite],
+) -> list[dict]:
+    """The raw calls behind every claimed site or group, each once, by identity.
+
+    Positional: `collect_*` append one raw per site or group, and `_with_caller_scope` keeps order.
+    Walking the pairs rather than a dict keyed by `CallSite` keeps two raws with equal sites apart.
+    """
+    proved: dict[int, dict] = {}
+    for site, raw in zip(sites, site_raws, strict=True):
+        if site in claimed:
+            proved[id(raw)] = raw
+    for group, raw in zip(groups, group_raws, strict=True):
+        if any(candidate in claimed for candidate in group.candidates):
+            proved[id(raw)] = raw
+    return list(proved.values())
+
+
+def _with_caller_scope(
+    index: NodeIndex, sites: list[CallSite], groups: list[ScopedGroup]
+) -> tuple[list[CallSite], list[ScopedGroup]]:
+    """Stamp each site with the class methods its caller can be reported as.
+
+    Optional on the index, as `method_node_for` is: `ports.NodeIndex` stays one question, and
+    a site without the stamp is matched exactly as before.
+    """
+    describe: Callable[[str], Iterable[str]] | None = getattr(index, "caller_scope", None)
+    owns: Callable[[str, str], bool] | None = getattr(index, "caller_owns_line", None)
+    if not callable(describe):
+        return sites, groups
+    known: dict[str, tuple[str, ...]] = {}
+
+    def stamp(site: CallSite) -> CallSite:
+        if site.caller_nid not in known:
+            known[site.caller_nid] = tuple(describe(site.caller_nid))
+        owns_line = bool(owns(site.caller_nid, site.source_location)) if callable(owns) else False
+        return dataclasses.replace(site, caller_scope=known[site.caller_nid], owns_line=owns_line)
+
+    return [stamp(s) for s in sites], [
+        ScopedGroup(scope=g.scope, candidates=[stamp(c) for c in g.candidates]) for g in groups
+    ]
+
+
+def _unsent_calls(
+    sources: Sequence[CallTargetSource],
+    repo_root: str,
+    groups: Sequence[ScopedGroup],
+    members: Sequence[CallSite],
+) -> list[CallTarget]:
+    """Calls graphify never sent, found on the line of a scoped site.
+
+    The scoped site keeps its own outcome, resolved or refused; it only proves its caller has
+    code on that line. 0.9.103 sends `Foo::m()` as a `php_scoped` member site, older graphify
+    as a group. Optional on a source, as `corpus` is: only per-line records can answer.
+    """
+    anchors = [group.candidates[0] for group in groups if group.candidates]
+    anchors += [site for site in members if site.scoped]
+    members = [site for site in members if not site.scoped]
+    found: list[CallTarget] = []
+    if not anchors:
+        return found
+    for source in sources:
+        ask: Callable[..., Iterable[CallTarget]] | None = getattr(source, "unsent_calls", None)
+        if callable(ask):
+            found.extend(ask(repo_root, anchors, members))
+    return found
+
+
+def _takes_nullsafe(ask: Callable) -> bool:
+    """Whether an `unsent_calls` accepts `nullsafe`, read from its signature as `corpus` is."""
+    try:
+        return "nullsafe" in inspect.signature(ask).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _nullsafe_calls(
+    sources: Sequence[CallTargetSource],
+    repo_root: str,
+    corpus: Sequence[str],
+    index: NodeIndex,
+    sink: EdgeSink,
+    record: MemberCallStatus,
+    stubs=None,
+) -> None:
+    """Edge `$x?->m()` calls, which graphify never sends, from the caller a parser placed.
+
+    The `unsent_calls` anchor exists to name the caller; here the parser names it instead: the
+    innermost callable around the call, found in the graph by the line it starts on. The parser
+    refuses a line holding another call of that name that is not nullsafe (that call has its
+    own raw site and fate) and one whose calls of that name sit in different callables. The
+    type source then takes only records of that name made inside that caller.
+    """
+    find = _first_offered(sources, "nullsafe_calls")
+    place = getattr(index, "callable_at", None)
+    if find is None or not callable(place):
+        return
+    finder = getattr(getattr(find, "__self__", None), "name", "")
+    sites: list[CallSite] = []
+    for call in find(repo_root, corpus):
+        record.nullsafe_sites_total += 1
+        if call.refusal:
+            record.unresolvable(f"{NULLSAFE_REASON_PREFIX}{finder}:{call.refusal}")
+            continue
+        caller = place(call.source_file, call.caller_lines, repo_root)
+        if caller is None:
+            record.unresolvable(NULLSAFE_REASON_PREFIX + REASON_NULLSAFE_CALLER_NOT_IN_GRAPH)
+            continue
+        sites.append(
+            CallSite(
+                caller_nid=caller,
+                receiver="",
+                method=call.method,
+                source_file=call.source_file,
+                source_location=f"L{call.line}",
+            )
+        )
+    sites, _ = _with_caller_scope(index, sites, [])
+    if not sites:
+        return
+    targets: list[CallTarget] = []
+    for source in sources:
+        ask = getattr(source, "unsent_calls", None)
+        if callable(ask) and _takes_nullsafe(ask):
+            targets.extend(ask(repo_root, (), (), nullsafe=sites))
+    proved = {target.site for target in targets}
+    unproved = sum(1 for site in sites if site not in proved)
+    if unproved:
+        record.unresolvable(NULLSAFE_REASON_PREFIX + REASON_NULLSAFE_NO_RECORD, unproved)
+    bound = _write_edges(
+        targets,
+        index,
+        sink,
+        record,
+        stubs=stubs,
+        repo_root=repo_root,
+        reason_prefix=NULLSAFE_REASON_PREFIX,
+    )
+    record.nullsafe_calls_added = sum(1 for site in sites if site in bound)
+
+
+_LOCATION_LINE = re.compile(r"\d+")
+
+
+def _first_offered(sources: Sequence[CallTargetSource], attribute: str) -> Callable | None:
+    """The first source's optional method of that name, as `unsent_calls` is optional."""
+    for source in sources:
+        found = getattr(source, attribute, None)
+        if callable(found):
+            return found
+    return None
+
+
+def _engine_verdict(call: EngineCall, proof: LineProof | None, names, repo_root: str) -> str:
+    """`""` when every record on the line names a body other than the engine's target."""
+    if proof is None or not proof.targets:
+        return REASON_ENGINE_NO_RECORD
+    marks = [names(call.target_nid, target, repo_root) for target in proof.targets]
+    if all(mark is True for mark in marks):
+        return REASON_ENGINE_AGREES
+    if any(mark is True for mark in marks):
+        return REASON_ENGINE_RECORDS_DISAGREE
+    if any(mark is None for mark in marks):
+        return REASON_ENGINE_UNPLACED
+    return ""
+
+
+def _check_engine_edges(
+    sources: Sequence[CallTargetSource],
+    repo_root: str,
+    all_edges: list[dict],
+    index: NodeIndex,
+    sink: EdgeSink,
+    record: status.ResolverStatus,
+    *,
+    owned: bool,
+    stubs=None,
+) -> None:
+    """Drop graphify's bare-name engine edges a type proof contradicts at every site.
+
+    The engine binds `$x->m()` to the last `m` declared in the caller's file, keeps one edge
+    per (caller, target) at the first site's line, and sends no raw call for it, so no other
+    pass sees it. It is dropped only when records in the caller prove another body at that
+    line AND at every other `->m(` in the caller, each line's records covering each call:
+    the edge may stand for any of those sites, and one unproved site may be the real one.
+    The proved targets are then edged the way `unsent_calls` edges are.
+
+    Removal needs the list graphify keeps. An incremental build hands over a copy, where a
+    removal is lost while an added edge is not, so there nothing is dropped or added.
+    """
+    list_calls = getattr(index, "engine_calls", None)
+    names = getattr(index, "names_node", None)
+    if not callable(list_calls) or not callable(names):
+        return
+    listed: list[EngineCall] = list(list_calls(all_edges))
+    record.engine_sites_total = len(listed)
+    if not listed:
+        return
+
+    def keep(reason: str, count: int = 1) -> None:
+        record.engine_kept[reason] = record.engine_kept.get(reason, 0) + count
+
+    # A dot-less target is a free function or an anonymous class's method; only a parser that
+    # reads a method declared there lets it in.
+    declared = _first_offered(sources, "method_declared_at")
+    engine: list[EngineCall] = []
+    for call in listed:
+        kind = (
+            True
+            if call.target_is_method
+            else declared(repo_root, call.source_file, call.target_location, call.method)
+            if declared is not None
+            else None
+        )
+        if kind is True:
+            engine.append(call)
+        else:
+            keep(REASON_ENGINE_TARGET_NOT_METHOD if kind is False else REASON_ENGINE_TARGET_UNKNOWN)
+    if not engine:
+        return
+
+    def site_at(call: EngineCall, line: int) -> CallSite:
+        return CallSite(
+            caller_nid=call.caller_nid,
+            receiver="",
+            method=call.method,
+            source_file=call.source_file,
+            source_location=f"L{line}",
+        )
+
+    def line_of(item: EngineCall | CallSite) -> int:
+        found = _LOCATION_LINE.search(item.source_location)
+        return int(found.group()) if found else 0
+
+    prove = _first_offered(sources, "line_proofs")
+    anchors, _ = _with_caller_scope(index, [site_at(c, line_of(c)) for c in engine], [])
+    proofs = prove(repo_root, anchors) if prove is not None else None
+    if proofs is None:
+        keep(REASON_ENGINE_NO_PROOFS, len(engine))
+        return
+
+    lines_of = _first_offered(sources, "member_call_lines")
+    pending: list[tuple[EngineCall, CallSite, CallerSites, list[CallSite]]] = []
+    for call, anchor in zip(engine, anchors, strict=True):
+        reason = _engine_verdict(call, proofs.get(anchor), names, repo_root)
+        if reason:
+            keep(reason)
+            continue
+        record.engine_contradicted += 1
+        sites: CallerSites | None = (
+            lines_of(repo_root, call.source_file, call.caller_location, call.method)
+            if lines_of is not None
+            else None
+        )
+        if sites is None:
+            keep(REASON_ENGINE_SITES_UNKNOWN)
+            continue
+        if sites.other_kinds:
+            keep(REASON_ENGINE_OTHER_CALL_KIND)
+            continue
+        if line_of(call) not in sites.lines:
+            keep(REASON_ENGINE_SITE_NOT_FOUND)
+            continue
+        others, _ = _with_caller_scope(
+            index, [site_at(call, n) for n in sorted(sites.lines) if n != line_of(call)], []
+        )
+        pending.append((call, anchor, sites, others))
+
+    asked = [site for *_, others in pending for site in others]
+    proofs = {**proofs, **(prove(repo_root, asked) or {})} if asked else proofs
+    remove = getattr(sink, "remove_edges", None)
+    drops: list[tuple[EngineCall, list[CallTarget], list[CallTarget], frozenset[int]]] = []
+    for call, anchor, sites, others in pending:
+        at = {line_of(call): anchor} | {line_of(s): s for s in others}
+        held = all(
+            not _engine_verdict(call, proofs.get(at[n]), names, repo_root)
+            and proofs[at[n]].calls >= count
+            for n, count in sites.lines.items()
+        )
+        if not held:
+            keep(REASON_ENGINE_OTHER_SITE)
+            continue
+        if not owned or not callable(remove):
+            keep(REASON_ENGINE_NOT_OWNED)
+            continue
+        here = list(proofs[anchor].targets)
+        proved = here + [t for s in others for t in proofs[s].targets]
+        drops.append((call, here, proved, sites.foreign))
+    if not drops:
+        return
+
+    proved_node = getattr(index, "proved_node_for", None)
+    origin_aware = getattr(index, "method_node_for", None)
+    closure_start = getattr(index, "closure_starts_on", None)
+    no_method = getattr(index, "method_missing_in_declaring_file", None)
+
+    def node_of(target: CallTarget) -> str | None:
+        # The binding `_write_edges` uses: the proof's declaring file first, visibility only
+        # when the proof names no file. Only a node holding the proved body will do.
+        if callable(proved_node):
+            nid = proved_node(target.site.caller_nid, target, repo_root)
+        elif callable(origin_aware):
+            nid = origin_aware(target.site.caller_nid, target.class_fqn, target.method)
+        else:
+            nid = index.method_node(target.class_fqn, target.method)
+        return nid if nid is not None and names(nid, target, repo_root) is True else None
+
+    def refusal(target: CallTarget, foreign: frozenset[int]) -> str:
+        """Why a proof cannot be edged from the caller, or `""`. The drop stands either way."""
+        site = target.site
+        if not site.owns_line:
+            return REASON_ENGINE_PROOF_NESTED
+        shared = callable(closure_start) and closure_start(site.caller_nid, site.source_location)
+        if shared or line_of(site) in foreign:
+            return REASON_ENGINE_PROOF_SHARED_LINE
+        return ""
+
+    before = getattr(sink, "added", 0)
+    stubbed = stubs.edges_added if stubs is not None else 0
+    # The node each proved target landed on, stub included: the shrink guard credits a dropped
+    # edge only when the row names a proof edge that is in the new graph.
+    landed: dict[int, str] = {}
+    for call, _here, proved, foreign in drops:
+        for target in proved:
+            refused = refusal(target, foreign)
+            if refused:
+                record.unresolvable(ENGINE_REASON_PREFIX + refused)
+                continue
+            nid = node_of(target)
+            if nid is None:
+                if stubs is not None and is_vendor_file(target.declaring_file, repo_root):
+                    stub_nid = stubs.node_for(target.class_fqn)
+                    stubs.add_call(call.caller_nid, stub_nid, target)
+                    landed.setdefault(id(target), stub_nid)
+                elif callable(no_method) and no_method(target, repo_root):
+                    record.unresolvable(ENGINE_REASON_PREFIX + REASON_ENGINE_METHOD_NO_NODE)
+                else:
+                    record.unresolvable(ENGINE_REASON_PREFIX + REASON_NOT_IN_GRAPH)
+            elif nid == call.caller_nid:
+                record.unresolvable(ENGINE_REASON_PREFIX + REASON_SELF_CALL)
+            else:
+                sink.add_call(call.caller_nid, nid, target)
+                landed.setdefault(id(target), nid)
+    record.engine_proved_added = getattr(sink, "added", 0) - before
+    if stubs is not None:
+        record.engine_proved_added += stubs.edges_added - stubbed
+
+    record.engine_dropped = remove([call.edge for call, *_ in drops])
+    for call, here, proved, _foreign in drops:
+        if any(target.interface_target for target in proved):
+            record.engine_dropped_interface += 1
+        # Only an edge this pass placed (or the graph already held) can stand as the proof.
+        proof_nid = next((landed[id(t)] for t in here if id(t) in landed), None)
+        record.engine_dropped_edges.append(
+            {
+                "source": call.caller_nid,
+                "target": call.target_nid,
+                "relation": "calls",
+                "reason": REASON_ENGINE_DROPPED,
+                "proof": {"source": call.caller_nid, "target": proof_nid},
+            }
+        )
+
+
+def _drop_new_site_edges(
+    sources: Sequence[CallTargetSource],
+    repo_root: str,
+    all_edges: list[dict],
+    index: NodeIndex,
+    sink: EdgeSink,
+    record: status.MemberCallStatus,
+    *,
+    owned: bool,
+) -> None:
+    """Drop graphify's edges that bound `new Type(...)` to a method named `type()`.
+
+    graphify sends `new Foo(...)` as a call to `Foo`; when its exact lookup misses (a vendor
+    class), the PHP fallback matches labels case-insensitively and can land on a method node.
+    An edge goes only when a parser reads a `new` of that name on the edge's line and no call
+    of that name there: such a call could be what the edge stands for. Runs before our edges
+    are written, because the sink skips a pair the graph holds and this edge would hide ours.
+    """
+    listed = getattr(index, "method_bound_calls", None)
+    read = _first_offered(sources, "new_site_line")
+    if not callable(listed) or read is None:
+        return
+
+    def keep(reason: str) -> None:
+        record.new_site_edges_total += 1
+        record.new_site_kept[reason] = record.new_site_kept.get(reason, 0) + 1
+
+    remove = getattr(sink, "remove_edges", None)
+    drops: list[MethodBoundCall] = []
+    for call in listed(all_edges):
+        found = _LOCATION_LINE.search(call.source_location)
+        line = read(repo_root, call.source_file, int(found.group()), call.method) if found else None
+        if line is None:
+            keep(REASON_NEW_SITE_NOT_LOCATED)
+            continue
+        if not line.creates:
+            continue
+        if line.calls_name:
+            keep(REASON_NEW_SITE_SHARED_LINE)
+            continue
+        if not owned or not callable(remove):
+            keep(REASON_NEW_SITE_NOT_OWNED)
+            continue
+        record.new_site_edges_total += 1
+        drops.append(call)
+    if not drops:
+        return
+    record.new_site_edges_dropped = remove([call.edge for call in drops])
+    record.new_site_dropped_edges = [
+        {"source": c.caller_nid, "target": c.target_nid, "source_location": c.source_location}
+        for c in drops
+    ]
 
 
 def run(
@@ -327,16 +821,22 @@ def run(
     sink: EdgeSink | None = None,
     scopes: ScopeIndex | None = None,
     stubs=None,
+    edges_owned: bool | None = None,
 ) -> status.ResolverStatus:
     """Resolve PHP member calls into `calls` edges, and record what happened either way.
 
     `sources` may be a factory taking the repository root. It is called in here, inside the
     record's own try, so a factory that raises leaves a `failed` record and not silence.
+    `edges_owned` says whether `all_edges` is graphify's own list; None asks the graph layer.
     """
-    record = status.ResolverStatus(name=RESOLVER_NAME)
+    record = MemberCallStatus(name=RESOLVER_NAME)
     try:
         if callable(sources):
             sources = sources(repo_root)
+        if edges_owned is None:
+            from .graph_adapter import holds_build_edges
+
+            edges_owned = holds_build_edges(all_edges)
         if index is None or sink is None:
             from .graph_adapter import GraphEdgeSink, GraphNodeIndex
 
@@ -347,6 +847,7 @@ def run(
             from .graph_adapter import GraphStubSink
 
             stubs = GraphStubSink(all_nodes, all_edges)
+        record.external_stubs = status.STUBS_ON if stubs is not None else status.STUBS_OFF
         if scopes is None and isinstance(index, ScopeIndex):
             scopes = index
 
@@ -366,19 +867,41 @@ def run(
             # build publishes, and the record says which layer was missing.
             record.state = "skipped"
             record.reason = "; ".join(unavailable) or "no call target sources configured"
+            # Nothing was proved here, so core's PHP pass keeps every site.
+            core_guard.prove(per_file, ())
             return record
 
-        sites = collect_sites(per_file)
-        groups = collect_scoped_groups(per_file, scopes) if scopes is not None else []
+        _drop_new_site_edges(usable, repo_root, all_edges, index, sink, record, owned=edges_owned)
+        site_raws: list[dict] = []
+        group_raws: list[dict] = []
+        sites = collect_sites(per_file, site_raws)
+        groups = collect_scoped_groups(per_file, scopes, group_raws) if scopes is not None else []
+        sites, groups = _with_caller_scope(index, sites, groups)
         record.eligible_sites = len(sites) + len(groups)
         targets = _ask_sources(usable, repo_root, sites, record, corpus=corpus)
         targets += _resolve_groups(groups, usable, repo_root, record, corpus=corpus)
-        record.resolved_sites = len({t.site for t in targets})
+        claimed = {t.site for t in targets}
+        record.resolved_sites = len(claimed)
         _write_edges(targets, index, sink, record, stubs=stubs, repo_root=repo_root)
+        # A claim proves the site even when its target is missing from the graph (a vendor class
+        # with stubs off): core binding another target there would contradict the source.
+        proved = _proved_raws(sites, site_raws, groups, group_raws, claimed)
+        # The unsent edges below prove nothing: no raw call stands behind them to withhold.
+        unsent = _unsent_calls(usable, repo_root, groups, sites)
+        before = getattr(sink, "added", 0)
+        _write_edges(unsent, index, sink, record, stubs=stubs, repo_root=repo_root)
+        record.unsent_calls_added = getattr(sink, "added", 0) - before
+        _nullsafe_calls(usable, repo_root, corpus, index, sink, record, stubs=stubs)
+        _check_engine_edges(
+            usable, repo_root, all_edges, index, sink, record, owned=edges_owned, stubs=stubs
+        )
         record.edges_added = getattr(sink, "added", record.resolved_sites)
         if stubs is not None:
             record.stub_nodes_added = stubs.nodes_added
             record.stub_edges_added = stubs.edges_added
+        # Published only on success: core_guard skips core when this pass failed. Refused sites
+        # stay with core, whose edge there may be right.
+        core_guard.prove(per_file, proved)
         record.state = "completed"
         if unavailable:
             record.reason = "; ".join(unavailable)

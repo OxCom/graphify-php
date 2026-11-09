@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from importlib import import_module
 
+from . import core_guard
 from .ports import CallTargetSource
 from .resolver import (
     PHP_SUFFIXES,
@@ -37,7 +38,9 @@ __all__ = [
     "register",
 ]
 
-_registered = False
+# Set on every resolve callable this package registers. A marker rather than `__module__`, so
+# the package imported under a second module path still recognises its own registrations.
+_OWNED = core_guard.OWNED
 
 
 def default_sources(repo_root: str = ".") -> Sequence[CallTargetSource]:
@@ -103,42 +106,43 @@ def register(
     repo_root: str = ".",
     route_sources_factory=default_route_sources,
 ) -> bool:
-    """Register the PHP resolver with graphify. Returns whether this call did the registering.
+    """Register the PHP passes with graphify. Returns whether this call registered any of them.
 
-    Idempotent by name rather than by a flag alone: a process that imported this package twice
-    under two module paths would otherwise register twice, and graphify runs the registry in
-    order without deduplicating, so the pass would run twice and the second run would find
-    every edge already present and report zero work.
+    Idempotent per pass and by ownership, not by name alone: graphify runs the registry in
+    order without deduplicating, so a pass registered twice runs twice and the second run finds
+    every edge present and reports zero work. A name is not proof the pass is ours, though:
+    graphify 0.9.103 registers its own `php_member_calls` when `graphify.extract` is imported.
     """
-    global _registered
     from graphify import resolver_registry
 
-    if _registered or any(
-        r.name == RESOLVER_NAME for r in resolver_registry.registered_resolvers()
-    ):
-        _registered = True
-        return False
-
-    resolver_registry.register(
-        resolver_registry.LanguageResolver(
-            name=RESOLVER_NAME,
-            suffixes=PHP_SUFFIXES,
-            resolve=make_resolver(sources_factory, repo_root),
-        )
-    )
-    # A second pass, not a stage of the first: routes add nodes rather than connect existing
-    # ones, and a separate registration gives them a status record the build gate can require.
-    resolver_registry.register(
-        resolver_registry.LanguageResolver(
-            name=RESOLVER_NAME_ROUTES,
-            suffixes=PHP_SUFFIXES,
-            resolve=make_route_resolver(route_sources_factory, repo_root),
-        )
-    )
-    # The Symfony configuration pass. Registered here because this is the one registration a
-    # build makes; a pass left out of it never runs, however complete its own `register` is.
     from . import config_resolver
 
-    config_resolver.register(repo_root)
-    _registered = True
-    return True
+    ours = {
+        r.name
+        for r in resolver_registry.registered_resolvers()
+        if getattr(r.resolve, _OWNED, False)
+    }
+    # Routes are a second pass rather than a stage of the first: they add nodes rather than
+    # connect existing ones, and a separate record is one the build gate can require. The
+    # Symfony configuration pass is listed here because a pass left out of here never runs.
+    passes = (
+        (RESOLVER_NAME, lambda: make_resolver(sources_factory, repo_root)),
+        (RESOLVER_NAME_ROUTES, lambda: make_route_resolver(route_sources_factory, repo_root)),
+        (config_resolver.RESOLVER_NAME, lambda: config_resolver.make_resolver(repo_root)),
+    )
+    registered = False
+    for name, build in passes:
+        if name in ours:
+            continue
+        resolve = build()
+        setattr(resolve, _OWNED, True)
+        resolver_registry.register(
+            resolver_registry.LanguageResolver(name=name, suffixes=PHP_SUFFIXES, resolve=resolve)
+        )
+        registered = True
+
+    # Imported after ours are in: a first import appends core's PHP pass behind them, and the
+    # guard needs it present to filter it. Core running first is caught by the guard itself.
+    import_module("graphify.extract")
+    core_guard.install(resolver_registry)
+    return registered

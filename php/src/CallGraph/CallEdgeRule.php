@@ -51,8 +51,8 @@ final class CallEdgeRule implements Rule
         foreach ($node->get(MethodCallCollector::class) as $file => $perNode) {
             foreach ($perNode as $records) {
                 foreach ($records as $record) {
-                    // The file comes from the key rather than from the record: the analyser owns
-                    // path normalisation, and a second copy would drift from it.
+                    // The key is the file the analyser was in. For a trait body that is the using
+                    // class's file, not the body's, so a file set by the collector wins over it.
                     yield CallEdge::fromArray($record, (string) $file);
                 }
             }

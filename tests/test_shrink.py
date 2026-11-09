@@ -169,6 +169,8 @@ def test_unchanged_file_count_drop_is_unexplained(root):
         "unexplained": 2,
         "base": 10,
         "floor": 9,
+        "attributed": {},
+        "attributed_total": 0,
     }
     assert "unexplained node loss 2" in report.reasons[0]
 
@@ -579,6 +581,8 @@ def test_to_dict_carries_the_contract_keys(root):
         "unexplained",
         "base",
         "floor",
+        "attributed",
+        "attributed_total",
     }
     assert set(d["edges"]) == {
         "old",
@@ -588,6 +592,8 @@ def test_to_dict_carries_the_contract_keys(root):
         "unexplained",
         "resolver_old",
         "resolver_lost",
+        "attributed",
+        "attributed_total",
     }
 
 
@@ -628,6 +634,8 @@ def test_ckeditor_degree_zero_externals_are_accepted(tmp_path):
         "unexplained": 1,
         "base": 152,
         "floor": 137,
+        "attributed": {},
+        "attributed_total": 0,
     }
     # The six non-orphan losses are renames in hash-unchanged tests/manual/* files; only
     # ckeditor-cjs-version.md really shrank (2 -> 1).
@@ -662,6 +670,8 @@ def test_games_needs_a_producer_change_for_claude_md(tmp_path):
         "unexplained": 6,
         "base": 363,
         "floor": 327,
+        "attributed": {},
+        "attributed_total": 0,
     }
     by_file = files_by_name(accepted)
     assert by_file["CLAUDE.md"]["class"] == "out_of_corpus"
