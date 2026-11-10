@@ -30,6 +30,9 @@ The composition rules are read from Symfony's own loader rather than guessed, in
 
 from __future__ import annotations
 
+import functools
+import os
+import re
 from dataclasses import dataclass
 
 from . import nodes
@@ -48,6 +51,26 @@ PATH_NOT_LITERAL = "path-not-literal"
 PREFIX_NOT_LITERAL = "prefix-not-literal"
 LOCALIZED_PATH = "localized-path"
 NO_PATH = "no-path"
+
+# `#[IsGranted]`, matched on the short name for the same reason as `ROUTE_ATTRIBUTE`.
+GUARD_ATTRIBUTE = "IsGranted"
+
+# Why an `#[IsGranted]` produced no guard. Fixed string, same discipline as the route reasons.
+GUARD_NO_ATTRIBUTE_ARG = "guard-no-attribute-argument"
+
+# Calls that check access by naming an attribute, with whether the caller decides what happens
+# on refusal (`isGranted` returns a bool) or the call throws itself (`denyAccessUnlessGranted`).
+GRANT_CALLS = {"isGranted": True, "denyAccessUnlessGranted": False}
+
+# Project helper names that check access without naming an attribute. Overridable, because the
+# convention is the project's own; a list of regexes, matched with `re.search`.
+ACCESS_CHECK_PATTERNS_ENV = "GRAPHIFY_PHP_ACCESS_CHECK_PATTERNS"
+DEFAULT_ACCESS_CHECK_PATTERNS = (r"^can[A-Z]", r"^assert\w*Access")
+
+# Why an access check produced no edge, or why the configured patterns were not used.
+CHECK_NO_ATTRIBUTE_ARG = "access-check-no-attribute-argument"
+CHECK_SPREAD_ARGUMENT = "access-check-spread-argument"
+ACCESS_CHECK_PATTERNS_INVALID = "access-check-patterns-invalid"
 
 
 @dataclass(frozen=True)
@@ -115,25 +138,299 @@ def _read_class(node, names, source_file: str, found: list) -> None:
         # route on one is a prefix for subclasses, never a route in its own right.
         return
     class_fqn = names.qualify_declaration(nodes.name_of(node))
-    class_attr = _route_attribute(node)
-    prefix = _Prefix.read(class_attr)
-
+    class_attrs = _route_attributes(node)
     body = nodes.child(node, "declaration_list", "enum_declaration_list")
+    # In trait code `self` is the using class, not the trait, so a trait's own constants never
+    # resolve `self::NAME`: the empty map refuses every such path as `path-not-literal`.
+    constants = {} if node.type == "trait_declaration" else _class_constants(body)
+    # `getAttributes(...)[0]` in the loader's `getGlobals()`: only the first class-level Route
+    # is the prefix, however many are stacked.
+    prefix = _Prefix.read(class_attrs[0] if class_attrs else None, constants)
+
     methods = nodes.children(body, "method_declaration") if body is not None else []
 
     before = len(found)
     for method in methods:
-        attribute = _route_attribute(method)
-        if attribute is None:
-            continue
-        found.append(_compose(attribute, prefix, class_fqn, nodes.name_of(method), source_file))
+        # Every Route on a method is a route of its own (the loader's `foreach`), whether the
+        # attributes are stacked in separate groups or listed in one.
+        for attribute in _route_attributes(method):
+            found.append(
+                _compose(
+                    attribute, prefix, class_fqn, nodes.name_of(method), source_file, constants
+                )
+            )
 
-    if len(found) == before and class_attr is not None:
+    if len(found) == before and class_attrs:
         invoke = next((m for m in methods if nodes.name_of(m) == "__invoke"), None)
         if invoke is not None:
-            # `resetGlobals()` in the loader: the class attribute is the route itself here, so
+            # `resetGlobals()` in the loader: each class attribute is a route itself here, so
             # it composes with nothing.
-            found.append(_compose(class_attr, _Prefix(), class_fqn, "__invoke", source_file))
+            for class_attr in class_attrs:
+                found.append(
+                    _compose(class_attr, _Prefix(), class_fqn, "__invoke", source_file, constants)
+                )
+
+
+def _class_constants(body) -> dict[str, str | None]:
+    """Constants declared in this class body, by name: the string value, or None.
+
+    None marks a name this package must not resolve: a value that is not a plain string
+    literal, or a name declared twice. A name absent from the map (inherited, from an
+    interface, from another class) is not resolved either.
+    """
+    found: dict[str, str | None] = {}
+    if body is None:
+        return found
+    for declaration in nodes.children(body, "const_declaration"):
+        for element in nodes.children(declaration, "const_element"):
+            name_node = nodes.child(element, "name")
+            value_node = next(
+                (c for c in element.children if c.is_named and c is not name_node), None
+            )
+            name = nodes.node_text(name_node)
+            found[name] = None if name in found else _string_value(value_node)
+    return found
+
+
+@dataclass(frozen=True)
+class AccessGuard:
+    """One `#[IsGranted]` as declared on a class or a method.
+
+    `label` is the first argument: the string value when it is a plain literal, otherwise the
+    argument's source text verbatim (`new Expression(self::READ_ROLES)`), never evaluated. It
+    proves the declaration, not what the security voter decides at runtime.
+    """
+
+    holder_class: str
+    holder_method: str | None
+    source_file: str
+    line: int
+    label: str
+    literal: bool
+    subject: str = ""
+    reason: str = ""
+
+    @property
+    def node_key(self) -> str:
+        """A literal names one role wherever it is written, so its node is shared.
+
+        Source text is scoped to the declaring class, because `self::` and an imported short
+        name mean something different in another class.
+        """
+        if self.literal:
+            return f"guard#{self.label}"
+        return f"{self.holder_class}::guard#{self.label}"
+
+
+def collect_guards(root, names, source_file: str) -> list[AccessGuard]:
+    """Every `#[IsGranted]` on a class or method in one file, abstract classes included.
+
+    Symfony does not inherit class attributes, so a guard is reported on its declaring class
+    only and never copied onto subclasses.
+    """
+    found: list[AccessGuard] = []
+    _walk_guards(root, names, source_file, found)
+    return found
+
+
+def _walk_guards(node, names, source_file: str, found: list) -> None:
+    if node.type in nodes.CLASS_KINDS:
+        _read_class_guards(node, names, source_file, found)
+        return
+    for child in node.children:
+        _walk_guards(child, names, source_file, found)
+
+
+def _read_class_guards(node, names, source_file: str, found: list) -> None:
+    class_fqn = names.qualify_declaration(nodes.name_of(node))
+    for attribute in _attributes_named(node, GUARD_ATTRIBUTE):
+        found.append(_guard(attribute, class_fqn, None, source_file))
+    body = nodes.child(node, "declaration_list", "enum_declaration_list")
+    methods = nodes.children(body, "method_declaration") if body is not None else []
+    for method in methods:
+        for attribute in _attributes_named(method, GUARD_ATTRIBUTE):
+            found.append(_guard(attribute, class_fqn, nodes.name_of(method), source_file))
+
+
+def _guard(attribute, class_fqn: str, method_name: str | None, source_file: str) -> AccessGuard:
+    positional, named = _arguments(attribute)
+    first = named.get("attribute") or (positional[0] if positional else None)
+    subject_node = named.get("subject") or (positional[1] if len(positional) > 1 else None)
+    subject = nodes.node_text(subject_node) if subject_node is not None else ""
+    line = nodes.line_span(attribute)[0]
+    if first is None:
+        return AccessGuard(
+            class_fqn, method_name, source_file, line, "", False, subject, GUARD_NO_ATTRIBUTE_ARG
+        )
+    value = _string_value(first)
+    if value is not None:
+        return AccessGuard(class_fqn, method_name, source_file, line, value, True, subject)
+    return AccessGuard(
+        class_fqn, method_name, source_file, line, nodes.node_text(first), False, subject
+    )
+
+
+@dataclass(frozen=True)
+class AccessCheck:
+    """One access-check call written directly in a route handler's body.
+
+    `check_call` is the called method's name. For `isGranted` and `denyAccessUnlessGranted`,
+    `label`, `literal` and `subject` are read from the arguments exactly as `AccessGuard` reads
+    them from `#[IsGranted]`, so both name one guard node. For a project helper matched by
+    pattern (`canView`, `assertTeamAccess`), `label` is the method name. A call proves the
+    handler asks; it does not prove what the voter or the helper decides.
+    """
+
+    holder_class: str
+    holder_method: str
+    source_file: str
+    line: int
+    check_call: str
+    label: str
+    literal: bool
+    subject: str = ""
+    reason: str = ""
+
+    @property
+    def is_grant_call(self) -> bool:
+        return self.check_call in GRANT_CALLS
+
+    @property
+    def conditional(self) -> bool | None:
+        """True when the caller decides on refusal, False when the call throws, None unknown."""
+        return GRANT_CALLS.get(self.check_call)
+
+    @property
+    def node_key(self) -> str:
+        """The `#[IsGranted]` identity for an attribute check, a class-scoped one for a helper.
+
+        A helper is keyed by the calling class: `$this->canView()` in two controllers calls two
+        methods that only share a name.
+        """
+        if not self.is_grant_call:
+            return f"{self.holder_class}::check#{self.check_call}"
+        if self.literal:
+            return f"guard#{self.label}"
+        return f"{self.holder_class}::guard#{self.label}"
+
+
+def access_check_patterns() -> tuple[tuple[re.Pattern, ...], str]:
+    """The helper-name patterns in force, and a fixed reason when the override was refused.
+
+    `GRAPHIFY_PHP_ACCESS_CHECK_PATTERNS` is comma-separated, so a pattern cannot contain a
+    comma. An override that is empty or fails to compile falls back to the defaults.
+    """
+    return _compile_patterns(os.environ.get(ACCESS_CHECK_PATTERNS_ENV) or "")
+
+
+@functools.lru_cache(maxsize=8)
+def _compile_patterns(raw: str) -> tuple[tuple[re.Pattern, ...], str]:
+    defaults = tuple(re.compile(p) for p in DEFAULT_ACCESS_CHECK_PATTERNS)
+    if not raw:
+        return defaults, ""
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return defaults, ACCESS_CHECK_PATTERNS_INVALID
+    try:
+        return tuple(re.compile(p) for p in parts), ""
+    except re.error:
+        return defaults, ACCESS_CHECK_PATTERNS_INVALID
+
+
+def collect_access_checks(root, names, source_file: str, handlers) -> list[AccessCheck]:
+    """Access-check calls on `$this` written directly in the body of a route handler.
+
+    `handlers` is the set of `(class FQN, method)` pairs that carry a `#[Route]`, the invokable
+    fallback included. Only `$this->name(...)` and `$this?->name(...)` count, and only where the
+    handler's own body runs them: a closure, an arrow function, an anonymous class or a nested
+    function is not descended into, because nothing proves the handler runs it. A call in a
+    method that is not a handler is not read, even when a handler calls that method.
+    """
+    found: list[AccessCheck] = []
+    if not handlers:
+        return found
+    patterns, _ = access_check_patterns()
+    _walk_checks(root, names, source_file, handlers, patterns, found)
+    return found
+
+
+def _walk_checks(node, names, source_file: str, handlers, patterns, found: list) -> None:
+    if node.type in nodes.CLASS_KINDS:
+        class_fqn = names.qualify_declaration(nodes.name_of(node))
+        body = nodes.child(node, "declaration_list", "enum_declaration_list")
+        for method in nodes.children(body, "method_declaration"):
+            method_name = nodes.name_of(method)
+            if (class_fqn, method_name) not in handlers:
+                continue
+            statements = nodes.child(method, "compound_statement")
+            for call in _direct_this_calls(statements):
+                check = _check(call, class_fqn, method_name, source_file, patterns)
+                if check is not None:
+                    found.append(check)
+        return
+    for child in node.children:
+        _walk_checks(child, names, source_file, handlers, patterns, found)
+
+
+# Bodies that do not run when the enclosing method runs, or run under another `$this`.
+_NOT_THE_HANDLER_BODY = (
+    *nodes.CLOSURE_KINDS,
+    *nodes.CLASS_KINDS,
+    "anonymous_class",
+    "function_definition",
+)
+
+
+def _direct_this_calls(node) -> list:
+    """`$this->m()` / `$this?->m()` calls under `node`, in source order, skipping nested bodies."""
+    out: list = []
+    if node is None:
+        return out
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in _NOT_THE_HANDLER_BODY:
+            continue
+        if current.type == "object_creation_expression" and nodes.child(
+            current, "declaration_list"
+        ):
+            continue
+        if current.type in ("member_call_expression", "nullsafe_member_call_expression"):
+            receiver = current.child_by_field_name("object")
+            name = current.child_by_field_name("name")
+            if (
+                receiver is not None
+                and receiver.type == "variable_name"
+                and nodes.node_text(receiver) == "$this"
+                and name is not None
+                and name.type == "name"
+            ):
+                out.append(current)
+        stack.extend(reversed(current.children))
+    return out
+
+
+def _check(call, class_fqn: str, method_name: str, source_file: str, patterns):
+    called = nodes.node_text(call.child_by_field_name("name"))
+    line = nodes.line_span(call)[0]
+    if called not in GRANT_CALLS:
+        if not any(p.search(called) for p in patterns):
+            return None
+        return AccessCheck(class_fqn, method_name, source_file, line, called, called, False)
+
+    positional, named = _arguments(call)
+    first = named.get("attribute") or (positional[0] if positional else None)
+    subject_node = named.get("subject") or (positional[1] if len(positional) > 1 else None)
+    if first is None or first.type == "variadic_unpacking":
+        reason = CHECK_NO_ATTRIBUTE_ARG if first is None else CHECK_SPREAD_ARGUMENT
+        return AccessCheck(class_fqn, method_name, source_file, line, called, "", False, "", reason)
+    subject = nodes.node_text(subject_node) if subject_node is not None else ""
+    value = _string_value(first)
+    if value is not None:
+        return AccessCheck(class_fqn, method_name, source_file, line, called, value, True, subject)
+    return AccessCheck(
+        class_fqn, method_name, source_file, line, called, nodes.node_text(first), False, subject
+    )
 
 
 @dataclass
@@ -146,12 +443,12 @@ class _Prefix:
     path_literal: bool = True
 
     @classmethod
-    def read(cls, attribute) -> _Prefix:
+    def read(cls, attribute, constants: dict[str, str | None] | None = None) -> _Prefix:
         if attribute is None:
             return cls()
         positional, named = _arguments(attribute)
         path_node = named.get("path") or (positional[0] if positional else None)
-        path, literal = _path_of(path_node)
+        path, literal = _path_of(path_node, constants)
         return cls(
             path=path,
             name=_string_value(named.get("name")) or "",
@@ -161,11 +458,16 @@ class _Prefix:
 
 
 def _compose(
-    attribute, prefix: _Prefix, class_fqn: str, method_name: str, source_file: str
+    attribute,
+    prefix: _Prefix,
+    class_fqn: str,
+    method_name: str,
+    source_file: str,
+    constants: dict[str, str | None] | None = None,
 ) -> RouteDeclaration:
     positional, named = _arguments(attribute)
     path_node = named.get("path") or (positional[0] if positional else None)
-    method_path, literal = _path_of(path_node)
+    method_path, literal = _path_of(path_node, constants)
 
     name = _string_value(named.get("name"))
     # `array_unique(array_merge(...))`: a union, with the class-level entries first.
@@ -198,21 +500,27 @@ def _compose(
     )
 
 
-def _route_attribute(declaration):
-    """The `#[Route(...)]` on a class or method declaration, or None.
+def _route_attributes(declaration) -> list:
+    """Every `#[Route(...)]` on a class or method declaration, in source order."""
+    return _attributes_named(declaration, ROUTE_ATTRIBUTE)
+
+
+def _attributes_named(declaration, short_name: str) -> list:
+    """The attributes written with `short_name` on a declaration, in source order.
 
     Only attribute groups directly on this declaration are read, so an attribute on a nested
     declaration cannot be mistaken for one on its parent.
     """
     attributes = nodes.child(declaration, "attribute_list")
     if attributes is None:
-        return None
+        return []
+    found = []
     for group in nodes.children(attributes, "attribute_group"):
         for attribute in nodes.children(group, "attribute"):
             written = nodes.node_text(nodes.child(attribute, "name", "qualified_name"))
-            if written.rsplit("\\", 1)[-1] == ROUTE_ATTRIBUTE:
-                return attribute
-    return None
+            if written.rsplit("\\", 1)[-1] == short_name:
+                found.append(attribute)
+    return found
 
 
 def _arguments(attribute) -> tuple[list, dict]:
@@ -220,10 +528,17 @@ def _arguments(attribute) -> tuple[list, dict]:
     named: dict = {}
     argument_list = nodes.child(attribute, "arguments")
     for argument in nodes.children(argument_list, "argument"):
-        label = nodes.child(argument, "name")
-        # Named nodes only: `name: "x"` puts a bare `:` token between the label and the value,
-        # and taking the first non-label child would take the colon.
-        value = next((c for c in argument.children if c.is_named and c is not label), None)
+        # The `name` FIELD, not the first `name` child: a bare constant (`#[Route(PREFIX)]`)
+        # is a `name` node too, and reading it as a label dropped the argument.
+        label = None
+        value = None
+        for i, c in enumerate(argument.children):
+            if argument.field_name_for_child(i) == "name":
+                label = c
+            elif c.is_named and value is None:
+                # Named nodes only: `name: "x"` puts a bare `:` token between the label and
+                # the value, and taking the first non-label child would take the colon.
+                value = c
         if value is None:
             continue
         if label is not None:
@@ -233,14 +548,47 @@ def _arguments(attribute) -> tuple[list, dict]:
     return positional, named
 
 
-def _path_of(node) -> tuple[str | None, bool]:
+def _path_of(node, constants: dict[str, str | None] | None = None) -> tuple[str | None, bool]:
     """(path, was-a-literal). A non-literal keeps `None` rather than a guessed value."""
     if node is None:
         return None, True
-    value = _string_value(node)
+    value = _path_value(node, constants or {})
     if value is None:
         return None, False
     return value, True
+
+
+def _path_value(node, constants: dict[str, str | None]) -> str | None:
+    """A string literal, `self::NAME` for a constant of this class body, or a `.` of those.
+
+    `self::` names the declaring class, so a constant declared in the same body has exactly the
+    value written there. `static::` is late-bound to whichever subclass is called and is
+    refused, as is any constant this class body does not declare itself.
+    """
+    if node is None:
+        return None
+    if node.type in STRING_KINDS:
+        return _string_value(node)
+    if node.type == "class_constant_access_expression":
+        named = [c for c in node.children if c.is_named]
+        if (
+            len(named) == 2
+            and named[0].type == "relative_scope"
+            and nodes.node_text(named[0]).lower() == "self"
+            and named[1].type == "name"
+        ):
+            return constants.get(nodes.node_text(named[1]))
+        return None
+    if node.type == "binary_expression":
+        operators = [c for c in node.children if not c.is_named]
+        if len(operators) != 1 or nodes.node_text(operators[0]) != ".":
+            return None
+        left = _path_value(node.child_by_field_name("left"), constants)
+        right = _path_value(node.child_by_field_name("right"), constants)
+        if left is None or right is None:
+            return None
+        return left + right
+    return None
 
 
 def _is_array(node) -> bool:

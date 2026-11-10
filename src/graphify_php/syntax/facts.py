@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 from ..ports import Confidence
 from .call_sites import CallSiteIndex
-from .routes import RouteDeclaration
+from .routes import AccessCheck, AccessGuard, RouteDeclaration
 
 
 @dataclass(frozen=True)
@@ -158,6 +158,10 @@ class FileFacts:
     # Route attributes declared in this file. Not a type fact, carried here because the file
     # is what owns them and one parse should answer every question about it.
     routes: list[RouteDeclaration] = field(default_factory=list)
+    # `#[IsGranted]` declarations on classes and methods in this file, for the same reason.
+    guards: list[AccessGuard] = field(default_factory=list)
+    # Access-check calls written directly in route handler bodies in this file.
+    access_checks: list[AccessCheck] = field(default_factory=list)
     # Line spans of every `new class { ... }`. The walker reads nothing inside one, so a site
     # there has no facts of its own and must not be answered with the enclosing class's.
     anonymous_classes: list[tuple[int, int]] = field(default_factory=list)

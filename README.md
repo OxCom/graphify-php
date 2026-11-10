@@ -154,11 +154,18 @@ a file.
 A second registered pass publishes what `#[Route]` attributes declare. Each declaration becomes
 one node — labelled with the path template, carrying the route name, the HTTP methods and
 whether the path was composed whole — and one `handled_by` edge to the controller method that
-serves it. On the reference Symfony application: **156 route nodes, 156 edges, no refusals**.
+serves it. `route_path` holds the full composed path, `""` when it could not be composed.
+
+Every `#[Route]` on a method is a route of its own, stacked in separate groups or listed in one.
+Only the first class-level `#[Route]` is the prefix. An invokable class with no method routes
+turns each class-level `#[Route]` into a route for `__invoke`. A path may be a string literal,
+`self::NAME` for a string constant declared in the same class body, or a `.` concatenation of
+those; `static::NAME`, inherited constants and any `self::NAME` in a trait (where `self` is the
+using class) are refused as `path-not-literal`.
 
 The node key is `Class::method#path`, so two controller methods declaring the same path stay two
-nodes. That is not hypothetical: the reference application declares 156 routes over 135 distinct
-path templates, the repeats being different HTTP verbs on one path.
+nodes. An older measurement of the reference application found more route declarations than
+distinct path templates, the repeats being different HTTP verbs on one path.
 
 The relation is `handled_by`, not `routed_to` — the latter already means messenger transport
 routing, and merging the two would put HTTP paths and message transports in one query.
@@ -166,6 +173,50 @@ routing, and merging the two would put HTTP paths and message transports in one 
 A declaration whose controller method is missing from the graph still gets its node; only the
 edge is withheld, and the omission is counted under `controller_not_in_graph`. The path is a
 fact about the codebase either way.
+
+### Access guards
+
+Guards are `access_guard` nodes. Three relations reach them:
+
+- `guarded_by` with `_via: "attribute"`: from a method or class to each `#[IsGranted]` on it.
+  A literal role is one shared node (`guard#ROLE_X`); any other first argument is kept as source
+  text and scoped to its class. The edge carries `guard_scope` and `guard_attribute: "IsGranted"`.
+- `checks_access` with `_via: "call"`: from a route handler to the guard named by a direct
+  `$this->isGranted(...)` (`conditional: true`) or `$this->denyAccessUnlessGranted(...)`
+  (`conditional: false`) in its body. These share the `#[IsGranted]` node. A call whose name
+  matches `^can[A-Z]` or `^assert\w*Access` goes to a class-scoped node labelled with the method
+  name (`conditional: null`). `GRAPHIFY_PHP_ACCESS_CHECK_PATTERNS` replaces the patterns with a
+  comma-separated list; an invalid list falls back to the defaults and is counted. Every
+  `checks_access` edge carries `check_kind`: `framework` for `isGranted` and
+  `denyAccessUnlessGranted`, `pattern` for a name-matched project method.
+- `guarded_by` with `_via: "access_control"`: from a route node to the
+  `config/packages/security.yaml` rule Symfony applies to it. The edge is added only when that
+  rule is proved to be the first match for every URL the route template can produce.
+  Otherwise the route is counted under `access-control-undecided`.
+
+The `php_routes` status record counts `handlers_total` and `handlers_unguarded` (handlers with no
+guard edge from the method, its class or its routes, and no `check_kind: framework` edge). A
+pattern-only check does not cover a handler. Handlers with no `guarded_by` edge fall into exactly
+one of `handlers_check_framework`, `handlers_check_pattern_only` and `handlers_unchecked`, and
+`handlers_unguarded` equals the last two summed. The record also counts
+`checks_access_declarations`, `checks_access_edges_added`, `access_control_edges_added` and
+`routes_access_control_undecided`.
+
+Limits:
+
+- Inherited route methods are not followed, although Symfony reads routes from parent methods.
+- A `use ... as` alias for `Route` or `IsGranted` is not followed.
+- Two stacked routes with the same path on one method collapse to one node.
+- A shared literal guard node keeps the subject and location of the first declaration seen.
+- `access_control` is read from top-level `security.yaml` only, and only a proved first match
+  gets an edge. When a `when@<env>` block, another file under `config/packages/`, or a PHP/XML
+  file there may declare `access_control`, every such edge is refused as
+  `access-control-overridden-elsewhere`.
+- `route_path` is the attribute-declared path. A routes-config import prefix is not applied,
+  and when one exists access_control edges are refused as `access-control-route-prefix-unread`.
+  Routing PHP and XML files and `src/Kernel.php` get a text check for `prefix` calls only.
+- `checks_access` reads only direct `$this` calls in handler bodies. Closures, arrow functions,
+  anonymous classes and helper methods are not followed.
 
 ## Verifying it works
 

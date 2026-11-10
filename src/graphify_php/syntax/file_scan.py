@@ -14,7 +14,7 @@ from .call_sites import index_calls
 from .collectors import COLLECTORS, ScanContext, by_node_kind
 from .facts import ClassScope, FileFacts, MethodScope
 from .names import NameResolver
-from .routes import collect_routes
+from .routes import collect_access_checks, collect_guards, collect_routes
 
 
 def scan_source(path: str, source: bytes, collectors=None) -> FileFacts:
@@ -29,6 +29,9 @@ def scan_source(path: str, source: bytes, collectors=None) -> FileFacts:
     # keeping it out means the walker still has one reason to change.
     facts.calls = index_calls(tree.root_node)
     facts.routes = collect_routes(tree.root_node, names, path)
+    facts.guards = collect_guards(tree.root_node, names, path)
+    handlers = {(r.controller_class, r.controller_method) for r in facts.routes}
+    facts.access_checks = collect_access_checks(tree.root_node, names, path, handlers)
     return facts
 
 

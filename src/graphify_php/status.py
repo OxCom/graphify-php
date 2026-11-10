@@ -70,6 +70,26 @@ class ResolverStatus:
     eligible_sites: int = 0  # member calls this resolver could have resolved
     resolved_sites: int = 0  # ... and did
     edges_added: int = 0
+    # Route pass only: `#[IsGranted]` declarations read, and the `guarded_by` edges they produced.
+    guard_declarations: int = 0
+    guard_edges_added: int = 0
+    # Route pass only: distinct handler method nodes that received a `handled_by` edge.
+    handlers_total: int = 0
+    # ... of those, with no guard edge from the method, its class, or a route of it, and no
+    # framework (`isGranted` / `denyAccessUnlessGranted`) `checks_access` edge.
+    handlers_unguarded: int = 0
+    # Handlers with no `guarded_by` edge, split three ways (the last two sum to unguarded):
+    handlers_check_framework: int = 0  # at least one framework `checks_access` edge
+    handlers_check_pattern_only: int = 0  # only pattern-matched `checks_access` edges
+    handlers_unchecked: int = 0  # no `checks_access` edge
+    # Route nodes with a full path for which no `access_control` rule could be proved first.
+    routes_access_control_undecided: int = 0
+    # Access-check calls read in handler bodies, refused ones included (the denominator).
+    checks_access_declarations: int = 0
+    # `checks_access` edges those calls produced.
+    checks_access_edges_added: int = 0
+    # `guarded_by` edges from a route node to the `access_control` rule proved to apply.
+    access_control_edges_added: int = 0
     # Target records bound to an external stub node instead of being dropped as
     # `target_not_in_graph`, and the stub nodes and edges that produced. Zero with the flag off.
     external_stubbed: int = 0

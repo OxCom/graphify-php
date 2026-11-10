@@ -39,7 +39,7 @@ from ..ports import RouteDeclarationSource  # noqa: F401  the port this module i
 from ..syntax import nodes
 from ..syntax.facts import FileFacts
 from ..syntax.file_scan import scan_source
-from ..syntax.routes import RouteDeclaration
+from ..syntax.routes import AccessCheck, AccessGuard, RouteDeclaration, access_check_patterns
 
 UNREADABLE_FILE = "unreadable-file"
 
@@ -49,6 +49,8 @@ class RouteResolution:
     """What a source made of the files it was given."""
 
     declarations: list[RouteDeclaration] = field(default_factory=list)
+    guards: list[AccessGuard] = field(default_factory=list)
+    access_checks: list[AccessCheck] = field(default_factory=list)
     unresolved: dict[str, int] = field(default_factory=dict)
     files_seen: int = 0
 
@@ -74,6 +76,10 @@ class TreeSitterRouteSource:
 
     def declarations(self, repo_root: str, files: Iterable[str]) -> RouteResolution:
         resolution = RouteResolution()
+        _, patterns_refused = access_check_patterns()
+        if patterns_refused:
+            # Once per run, not per file: the override is one setting.
+            _count(resolution, patterns_refused)
         seen: set[str] = set()
         for path in files:
             full = path if os.path.isabs(path) else os.path.join(repo_root, path)
@@ -90,6 +96,14 @@ class TreeSitterRouteSource:
                 resolution.declarations.append(declaration)
                 if declaration.reason:
                     _count(resolution, declaration.reason)
+            for guard in facts.guards:
+                resolution.guards.append(guard)
+                if guard.reason:
+                    _count(resolution, guard.reason)
+            for check in facts.access_checks:
+                resolution.access_checks.append(check)
+                if check.reason:
+                    _count(resolution, check.reason)
         return resolution
 
     def _facts(self, path: str, full: str) -> FileFacts | None:

@@ -936,6 +936,46 @@ RESOLVER_NAME_ROUTES = "php_routes"
 # Reasons the route pass owns. A source's own reasons arrive prefixed with its name.
 REASON_ROUTE_NO_CONTROLLER = "controller_not_in_graph"
 REASON_ROUTE_NO_PATH = "route_had_no_path"
+REASON_GUARD_NO_HOLDER = "guard_holder_not_in_graph"
+REASON_CHECK_NO_HANDLER = "check_handler_not_in_graph"
+
+
+def _publish_access_control(record, repo_root: str, route_nodes: dict, sink) -> set:
+    """Edge each route node to the `access_control` rule proved to apply to all its URLs.
+
+    Returns the route node ids that received such an edge. A repository with no
+    `config/packages/security.yaml` gets no edges and no reasons.
+    """
+    from .syntax import access_control
+
+    add = getattr(sink, "add_access_control", None)
+    if not callable(add):
+        return set()
+    rules, why = access_control.load_rules(repo_root)
+    if why:
+        record.unresolvable(why)
+    if rules is None:
+        return set()
+    blocker = access_control.config_blocker(repo_root)
+    if blocker:
+        # The rules or the route paths read here may not be the ones served: no edge at all,
+        # one count per route, as for an undecided route.
+        record.unresolvable(blocker, len(route_nodes))
+        return set()
+    controlled: set = set()
+    for route_nid, declaration in route_nodes.items():
+        if declaration.path is None:
+            record.unresolvable(access_control.REASON_NO_PATH)
+            continue
+        rule, reason = access_control.first_rule(declaration.path, rules)
+        if rule is None:
+            record.unresolvable(reason)
+            if reason == access_control.REASON_UNDECIDED:
+                record.routes_access_control_undecided += 1
+            continue
+        if add(rule, route_nid, access_control.SECURITY_YAML) is not None:
+            controlled.add(route_nid)
+    return controlled
 
 
 def run_routes(
@@ -987,38 +1027,124 @@ def run_routes(
             return record
 
         declarations = []
+        guards = []
+        checks = []
         for source in usable:
             resolution = source.declarations(repo_root, corpus)
             record.files_seen = max(record.files_seen, resolution.files_seen)
             for reason, count in (resolution.unresolved or {}).items():
                 record.unresolvable(f"{source.name}:{reason}", count)
             declarations.extend(resolution.declarations)
+            guards.extend(getattr(resolution, "guards", None) or [])
+            checks.extend(getattr(resolution, "access_checks", None) or [])
 
         record.eligible_sites = len(declarations)
         # The declaration names the file it was read from, and the controller class is declared
         # in that same file. An index that can use it does; `ports.NodeIndex` cannot express it
         # yet, so the narrow call stays the fallback.
         in_file = getattr(index, "method_node_in_file", None)
+
+        def method_nid(source_file: str, class_fqn: str, method: str) -> str | None:
+            if callable(in_file):
+                nid = in_file(source_file, class_fqn, method)
+            else:
+                nid = index.method_node(class_fqn, method)
+            return nid if isinstance(nid, str) else None
+
+        # Route node id -> the first declaration with that node; handler node id -> its class
+        # and route node ids. Both feed the coverage counters and the access_control pass.
+        route_nodes: dict[str, object] = {}
+        handlers: dict[str, tuple[str, set]] = {}
         for declaration in declarations:
-            controller_nid = (
-                in_file(
-                    declaration.source_file,
-                    declaration.controller_class,
-                    declaration.controller_method,
-                )
-                if callable(in_file)
-                else index.method_node(declaration.controller_class, declaration.controller_method)
+            controller_nid = method_nid(
+                declaration.source_file,
+                declaration.controller_class,
+                declaration.controller_method,
             )
             if controller_nid is None:
                 # The node still goes in: the declaration is a fact about this codebase whether
                 # or not the controller method survived extraction, and dropping it would hide
                 # the path. Only the edge is withheld.
                 record.unresolvable(REASON_ROUTE_NO_CONTROLLER)
-            if sink.add_route(declaration, controller_nid) is None:
+            route_nid = sink.add_route(declaration, controller_nid)
+            if route_nid is None:
                 record.unresolvable(REASON_ROUTE_NO_PATH)
+                continue
+            route_nodes.setdefault(route_nid, declaration)
+            if controller_nid is not None:
+                handler = handlers.setdefault(controller_nid, (declaration.controller_class, set()))
+                handler[1].add(route_nid)
+
+        # A guard with no reason carries a label; one with a reason is already counted above.
+        record.guard_declarations = len(guards)
+        class_in_file = getattr(index, "class_node_in_file", None)
+        add_guard = getattr(sink, "add_guard", None)
+        guarded_methods: set = set()
+        guarded_classes: set = set()
+        for guard in guards:
+            if guard.reason or not callable(add_guard):
+                continue
+            if guard.holder_method is not None:
+                holder_nid = method_nid(guard.source_file, guard.holder_class, guard.holder_method)
+            else:
+                holder_nid = (
+                    class_in_file(guard.source_file, guard.holder_class)
+                    if callable(class_in_file)
+                    else None
+                )
+            if holder_nid is None:
+                # Unlike a route, no node goes in: a guard node with no edge says nothing.
+                record.unresolvable(REASON_GUARD_NO_HOLDER)
+                continue
+            if add_guard(guard, holder_nid) is None:
+                continue
+            if guard.holder_method is not None:
+                guarded_methods.add(holder_nid)
+            else:
+                guarded_classes.add(guard.holder_class)
+
+        # After the attribute guards on purpose: a guard node shared by an attribute and a call
+        # keeps the attribute's fields.
+        record.checks_access_declarations = len(checks)
+        add_check = getattr(sink, "add_access_check", None)
+        framework_checked: set = set()
+        pattern_checked: set = set()
+        for check in checks:
+            if check.reason or not callable(add_check):
+                continue
+            handler_nid = method_nid(check.source_file, check.holder_class, check.holder_method)
+            if handler_nid is None:
+                record.unresolvable(REASON_CHECK_NO_HANDLER)
+                continue
+            if add_check(check, handler_nid) is not None:
+                # Same rule as the edge's `check_kind`.
+                (framework_checked if check.is_grant_call else pattern_checked).add(handler_nid)
+
+        controlled = _publish_access_control(record, repo_root, route_nodes, sink)
+
+        record.handlers_total = len(handlers)
+        # A pattern match names a project method whose decision is unknown, so it covers
+        # nothing; the three buckets split the handlers that no `guarded_by` edge reaches.
+        for handler_nid, (class_fqn, route_nids) in handlers.items():
+            if (
+                handler_nid in guarded_methods
+                or class_fqn in guarded_classes
+                or route_nids & controlled
+            ):
+                continue
+            if handler_nid in framework_checked:
+                record.handlers_check_framework += 1
+            elif handler_nid in pattern_checked:
+                record.handlers_check_pattern_only += 1
+            else:
+                record.handlers_unchecked += 1
+        record.handlers_unguarded = record.handlers_check_pattern_only + record.handlers_unchecked
 
         record.resolved_sites = sink.nodes_added
         record.edges_added = sink.edges_added
+        record.guard_edges_added = getattr(sink, "guard_edges_added", 0)
+        record.checks_access_edges_added = getattr(sink, "checks_access_edges_added", 0)
+        record.access_control_edges_added = getattr(sink, "access_control_edges_added", 0)
         record.state = "completed"
         if unavailable:
             record.reason = "; ".join(unavailable)

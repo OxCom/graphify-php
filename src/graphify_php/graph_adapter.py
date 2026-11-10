@@ -304,6 +304,16 @@ class GraphNodeIndex:
         the lookup work for the many real projects whose directory layout does not mirror their
         namespace. Falls back to the namespace match when the file holds no such class.
         """
+        class_nid = self.class_node_in_file(source_file, class_fqn)
+        if class_nid is None:
+            return None
+        return self._methods.get((class_nid, _key(method)))
+
+    def class_node_in_file(self, source_file: str, class_fqn: str) -> str | None:
+        """The node id of `class_fqn`, preferring the one class of that name in `source_file`.
+
+        Falls back to the namespace match when the file holds no such class, or more than one.
+        """
         parts = _fqn_parts(class_fqn)
         if not parts:
             return None
@@ -315,7 +325,7 @@ class GraphNodeIndex:
         chosen = in_file[0] if len(in_file) == 1 else self._class_node(class_fqn)
         if chosen is None:
             return None
-        return self._methods.get((chosen["id"], _key(method)))
+        return chosen["id"]
 
     def engine_calls(self, all_edges: list[dict]) -> list[EngineCall]:
         """`calls` edges graphify's engine bound by bare name to a node in the caller's file.
@@ -884,6 +894,16 @@ class GraphStubSink:
 ROUTE_RELATION = "handled_by"
 ROUTE_NODE_KIND = "http_route"
 
+# An `#[IsGranted]` declaration: handler method or controller class -> the access guard it names.
+# Names agreed with the graphify-mesh consumer; change them only together with it.
+GUARD_RELATION = "guarded_by"
+GUARD_NODE_KIND = "access_guard"
+# A route handler's direct `$this->isGranted(...)`-style call -> the access guard it names.
+CHECK_RELATION = "checks_access"
+# `guard_attribute` values on guard edges and nodes, beside a check's own method name.
+GUARD_ATTRIBUTE_ISGRANTED = "IsGranted"
+GUARD_ATTRIBUTE_ACCESS_CONTROL = "access_control"
+
 
 def _route_nid(node_key: str) -> str:
     """A stable, readable id for a route declaration.
@@ -897,6 +917,13 @@ def _route_nid(node_key: str) -> str:
     return f"route_{slug}_{digest}"
 
 
+def _guard_nid(node_key: str) -> str:
+    """`_route_nid` with a `guard_` prefix, for the same stability reasons."""
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", node_key).strip("_").lower()[:80]
+    digest = hashlib.blake2b(node_key.encode("utf-8"), digest_size=4).hexdigest()
+    return f"guard_{slug}_{digest}"
+
+
 class GraphRouteSink:
     """Publishes one node and one edge per route declaration.
 
@@ -904,15 +931,23 @@ class GraphRouteSink:
     a route is a thing the graph did not previously contain, not a connection between two
     things it already had. That is also why it is worth a status record of its own — a layer
     that adds nothing looks exactly like a codebase with no routes.
+
+    Edges are de-duplicated per (source, target, relation): a handler that both carries
+    `#[IsGranted('ROLE_X')]` and calls `isGranted('ROLE_X')` gets a `guarded_by` and a
+    `checks_access` edge to the same guard node.
     """
 
     def __init__(self, all_nodes: list[dict], all_edges: list[dict]) -> None:
         self._all_nodes = all_nodes
         self._all_edges = all_edges
         self._by_id = {n.get("id") for n in all_nodes}
-        self._pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+        self._pairs = {(e.get("source"), e.get("target"), e.get("relation")) for e in all_edges}
         self.nodes_added = 0
         self.edges_added = 0
+        self.guard_nodes_added = 0
+        self.guard_edges_added = 0
+        self.checks_access_edges_added = 0
+        self.access_control_edges_added = 0
 
     def add_route(self, declaration, controller_nid: str | None) -> str | None:
         """Emit the declaration's node, and its edge when the controller method is in the graph.
@@ -941,12 +976,14 @@ class GraphRouteSink:
                     # A path composed from only one half is a usable partial, not a whole answer,
                     # and a reader ranking routes needs to know which it is looking at.
                     "route_complete": declaration.path is not None,
+                    # The full composed path, "" when it could not be composed; `label` falls
+                    # back to the method-level half and cannot tell the two apart.
+                    "route_path": declaration.path or "",
                 }
             )
             self.nodes_added += 1
 
-        if controller_nid and (nid, controller_nid) not in self._pairs:
-            self._pairs.add((nid, controller_nid))
+        if controller_nid and self._claim(nid, controller_nid, ROUTE_RELATION):
             self._all_edges.append(
                 {
                     "source": nid,
@@ -964,3 +1001,162 @@ class GraphRouteSink:
             )
             self.edges_added += 1
         return nid
+
+    def add_guard(self, guard, holder_nid: str) -> str | None:
+        """Emit the guard's node and the `guarded_by` edge from its holder.
+
+        The caller passes a holder that is in the graph; a guard node with no edge says
+        nothing, so none is added without one. Returns the node id, or None when the guard
+        names no attribute.
+        """
+        if not holder_nid or guard.reason or not guard.label:
+            return None
+
+        nid = _guard_nid(guard.node_key)
+        self._guard_node(
+            nid,
+            label=guard.label,
+            source_file=guard.source_file,
+            source_location=f"L{guard.line}",
+            guard_attribute=GUARD_ATTRIBUTE_ISGRANTED,
+            guard_literal=guard.literal,
+            guard_subject=guard.subject,
+        )
+        if self._claim(holder_nid, nid, GUARD_RELATION):
+            self._all_edges.append(
+                {
+                    "source": holder_nid,
+                    "target": nid,
+                    "relation": GUARD_RELATION,
+                    "context": "guard",
+                    "confidence": Confidence.EXTRACTED.value,
+                    "confidence_score": 1.0,
+                    "source_file": guard.source_file,
+                    "source_location": f"L{guard.line}",
+                    "weight": 1.0,
+                    EDGE_MARKER: EDGE_ORIGIN,
+                    "_via": "attribute",
+                    "guard_scope": "method" if guard.holder_method is not None else "class",
+                    "guard_attribute": GUARD_ATTRIBUTE_ISGRANTED,
+                }
+            )
+            self.guard_edges_added += 1
+        return nid
+
+    def add_access_check(self, check, handler_nid: str) -> str | None:
+        """Emit the guard node a handler's access-check call names, and `checks_access` to it.
+
+        An `isGranted` / `denyAccessUnlessGranted` call shares its node with the matching
+        `#[IsGranted]`. Several calls of one check in one handler make one edge, located at the
+        first. Returns the node id, or None for a refused call.
+        """
+        if not handler_nid or check.reason or not check.label:
+            return None
+
+        nid = _guard_nid(check.node_key)
+        self._guard_node(
+            nid,
+            label=check.label,
+            source_file=check.source_file,
+            source_location=f"L{check.line}",
+            guard_attribute=check.check_call if check.is_grant_call else "method",
+            guard_literal=check.literal,
+            guard_subject=check.subject if check.is_grant_call else "",
+        )
+        if self._claim(handler_nid, nid, CHECK_RELATION):
+            self._all_edges.append(
+                {
+                    "source": handler_nid,
+                    "target": nid,
+                    "relation": CHECK_RELATION,
+                    "context": "access_check",
+                    "confidence": Confidence.EXTRACTED.value,
+                    "confidence_score": 1.0,
+                    "source_file": check.source_file,
+                    "source_location": f"L{check.line}",
+                    "weight": 1.0,
+                    EDGE_MARKER: EDGE_ORIGIN,
+                    "_via": "call",
+                    "check_call": check.check_call,
+                    "guard_attribute": check.check_call,
+                    "conditional": check.conditional,
+                    # Only a framework call reaches a voter; a pattern match is a method name.
+                    "check_kind": "framework" if check.is_grant_call else "pattern",
+                }
+            )
+            self.checks_access_edges_added += 1
+        return nid
+
+    def add_access_control(self, rule, route_nid: str, source_file: str) -> str | None:
+        """Emit the `access_control` rule's node and `guarded_by` from the route it applies to.
+
+        The caller has proved that the rule is the first one Symfony applies to every URL of
+        the route; this method does not check it.
+        """
+        if not route_nid:
+            return None
+        nid = _guard_nid(rule.node_key)
+        self._guard_node(
+            nid,
+            label=rule.label,
+            source_file=source_file,
+            source_location="",
+            guard_attribute=GUARD_ATTRIBUTE_ACCESS_CONTROL,
+            guard_literal=True,
+            guard_subject="",
+            access_control_path=rule.path if isinstance(rule.path, str) else "",
+            access_control_index=rule.index,
+        )
+        if self._claim(route_nid, nid, GUARD_RELATION):
+            self._all_edges.append(
+                {
+                    "source": route_nid,
+                    "target": nid,
+                    "relation": GUARD_RELATION,
+                    "context": "guard",
+                    "confidence": Confidence.EXTRACTED.value,
+                    "confidence_score": 1.0,
+                    "source_file": source_file,
+                    "source_location": "",
+                    "weight": 1.0,
+                    EDGE_MARKER: EDGE_ORIGIN,
+                    "_via": "access_control",
+                    "guard_scope": "route",
+                    "guard_attribute": GUARD_ATTRIBUTE_ACCESS_CONTROL,
+                }
+            )
+            self.access_control_edges_added += 1
+        return nid
+
+    def _guard_node(
+        self, nid: str, *, label: str, source_file: str, source_location: str, **fields
+    ) -> None:
+        """Add an access-guard node unless one with this id exists.
+
+        A shared node (a literal role, one `access_control` rule) keeps the fields of the first
+        declaration seen: its source_file, source_location, subject and guard_attribute.
+        """
+        if nid in self._by_id:
+            return
+        self._by_id.add(nid)
+        self._all_nodes.append(
+            {
+                "id": nid,
+                "label": label,
+                "source_file": source_file,
+                "source_location": source_location,
+                "file_type": "code",
+                EDGE_MARKER: EDGE_ORIGIN,
+                "_kind": GUARD_NODE_KIND,
+                **fields,
+            }
+        )
+        self.guard_nodes_added += 1
+
+    def _claim(self, source: str, target: str, relation: str) -> bool:
+        """True the first time this (source, target, relation) is seen, graph included."""
+        key = (source, target, relation)
+        if key in self._pairs:
+            return False
+        self._pairs.add(key)
+        return True
