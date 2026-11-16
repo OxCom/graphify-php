@@ -38,6 +38,11 @@ title: Documentation
     <strong>Architecture</strong>
     <span>Understand the ports, source precedence, edge keys, and unresolved reasons.</span>
   </a>
+  <a class="docs-card" href="routes.html">
+    <span class="docs-card-label">Reference</span>
+    <strong>Routes</strong>
+    <span>Look up route nodes, the Laravel and CodeIgniter providers, and access guards.</span>
+  </a>
   <a class="docs-card" href="phpstan.html">
     <span class="docs-card-label">Sources</span>
     <strong>PHPStan source</strong>
