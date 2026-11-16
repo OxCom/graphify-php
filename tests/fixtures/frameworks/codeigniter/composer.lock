@@ -1,0 +1,6 @@
+{
+    "packages": [
+        {"name": "codeigniter4/framework", "version": "v4.7.6"},
+        {"name": "codeigniter4/shield", "version": "v1.1.0"}
+    ]
+}

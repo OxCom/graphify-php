@@ -157,6 +157,28 @@ class MemberCallStatus(ResolverStatus):
     new_site_dropped_edges: list = field(default_factory=list)
 
 
+@dataclass
+class RouteStatus(ResolverStatus):
+    """The route record (`php_routes`), plus which providers ran and what the attributes were.
+
+    `attributes_total` counts every attribute in the files read; `attributes_mapped` those a
+    selected provider mapped to a role; `attributes_short_name_only` those it did not map whose
+    short name equals a role's (a `#[Route]` from an unexpected namespace, a missing `use`).
+    """
+
+    providers: list = field(default_factory=list)
+    attributes_total: int = 0
+    attributes_mapped: int = 0
+    attributes_short_name_only: int = 0
+    # The route/guard graph contract the route nodes follow.
+    route_schema: int = 2
+    # Route nodes per `authorization_state` value, and undecided ones per `authorization_reason`.
+    authorization_state: dict = field(
+        default_factory=lambda: {"covered": 0, "not_proven": 0, "undecided": 0}
+    )
+    authorization_reason: dict = field(default_factory=dict)
+
+
 def status_path() -> Path:
     return Path(os.environ.get(STATUS_PATH_ENV) or DEFAULT_STATUS_PATH)
 

@@ -10,29 +10,38 @@ rather than a chain of `elif`s, and why the four that exist are never named in t
 from __future__ import annotations
 
 from . import nodes
+from .attributes import collect_attributes
 from .call_sites import index_calls
 from .collectors import COLLECTORS, ScanContext, by_node_kind
 from .facts import ClassScope, FileFacts, MethodScope
 from .names import NameResolver
-from .routes import collect_access_checks, collect_guards, collect_routes
 
 
 def scan_source(path: str, source: bytes, collectors=None) -> FileFacts:
     """Parse one file and return what it proves about its own receivers."""
+    return parse_source(path, source, collectors)[2]
+
+
+def parse_source(path: str, source: bytes, collectors=None):
+    """`scan_source`, also returning the tree's root and the file's names: `(root, names, facts)`.
+
+    For a reader that walks the tree itself (a route provider). The root keeps the whole tree
+    alive, so a caller holding many should hold `FileFacts` instead.
+    """
     tree = nodes.parse(source)
     names = NameResolver()
-    facts = FileFacts(path=path, imports=names.imports)
+    facts = FileFacts(path=path)
     registry = by_node_kind(collectors if collectors is not None else COLLECTORS)
     _walk(tree.root_node, facts, names, registry, klass=None, method=None)
+    # The last block's: the whole file's in a single-namespace file. A reader that needs the
+    # block of one class asks `ClassScope.names` instead.
     facts.namespace = names.namespace
+    facts.imports = names.imports
     # A second pass rather than a hook in `_walk`: locating calls is not scope work, and
     # keeping it out means the walker still has one reason to change.
     facts.calls = index_calls(tree.root_node)
-    facts.routes = collect_routes(tree.root_node, names, path)
-    facts.guards = collect_guards(tree.root_node, names, path)
-    handlers = {(r.controller_class, r.controller_method) for r in facts.routes}
-    facts.access_checks = collect_access_checks(tree.root_node, names, path, handlers)
-    return facts
+    facts.attributes = collect_attributes(tree.root_node, names, path)
+    return tree.root_node, names, facts
 
 
 def scan_file(path: str, collectors=None) -> FileFacts:
@@ -70,6 +79,10 @@ def _walk(node, facts: FileFacts, names: NameResolver, registry, klass, method) 
     for child in node.children:
         _walk(child, facts, names, registry, klass, method)
 
+    if kind == "namespace_definition" and nodes.child(node, "compound_statement") is not None:
+        # Code after a braced block is global code, and the block's imports end with it.
+        names.enter_namespace("", node.end_byte)
+
 
 def _is_anonymous_class(node) -> bool:
     """`new class { ... }`, which the grammar hangs under an `object_creation_expression`."""
@@ -82,21 +95,43 @@ def _is_anonymous_class(node) -> bool:
 
 
 def _read_namespace(node, names: NameResolver) -> None:
+    """Open the block a `namespace` statement starts, braced or not, named or global.
+
+    Each block starts with no imports: PHP scopes a `use` line to the block it is written in,
+    so an import in one block must not resolve a name in the next.
+    """
     name_node = nodes.child(node, "namespace_name", "qualified_name", "name")
-    if name_node is None:
-        return
-    # A braced `namespace X { ... }` block is read the same way, which is wrong for the rare
-    # file holding two of them. Two namespaces in one file is disallowed by PSR-4 and absent
-    # from the reference application, so the simpler reading stands until one turns up.
-    names.namespace = nodes.node_text(name_node).strip().strip(";").strip().strip("\\")
+    namespace = ""
+    if name_node is not None:
+        namespace = nodes.node_text(name_node).strip().strip(";").strip().strip("\\")
+    names.enter_namespace(namespace, node.start_byte)
 
 
 def _read_imports(node, names: NameResolver) -> None:
-    """`use A\\B\\C;` and `use A\\B\\C as D;`.
+    """`use A\\B\\C;`, `use A\\B\\C as D;` and the grouped `use A\\{B, C\\E as D};`.
 
-    Grouped and function/const imports are not read: a grouped `use A\\{B, C};` nests its
-    clauses differently, and a function import binds a name that is never a call receiver.
+    A grouped clause is read as the group prefix joined to the clause's own name. A
+    `function` or `const` import inside a group, or a whole grouped `use function`, is
+    skipped: it binds a name that is never a class. An ungrouped one is read as before.
     """
+    group = nodes.child(node, "namespace_use_group")
+    if group is not None:
+        if nodes.child(node, "function", "const") is not None:
+            return
+        prefix_node = nodes.child(node, "namespace_name", "qualified_name", "name")
+        prefix = nodes.node_text(prefix_node).strip().strip("\\") if prefix_node else ""
+        for clause in nodes.children(group, "namespace_use_clause"):
+            if nodes.child(clause, "function", "const") is not None:
+                continue
+            target = nodes.child(clause, "qualified_name", "name")
+            if target is None:
+                continue
+            tail = nodes.node_text(target).strip().strip("\\")
+            if not tail:
+                continue
+            fqn = f"{prefix}\\{tail}" if prefix else tail
+            names.add_import(_alias_of(clause) or fqn.rsplit("\\", 1)[-1], fqn)
+        return
     for clause in nodes.children(node, "namespace_use_clause"):
         target = nodes.child(clause, "qualified_name", "name")
         if target is None:
@@ -127,7 +162,10 @@ def _alias_of(clause) -> str:
 def _open_class(node, facts: FileFacts, names: NameResolver) -> ClassScope:
     start, end = nodes.line_span(node)
     scope = ClassScope(
-        fqn=names.qualify_declaration(nodes.name_of(node)), start_line=start, end_line=end
+        fqn=names.qualify_declaration(nodes.name_of(node)),
+        start_line=start,
+        end_line=end,
+        names=names.current(),
     )
     base = nodes.child(node, "base_clause")
     if base is not None:

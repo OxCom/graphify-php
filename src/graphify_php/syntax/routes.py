@@ -1,4 +1,4 @@
-"""Route declarations read from PHP attributes.
+"""The route pass's records, and the PHP value readers every framework provider shares.
 
 Why this is here at all. The call graph answers questions whose subject is a symbol. It cannot
 answer one whose subject is a literal: "which repository owns `/api/v1/storage/upload/small`"
@@ -13,19 +13,9 @@ the route at all — Symfony filters by `env`, a firewall may block it, and anot
 answer the same path first. A reader will assume the stronger claim, so it is worth saying
 plainly: this is a declaration in source, not an observation of production traffic.
 
-The composition rules are read from Symfony's own loader rather than guessed, in the copy at
-`vendor/symfony/routing/Loader/AttributeClassLoader.php`:
-
-- path — `$paths[] = $prefix.$path`, plain string concatenation of the class-level path onto
-  the method-level one.
-- name — `$name = $globals['name'].$name`, the class-level name used as a prefix.
-- methods — `array_unique(array_merge($globals['methods'], $attr->methods))`, a UNION. A
-  method-level `methods:` does not replace the class-level one, which is the rule most likely
-  to be guessed wrong.
-- an abstract class is skipped entirely (`load()` throws on it).
-- a class with `__invoke` and no method-level route takes its route from the class attribute,
-  and `resetGlobals()` means no prefix is applied in that case — the class attribute IS the
-  route rather than a prefix for one.
+Which attributes, files or calls declare a route or a guard is a framework provider's business
+(`frameworks/`). Every provider emits the three records below, so the publishing side has one
+shape to handle. The composition rules of Symfony's `#[Route]` live in `frameworks/symfony.py`.
 """
 
 from __future__ import annotations
@@ -33,15 +23,17 @@ from __future__ import annotations
 import functools
 import os
 import re
-from dataclasses import dataclass
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from . import nodes
+from .attributes import fold as _fold
+from .attributes import resolve_class_name
 
-# Matched on the short name, because that is what the attribute is written as. A `use` that
-# renames it is not followed: an alias for `Route` is vanishingly rare next to the cost of
-# resolving every attribute name in the file, and a miss here loses a node rather than
-# inventing one.
-ROUTE_ATTRIBUTE = "Route"
+if TYPE_CHECKING:
+    # `access_control` imports this module at runtime.
+    from .access_control import PlaceholderFacts
 
 STRING_KINDS = ("string", "encapsed_string")
 
@@ -52,15 +44,8 @@ PREFIX_NOT_LITERAL = "prefix-not-literal"
 LOCALIZED_PATH = "localized-path"
 NO_PATH = "no-path"
 
-# `#[IsGranted]`, matched on the short name for the same reason as `ROUTE_ATTRIBUTE`.
-GUARD_ATTRIBUTE = "IsGranted"
-
 # Why an `#[IsGranted]` produced no guard. Fixed string, same discipline as the route reasons.
 GUARD_NO_ATTRIBUTE_ARG = "guard-no-attribute-argument"
-
-# Calls that check access by naming an attribute, with whether the caller decides what happens
-# on refusal (`isGranted` returns a bool) or the call throws itself (`denyAccessUnlessGranted`).
-GRANT_CALLS = {"isGranted": True, "denyAccessUnlessGranted": False}
 
 # Project helper names that check access without naming an attribute. Overridable, because the
 # convention is the project's own; a list of regexes, matched with `re.search`.
@@ -72,10 +57,44 @@ CHECK_NO_ATTRIBUTE_ARG = "access-check-no-attribute-argument"
 CHECK_SPREAD_ARGUMENT = "access-check-spread-argument"
 ACCESS_CHECK_PATTERNS_INVALID = "access-check-patterns-invalid"
 
+# What a guard does. Only `authorization` makes a handler guarded in the coverage counters.
+# `public` lets every request through; `unknown` is a guard whose decision cannot be read.
+GUARD_KIND_AUTHORIZATION = "authorization"
+GUARD_KIND_AUTHENTICATION = "authentication"
+GUARD_KIND_PUBLIC = "public"
+GUARD_KIND_MIDDLEWARE = "middleware"
+GUARD_KIND_UNKNOWN = "unknown"
+
+# `RouteDeclaration.handler_kind`. The route pass also writes "unresolved" on a node whose
+# named handler is not in the graph. A provider declares `HANDLER_KIND_UNRESOLVED` for a route
+# whose path it proved but whose handler it could not: no lookup, no `handled_by` edge.
+HANDLER_KIND_METHOD = "method"
+HANDLER_KIND_CLOSURE = "closure"
+HANDLER_KIND_UNRESOLVED = "unresolved"
+
+# Why a route's `route_template` is "" or was kept unchecked. Fixed strings.
+TEMPLATE_OPTIONAL_LITERAL = "route-template-optional-literal"
+TEMPLATE_MULTI_SEGMENT = "route-template-multi-segment"
+TEMPLATE_REQUIREMENT_UNREAD = "route-template-requirement-unread"
+# A `{` or `}` that is not a placeholder: the template would be ambiguous to a reader.
+TEMPLATE_UNPARSED = "route-template-unparsed"
+
+# A normalized placeholder: `{name}`, or `{name?}` when the segment may be absent.
+_TEMPLATE_PLACEHOLDER = re.compile(r"\{(\w+)(\?)?\}")
+
+# Providers whose guard node keys predate `guard_kind` and must stay byte-identical. ""
+# covers a record built without a provider.
+FROZEN_KEY_PROVIDERS = frozenset({"", "symfony"})
+
+# A grant-call receiver: `$this->m()` / `$this?->m()`, or `Fqcn::m()` as `STATIC_RECEIVER` +
+# the FQCN, resolved through the file's imports and compared case-insensitively.
+THIS_RECEIVER = "this"
+STATIC_RECEIVER = "static:"
+
 
 @dataclass(frozen=True)
 class RouteDeclaration:
-    """One `#[Route]` as declared, with the controller method it sits on.
+    """One route as declared, with the controller method it names.
 
     `path` is the template verbatim — `/api/v1/storage/upload/small/{id}` — because the
     placeholder is what makes it searchable and matchable. It is None when composition needed
@@ -93,10 +112,37 @@ class RouteDeclaration:
     class_path: str | None = None
     method_path: str | None = None
     reason: str = ""
+    # The provider that declared it, written as `provider` on its node and edge.
+    provider: str = ""
+    # `_via` on the `handled_by` edge: "attribute", or "route_file" for a routes file.
+    via: str = "attribute"
+    # The file declaring the handler class when it is not `source_file` (a routes file).
+    handler_file: str = ""
+    # `route_template` as the provider normalized `path` (see `brace_template`). None: the
+    # provider does not normalize, published as "". `template_reason` is a `TEMPLATE_*`
+    # reason: with "" it says why, with a template it says what was not checked.
+    template: str | None = None
+    template_reason: str = ""
+    # `access_control.PlaceholderFacts` for the `access_control` matcher; None when the provider
+    # does not read them. Never published on a node, and not part of equality.
+    placeholder_facts: PlaceholderFacts | None = field(default=None, compare=False, repr=False)
+    # `HANDLER_KIND_CLOSURE` when the action is a closure: no handler node exists by design,
+    # `controller_class` and `controller_method` are "", and `handler_file` is the repo-relative
+    # routes file declaring it.
+    handler_kind: str = HANDLER_KIND_METHOD
 
     @property
     def resolved(self) -> bool:
         return self.path is not None
+
+    @property
+    def is_closure(self) -> bool:
+        return self.handler_kind == HANDLER_KIND_CLOSURE
+
+    @property
+    def has_no_handler(self) -> bool:
+        """A closure, or a handler the provider declared unresolved: the pass looks nothing up."""
+        return self.handler_kind in (HANDLER_KIND_CLOSURE, HANDLER_KIND_UNRESOLVED)
 
     @property
     def node_key(self) -> str:
@@ -105,98 +151,26 @@ class RouteDeclaration:
         The declaring method is in the key on purpose. Two repositories that both declare
         `/health` declare two different things — each is served by its own controller — and
         collapsing them onto one node would claim a relationship between two codebases that
-        share nothing but a string.
+        share nothing but a string. A closure has no method, so its declaring file and line
+        stand in: `<provider>:closure:<file>:<line>#<path>`. A declared-unresolved handler has
+        none either: `<provider>:unresolved:<file>:<line>#<path>`.
         """
+        if self.has_no_handler:
+            return (
+                f"{self.provider}:{self.handler_kind}:{self.handler_file}:{self.line}#"
+                f"{self.path or self.method_path or ''}"
+            )
         return (
             f"{self.controller_class}::{self.controller_method}#"
             f"{self.path or self.method_path or ''}"
         )
 
 
-def collect_routes(root, names, source_file: str) -> list[RouteDeclaration]:
-    """Every route declared in one file.
-
-    A separate pass over the tree rather than a hook in the walker: routes are not type facts,
-    and the walker's one reason to change is scope.
-    """
-    found: list[RouteDeclaration] = []
-    _walk(root, names, source_file, found)
-    return found
-
-
-def _walk(node, names, source_file: str, found: list) -> None:
-    if node.type in nodes.CLASS_KINDS:
-        _read_class(node, names, source_file, found)
-        return
-    for child in node.children:
-        _walk(child, names, source_file, found)
-
-
-def _read_class(node, names, source_file: str, found: list) -> None:
-    if nodes.child(node, "abstract_modifier") is not None:
-        # Symfony's loader throws rather than reading attributes from an abstract class, so a
-        # route on one is a prefix for subclasses, never a route in its own right.
-        return
-    class_fqn = names.qualify_declaration(nodes.name_of(node))
-    class_attrs = _route_attributes(node)
-    body = nodes.child(node, "declaration_list", "enum_declaration_list")
-    # In trait code `self` is the using class, not the trait, so a trait's own constants never
-    # resolve `self::NAME`: the empty map refuses every such path as `path-not-literal`.
-    constants = {} if node.type == "trait_declaration" else _class_constants(body)
-    # `getAttributes(...)[0]` in the loader's `getGlobals()`: only the first class-level Route
-    # is the prefix, however many are stacked.
-    prefix = _Prefix.read(class_attrs[0] if class_attrs else None, constants)
-
-    methods = nodes.children(body, "method_declaration") if body is not None else []
-
-    before = len(found)
-    for method in methods:
-        # Every Route on a method is a route of its own (the loader's `foreach`), whether the
-        # attributes are stacked in separate groups or listed in one.
-        for attribute in _route_attributes(method):
-            found.append(
-                _compose(
-                    attribute, prefix, class_fqn, nodes.name_of(method), source_file, constants
-                )
-            )
-
-    if len(found) == before and class_attrs:
-        invoke = next((m for m in methods if nodes.name_of(m) == "__invoke"), None)
-        if invoke is not None:
-            # `resetGlobals()` in the loader: each class attribute is a route itself here, so
-            # it composes with nothing.
-            for class_attr in class_attrs:
-                found.append(
-                    _compose(class_attr, _Prefix(), class_fqn, "__invoke", source_file, constants)
-                )
-
-
-def _class_constants(body) -> dict[str, str | None]:
-    """Constants declared in this class body, by name: the string value, or None.
-
-    None marks a name this package must not resolve: a value that is not a plain string
-    literal, or a name declared twice. A name absent from the map (inherited, from an
-    interface, from another class) is not resolved either.
-    """
-    found: dict[str, str | None] = {}
-    if body is None:
-        return found
-    for declaration in nodes.children(body, "const_declaration"):
-        for element in nodes.children(declaration, "const_element"):
-            name_node = nodes.child(element, "name")
-            value_node = next(
-                (c for c in element.children if c.is_named and c is not name_node), None
-            )
-            name = nodes.node_text(name_node)
-            found[name] = None if name in found else _string_value(value_node)
-    return found
-
-
 @dataclass(frozen=True)
 class AccessGuard:
-    """One `#[IsGranted]` as declared on a class or a method.
+    """One guard declared on a class or a method (`#[IsGranted]`, controller middleware).
 
-    `label` is the first argument: the string value when it is a plain literal, otherwise the
+    `label` is the guard's argument: the string value when it is a plain literal, otherwise the
     argument's source text verbatim (`new Expression(self::READ_ROLES)`), never evaluated. It
     proves the declaration, not what the security voter decides at runtime.
     """
@@ -209,76 +183,53 @@ class AccessGuard:
     literal: bool
     subject: str = ""
     reason: str = ""
+    provider: str = ""
+    # `_via` on the `guarded_by` edge.
+    via: str = "attribute"
+    # `guard_attribute` on the edge and the node: the attribute's canonical short name, or the
+    # provider's name for a non-attribute guard ("middleware", "filter").
+    guard_attribute: str = "IsGranted"
+    # One of the `GUARD_KIND_*` values. Only `authorization` makes a handler guarded.
+    guard_kind: str = "authorization"
 
     @property
     def node_key(self) -> str:
         """A literal names one role wherever it is written, so its node is shared.
 
         Source text is scoped to the declaring class, because `self::` and an imported short
-        name mean something different in another class.
+        name mean something different in another class. Outside `FROZEN_KEY_PROVIDERS` the
+        key is `guard#<provider>:<guard_kind>:<label>` (or `<Holder>::guard#...` for source
+        text), so a role and a middleware alias with one text do not merge.
         """
+        label = _kind_scoped(self.provider, self.guard_kind, self.label)
         if self.literal:
-            return f"guard#{self.label}"
-        return f"{self.holder_class}::guard#{self.label}"
+            return f"guard#{label}"
+        return f"{self.holder_class}::guard#{label}"
 
 
-def collect_guards(root, names, source_file: str) -> list[AccessGuard]:
-    """Every `#[IsGranted]` on a class or method in one file, abstract classes included.
+@dataclass(frozen=True)
+class GrantCall:
+    """A call that asks the framework's access layer to decide, and where its arguments sit.
 
-    Symfony does not inherit class attributes, so a guard is reported on its declaring class
-    only and never copied onto subclasses.
+    `conditional`: True when the caller decides on refusal (the call returns a bool), False when
+    the call throws, None unknown. `label` and `subject` are `(position, name)`: the named
+    argument wins, then the positional one; None disables that half.
     """
-    found: list[AccessGuard] = []
-    _walk_guards(root, names, source_file, found)
-    return found
 
-
-def _walk_guards(node, names, source_file: str, found: list) -> None:
-    if node.type in nodes.CLASS_KINDS:
-        _read_class_guards(node, names, source_file, found)
-        return
-    for child in node.children:
-        _walk_guards(child, names, source_file, found)
-
-
-def _read_class_guards(node, names, source_file: str, found: list) -> None:
-    class_fqn = names.qualify_declaration(nodes.name_of(node))
-    for attribute in _attributes_named(node, GUARD_ATTRIBUTE):
-        found.append(_guard(attribute, class_fqn, None, source_file))
-    body = nodes.child(node, "declaration_list", "enum_declaration_list")
-    methods = nodes.children(body, "method_declaration") if body is not None else []
-    for method in methods:
-        for attribute in _attributes_named(method, GUARD_ATTRIBUTE):
-            found.append(_guard(attribute, class_fqn, nodes.name_of(method), source_file))
-
-
-def _guard(attribute, class_fqn: str, method_name: str | None, source_file: str) -> AccessGuard:
-    positional, named = _arguments(attribute)
-    first = named.get("attribute") or (positional[0] if positional else None)
-    subject_node = named.get("subject") or (positional[1] if len(positional) > 1 else None)
-    subject = nodes.node_text(subject_node) if subject_node is not None else ""
-    line = nodes.line_span(attribute)[0]
-    if first is None:
-        return AccessGuard(
-            class_fqn, method_name, source_file, line, "", False, subject, GUARD_NO_ATTRIBUTE_ARG
-        )
-    value = _string_value(first)
-    if value is not None:
-        return AccessGuard(class_fqn, method_name, source_file, line, value, True, subject)
-    return AccessGuard(
-        class_fqn, method_name, source_file, line, nodes.node_text(first), False, subject
-    )
+    conditional: bool | None = None
+    label: tuple[int | None, str | None] = (0, "attribute")
+    subject: tuple[int | None, str | None] = (1, "subject")
 
 
 @dataclass(frozen=True)
 class AccessCheck:
     """One access-check call written directly in a route handler's body.
 
-    `check_call` is the called method's name. For `isGranted` and `denyAccessUnlessGranted`,
-    `label`, `literal` and `subject` are read from the arguments exactly as `AccessGuard` reads
-    them from `#[IsGranted]`, so both name one guard node. For a project helper matched by
-    pattern (`canView`, `assertTeamAccess`), `label` is the method name. A call proves the
-    handler asks; it does not prove what the voter or the helper decides.
+    `check_call` is the called method's name (`Gate::authorize` for a static call). For a
+    provider's grant call, `label`, `literal` and `subject` are read from the arguments exactly
+    as `AccessGuard` reads them from `#[IsGranted]`, so both name one guard node. For a project
+    helper matched by pattern (`canView`, `assertTeamAccess`), `label` is the method name. A
+    call proves the handler asks; it does not prove what the voter or the helper decides.
     """
 
     holder_class: str
@@ -290,28 +241,153 @@ class AccessCheck:
     literal: bool
     subject: str = ""
     reason: str = ""
+    provider: str = ""
+    via: str = "call"
+    guard_kind: str = "authorization"
+    grant: bool = False
+    grant_conditional: bool | None = None
 
     @property
     def is_grant_call(self) -> bool:
-        return self.check_call in GRANT_CALLS
+        return self.grant
 
     @property
     def conditional(self) -> bool | None:
         """True when the caller decides on refusal, False when the call throws, None unknown."""
-        return GRANT_CALLS.get(self.check_call)
+        return self.grant_conditional if self.grant else None
 
     @property
     def node_key(self) -> str:
-        """The `#[IsGranted]` identity for an attribute check, a class-scoped one for a helper.
+        """The `#[IsGranted]` identity for a grant call, a class-scoped one for a helper.
 
         A helper is keyed by the calling class: `$this->canView()` in two controllers calls two
         methods that only share a name.
         """
         if not self.is_grant_call:
             return f"{self.holder_class}::check#{self.check_call}"
+        label = _kind_scoped(self.provider, self.guard_kind, self.label)
         if self.literal:
-            return f"guard#{self.label}"
-        return f"{self.holder_class}::guard#{self.label}"
+            return f"guard#{label}"
+        return f"{self.holder_class}::guard#{label}"
+
+
+def _kind_scoped(provider: str, guard_kind: str, label: str) -> str:
+    if provider in FROZEN_KEY_PROVIDERS:
+        return label
+    return f"{provider}:{guard_kind}:{label}"
+
+
+def brace_template(
+    path: str, optional: Collection[str] = (), multi_segment: Collection[str] = ()
+) -> tuple[str, str]:
+    """`(route_template, reason)` for a path already written with `{name}` placeholders.
+
+    `{name?}` is kept as written; a name in `optional` is written `{name?}` too. A name in
+    `multi_segment` (its pattern can match `/`) gives `("", TEMPLATE_MULTI_SEGMENT)`, and a
+    brace that is not a placeholder gives `("", TEMPLATE_UNPARSED)`. A provider with another
+    placeholder syntax rewrites it to this one first.
+    """
+    out: list[str] = []
+    last = 0
+    for match in _TEMPLATE_PLACEHOLDER.finditer(path):
+        literal = path[last : match.start()]
+        if "{" in literal or "}" in literal:
+            return "", TEMPLATE_UNPARSED
+        name = match.group(1)
+        if name in multi_segment:
+            return "", TEMPLATE_MULTI_SEGMENT
+        out.append(literal)
+        out.append(f"{{{name}?}}" if match.group(2) or name in optional else f"{{{name}}}")
+        last = match.end()
+    tail = path[last:]
+    if "{" in tail or "}" in tail:
+        return "", TEMPLATE_UNPARSED
+    out.append(tail)
+    return "/" + "".join(out).lstrip("/"), ""
+
+
+# What a requirement regex may contain and still never match `/`: word characters and a few
+# punctuation marks, the escapes `\d \w \s \h \v`, an escaped non-`/` mark, quantifiers,
+# groups and anchors. Anything else (`.`, `\S`, `[^...]`, `\x2f`, `\p{...}`) counts as can-match.
+_SAFE_REQUIREMENT_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-~%,;:=@'\""
+)
+_SAFE_REQUIREMENT_SYNTAX = frozenset("+*?{}()|^$")
+_SAFE_REQUIREMENT_ESCAPES = frozenset("dwshv")
+_SAFE_REQUIREMENT_ESCAPED_MARKS = frozenset(".-_~%,;:=@+*?{}()[]|^$#&!<>")
+
+
+def requirement_may_match_slash(regex: str) -> bool:
+    """False only when `regex` provably never matches a `/`; True when unsure.
+
+    A whitelist, not a parser: every construct it does not know makes the answer True.
+    """
+    i = 0
+    in_class = False
+    while i < len(regex):
+        char = regex[i]
+        if char == "\\":
+            if i + 1 >= len(regex):
+                return True
+            escaped = regex[i + 1]
+            if escaped not in _SAFE_REQUIREMENT_ESCAPES and (
+                escaped not in _SAFE_REQUIREMENT_ESCAPED_MARKS
+            ):
+                return True
+            i += 2
+            continue
+        if in_class:
+            if char == "]":
+                in_class = False
+            elif char == "-":
+                # A range is safe only inside one of `0-9`, `a-z`, `A-Z`.
+                low, high = regex[i - 1 : i], regex[i + 1 : i + 2]
+                if high != "]" and not _same_alnum_run(low, high):
+                    return True
+            elif char not in _SAFE_REQUIREMENT_CHARS and char != ".":
+                return True
+            i += 1
+            continue
+        if char == "[":
+            if regex[i + 1 : i + 2] == "^":
+                end = _class_end(regex, i + 2)
+                # A negated class that excludes `/` never matches it, whatever else it holds.
+                if end < 0 or "/" not in regex[i + 2 : end]:
+                    return True
+                i = end + 1
+                continue
+            if regex[i + 1 : i + 2] in ("]", ""):
+                return True
+            in_class = True
+        elif char == "(" and regex[i + 1 : i + 2] == "?":
+            if regex[i + 2 : i + 3] != ":":
+                return True
+            i += 3
+            continue
+        elif char not in _SAFE_REQUIREMENT_CHARS and char not in _SAFE_REQUIREMENT_SYNTAX:
+            return True
+        i += 1
+    return in_class
+
+
+def _class_end(regex: str, start: int) -> int:
+    """Index of the `]` closing a class whose body starts at `start`, or -1."""
+    i = start + 1 if regex[start : start + 1] == "]" else start
+    while i < len(regex):
+        if regex[i] == "\\":
+            i += 2
+            continue
+        if regex[i] == "]":
+            return i
+        i += 1
+    return -1
+
+
+def _same_alnum_run(low: str, high: str) -> bool:
+    return any(
+        low.isascii() and high.isascii() and start <= low <= high <= end
+        for start, end in (("0", "9"), ("a", "z"), ("A", "Z"))
+    )
 
 
 def access_check_patterns() -> tuple[tuple[re.Pattern, ...], str]:
@@ -337,25 +413,53 @@ def _compile_patterns(raw: str) -> tuple[tuple[re.Pattern, ...], str]:
         return defaults, ACCESS_CHECK_PATTERNS_INVALID
 
 
-def collect_access_checks(root, names, source_file: str, handlers) -> list[AccessCheck]:
-    """Access-check calls on `$this` written directly in the body of a route handler.
+def collect_access_checks(
+    root,
+    names,
+    source_file: str,
+    handlers,
+    grants: Mapping[tuple[str, str], GrantCall],
+    provider: str = "",
+) -> list[AccessCheck]:
+    """Access-check calls written directly in the body of a route handler.
 
-    `handlers` is the set of `(class FQN, method)` pairs that carry a `#[Route]`, the invokable
-    fallback included. Only `$this->name(...)` and `$this?->name(...)` count, and only where the
-    handler's own body runs them: a closure, an arrow function, an anonymous class or a nested
-    function is not descended into, because nothing proves the handler runs it. A call in a
-    method that is not a handler is not read, even when a handler calls that method.
+    `handlers` is the set of `(class FQN, method)` pairs the calling provider declared routes
+    for. `grants` is that provider's call specs, keyed `(receiver kind, method name)`:
+    `("this", "isGranted")` matches `$this->isGranted(...)` and `$this?->isGranted(...)`;
+    `("static:Illuminate\\Support\\Facades\\Gate", "authorize")` matches a static call whose
+    class resolves to that FQCN through the file's imports, case-insensitively. Project helpers
+    matched by `access_check_patterns` are `$this` calls only. A closure, an arrow function, an
+    anonymous class or a nested function is not descended into, because nothing proves the
+    handler runs it. A call in a method that is not a handler is not read, even when a handler
+    calls it.
     """
     found: list[AccessCheck] = []
     if not handlers:
         return found
     patterns, _ = access_check_patterns()
-    _walk_checks(root, names, source_file, handlers, patterns, found)
+    member: dict = {}
+    static: dict = {}
+    for (receiver, method), call in grants.items():
+        if receiver == THIS_RECEIVER:
+            member[method] = call
+        elif receiver.startswith(STATIC_RECEIVER):
+            static[(_fold(receiver[len(STATIC_RECEIVER) :]), method)] = call
+    table = _Grants(member, static, patterns, provider)
+    _walk_checks(root, names, source_file, handlers, table, found)
     return found
 
 
-def _walk_checks(node, names, source_file: str, handlers, patterns, found: list) -> None:
+@dataclass(frozen=True)
+class _Grants:
+    member: dict
+    static: dict
+    patterns: tuple
+    provider: str
+
+
+def _walk_checks(node, names, source_file: str, handlers, table: _Grants, found: list) -> None:
     if node.type in nodes.CLASS_KINDS:
+        names = names.at(node)
         class_fqn = names.qualify_declaration(nodes.name_of(node))
         body = nodes.child(node, "declaration_list", "enum_declaration_list")
         for method in nodes.children(body, "method_declaration"):
@@ -363,13 +467,13 @@ def _walk_checks(node, names, source_file: str, handlers, patterns, found: list)
             if (class_fqn, method_name) not in handlers:
                 continue
             statements = nodes.child(method, "compound_statement")
-            for call in _direct_this_calls(statements):
-                check = _check(call, class_fqn, method_name, source_file, patterns)
+            for call in _direct_calls(statements, bool(table.static)):
+                check = _check(call, class_fqn, method_name, source_file, table, names)
                 if check is not None:
                     found.append(check)
         return
     for child in node.children:
-        _walk_checks(child, names, source_file, handlers, patterns, found)
+        _walk_checks(child, names, source_file, handlers, table, found)
 
 
 # Bodies that do not run when the enclosing method runs, or run under another `$this`.
@@ -381,8 +485,11 @@ _NOT_THE_HANDLER_BODY = (
 )
 
 
-def _direct_this_calls(node) -> list:
-    """`$this->m()` / `$this?->m()` calls under `node`, in source order, skipping nested bodies."""
+def _direct_calls(node, with_static: bool) -> list:
+    """`$this->m()` / `$this?->m()` calls under `node`, and `X::m()` calls when `with_static`.
+
+    In source order, skipping nested bodies.
+    """
     out: list = []
     if node is None:
         return out
@@ -406,127 +513,97 @@ def _direct_this_calls(node) -> list:
                 and name.type == "name"
             ):
                 out.append(current)
+        elif with_static and current.type == "scoped_call_expression":
+            scope = current.child_by_field_name("scope")
+            name = current.child_by_field_name("name")
+            if (
+                scope is not None
+                and scope.type in ("name", "qualified_name")
+                and name is not None
+                and name.type == "name"
+            ):
+                out.append(current)
         stack.extend(reversed(current.children))
     return out
 
 
-def _check(call, class_fqn: str, method_name: str, source_file: str, patterns):
+def _check(call, class_fqn: str, method_name: str, source_file: str, table: _Grants, names):
     called = nodes.node_text(call.child_by_field_name("name"))
     line = nodes.line_span(call)[0]
-    if called not in GRANT_CALLS:
-        if not any(p.search(called) for p in patterns):
+    if call.type == "scoped_call_expression":
+        written = nodes.node_text(call.child_by_field_name("scope")).strip()
+        grant = table.static.get((_fold(resolve_class_name(written, names)), called))
+        if grant is None:
+            # The helper patterns name `$this` methods only: a static call is never one.
             return None
-        return AccessCheck(class_fqn, method_name, source_file, line, called, called, False)
-
-    positional, named = _arguments(call)
-    first = named.get("attribute") or (positional[0] if positional else None)
-    subject_node = named.get("subject") or (positional[1] if len(positional) > 1 else None)
-    if first is None or first.type == "variadic_unpacking":
-        reason = CHECK_NO_ATTRIBUTE_ARG if first is None else CHECK_SPREAD_ARGUMENT
-        return AccessCheck(class_fqn, method_name, source_file, line, called, "", False, "", reason)
-    subject = nodes.node_text(subject_node) if subject_node is not None else ""
-    value = _string_value(first)
-    if value is not None:
-        return AccessCheck(class_fqn, method_name, source_file, line, called, value, True, subject)
-    return AccessCheck(
-        class_fqn, method_name, source_file, line, called, nodes.node_text(first), False, subject
-    )
-
-
-@dataclass
-class _Prefix:
-    """The class-level attribute, as the three things it contributes."""
-
-    path: str | None = None
-    name: str = ""
-    methods: tuple[str, ...] = ()
-    path_literal: bool = True
-
-    @classmethod
-    def read(cls, attribute, constants: dict[str, str | None] | None = None) -> _Prefix:
-        if attribute is None:
-            return cls()
-        positional, named = _arguments(attribute)
-        path_node = named.get("path") or (positional[0] if positional else None)
-        path, literal = _path_of(path_node, constants)
-        return cls(
-            path=path,
-            name=_string_value(named.get("name")) or "",
-            methods=_string_list(named.get("methods")),
-            path_literal=literal,
-        )
-
-
-def _compose(
-    attribute,
-    prefix: _Prefix,
-    class_fqn: str,
-    method_name: str,
-    source_file: str,
-    constants: dict[str, str | None] | None = None,
-) -> RouteDeclaration:
-    positional, named = _arguments(attribute)
-    path_node = named.get("path") or (positional[0] if positional else None)
-    method_path, literal = _path_of(path_node, constants)
-
-    name = _string_value(named.get("name"))
-    # `array_unique(array_merge(...))`: a union, with the class-level entries first.
-    methods = tuple(dict.fromkeys(prefix.methods + _string_list(named.get("methods"))))
-
-    effective: str | None = None
-    reason = ""
-    if path_node is None:
-        reason = NO_PATH
-    elif not literal:
-        reason = (
-            LOCALIZED_PATH if method_path is None and _is_array(path_node) else PATH_NOT_LITERAL
-        )
-    elif not prefix.path_literal:
-        reason = PREFIX_NOT_LITERAL
+        called = f"{written.lstrip(chr(92)).rsplit(chr(92), 1)[-1]}::{called}"
     else:
-        effective = (prefix.path or "") + method_path
+        grant = table.member.get(called)
+    if grant is None:
+        if not any(p.search(called) for p in table.patterns):
+            return None
+        # A project helper's decision is not read, so its kind is unknown.
+        return AccessCheck(
+            class_fqn, method_name, source_file, line, called, called, False,
+            provider=table.provider, guard_kind=GUARD_KIND_UNKNOWN,
+        )  # fmt: skip
 
-    return RouteDeclaration(
-        controller_class=class_fqn,
-        controller_method=method_name,
-        source_file=source_file,
-        line=nodes.line_span(attribute)[0],
-        path=effective,
-        name=(prefix.name + name) if name is not None else (prefix.name or None),
-        methods=methods,
-        class_path=prefix.path,
-        method_path=method_path,
-        reason=reason,
-    )
+    def made(label: str, literal: bool, subject: str = "", reason: str = "") -> AccessCheck:
+        return AccessCheck(
+            class_fqn, method_name, source_file, line, called, label, literal, subject, reason,
+            provider=table.provider, grant=True, grant_conditional=grant.conditional,
+        )  # fmt: skip
+
+    positional, named = arguments(call)
+    first = pick(grant.label, positional, named)
+    subject_node = pick(grant.subject, positional, named)
+    if first is None or first.type == "variadic_unpacking":
+        return made(
+            "", False, "", CHECK_NO_ATTRIBUTE_ARG if first is None else CHECK_SPREAD_ARGUMENT
+        )
+    subject = nodes.node_text(subject_node) if subject_node is not None else ""
+    value = string_value(first)
+    if value is not None:
+        return made(value, True, subject)
+    return made(nodes.node_text(first), False, subject)
 
 
-def _route_attributes(declaration) -> list:
-    """Every `#[Route(...)]` on a class or method declaration, in source order."""
-    return _attributes_named(declaration, ROUTE_ATTRIBUTE)
+def pick(spec: tuple[int | None, str | None], positional: list, named: dict):
+    """The argument at `(position, name)`: the named one first, then the positional one."""
+    position, name = spec
+    if name is not None and name in named:
+        return named[name]
+    if position is not None and 0 <= position < len(positional):
+        return positional[position]
+    return None
 
 
-def _attributes_named(declaration, short_name: str) -> list:
-    """The attributes written with `short_name` on a declaration, in source order.
+def class_constants(body) -> dict[str, str | None]:
+    """Constants declared in this class body, by name: the string value, or None.
 
-    Only attribute groups directly on this declaration are read, so an attribute on a nested
-    declaration cannot be mistaken for one on its parent.
+    None marks a name this package must not resolve: a value that is not a plain string
+    literal, or a name declared twice. A name absent from the map (inherited, from an
+    interface, from another class) is not resolved either.
     """
-    attributes = nodes.child(declaration, "attribute_list")
-    if attributes is None:
-        return []
-    found = []
-    for group in nodes.children(attributes, "attribute_group"):
-        for attribute in nodes.children(group, "attribute"):
-            written = nodes.node_text(nodes.child(attribute, "name", "qualified_name"))
-            if written.rsplit("\\", 1)[-1] == short_name:
-                found.append(attribute)
+    found: dict[str, str | None] = {}
+    if body is None:
+        return found
+    for declaration in nodes.children(body, "const_declaration"):
+        for element in nodes.children(declaration, "const_element"):
+            name_node = nodes.child(element, "name")
+            value_node = next(
+                (c for c in element.children if c.is_named and c is not name_node), None
+            )
+            name = nodes.node_text(name_node)
+            found[name] = None if name in found else string_value(value_node)
     return found
 
 
-def _arguments(attribute) -> tuple[list, dict]:
+def arguments(call_or_attribute) -> tuple[list, dict]:
+    """The `(positional, named)` argument nodes of a call or an attribute."""
     positional: list = []
     named: dict = {}
-    argument_list = nodes.child(attribute, "arguments")
+    argument_list = nodes.child(call_or_attribute, "arguments")
     for argument in nodes.children(argument_list, "argument"):
         # The `name` FIELD, not the first `name` child: a bare constant (`#[Route(PREFIX)]`)
         # is a `name` node too, and reading it as a label dropped the argument.
@@ -548,17 +625,17 @@ def _arguments(attribute) -> tuple[list, dict]:
     return positional, named
 
 
-def _path_of(node, constants: dict[str, str | None] | None = None) -> tuple[str | None, bool]:
+def path_of(node, constants: dict[str, str | None] | None = None) -> tuple[str | None, bool]:
     """(path, was-a-literal). A non-literal keeps `None` rather than a guessed value."""
     if node is None:
         return None, True
-    value = _path_value(node, constants or {})
+    value = path_value(node, constants or {})
     if value is None:
         return None, False
     return value, True
 
 
-def _path_value(node, constants: dict[str, str | None]) -> str | None:
+def path_value(node, constants: dict[str, str | None]) -> str | None:
     """A string literal, `self::NAME` for a constant of this class body, or a `.` of those.
 
     `self::` names the declaring class, so a constant declared in the same body has exactly the
@@ -568,7 +645,7 @@ def _path_value(node, constants: dict[str, str | None]) -> str | None:
     if node is None:
         return None
     if node.type in STRING_KINDS:
-        return _string_value(node)
+        return string_value(node)
     if node.type == "class_constant_access_expression":
         named = [c for c in node.children if c.is_named]
         if (
@@ -583,19 +660,37 @@ def _path_value(node, constants: dict[str, str | None]) -> str | None:
         operators = [c for c in node.children if not c.is_named]
         if len(operators) != 1 or nodes.node_text(operators[0]) != ".":
             return None
-        left = _path_value(node.child_by_field_name("left"), constants)
-        right = _path_value(node.child_by_field_name("right"), constants)
+        left = path_value(node.child_by_field_name("left"), constants)
+        right = path_value(node.child_by_field_name("right"), constants)
         if left is None or right is None:
             return None
         return left + right
     return None
 
 
-def _is_array(node) -> bool:
+def class_constant_name(node, names) -> str | None:
+    """The FQCN of `Foo::class`, resolved through the file's imports, or None for anything else.
+
+    `self::class`, `static::class` and `parent::class` are refused: which class they name
+    depends on where the code runs.
+    """
+    if node is None or node.type != "class_constant_access_expression":
+        return None
+    named = [c for c in node.children if c.is_named]
+    if (
+        len(named) != 2
+        or named[0].type not in ("name", "qualified_name")
+        or nodes.node_text(named[1]).lower() != "class"
+    ):
+        return None
+    return resolve_class_name(nodes.node_text(named[0]).strip(), names.at(node))
+
+
+def is_array(node) -> bool:
     return node is not None and node.type == "array_creation_expression"
 
 
-def _string_value(node) -> str | None:
+def string_value(node) -> str | None:
     """The text of a string literal, or None for anything that needs evaluating.
 
     A concatenation, a constant or a variable all return None. Reading `self::PREFIX . '/x'`
@@ -614,21 +709,72 @@ def _string_value(node) -> str | None:
     return text[1:-1] if len(text) >= 2 and text[0] in "\"'" else text
 
 
-def _string_list(node) -> tuple[str, ...]:
+def literal(node) -> str | None:
+    """A string literal's value; single-quoted `\\\\` and `\\'` escapes decoded."""
+    value = string_value(node)
+    if value is not None or node is None or node.type != "string":
+        return value
+    parts = [c for c in node.children if c.is_named]
+    if not parts or any(p.type not in ("string_content", "escape_sequence") for p in parts):
+        return None
+    text = ""
+    for part in parts:
+        raw = nodes.node_text(part)
+        if part.type == "escape_sequence":
+            if raw not in ("\\\\", "\\'"):
+                return None
+            raw = raw[1]
+        text += raw
+    return text
+
+
+def array_items(node) -> list[tuple[object, object]] | None:
+    """`[(key node or None, value node)]` of an array literal; None when it has a spread."""
+    if not is_array(node):
+        return None
+    items: list[tuple[object, object]] = []
+    for element in nodes.children(node, "array_element_initializer"):
+        named = [c for c in element.children if c.is_named]
+        if not named or named[0].type == "variadic_unpacking":
+            return None
+        if len(named) == 2:
+            items.append((named[0], named[1]))
+        elif len(named) == 1:
+            items.append((None, named[0]))
+        else:
+            return None
+    return items
+
+
+def strings(node) -> tuple[str, ...] | None:
+    """A string, or a list literal of strings only. None when any part is not a literal."""
+    single = literal(node)
+    if single is not None:
+        return (single,)
+    items = array_items(node)
+    if items is None or any(key is not None for key, _ in items):
+        return None
+    values = tuple(literal(value) for _, value in items)
+    if any(v is None for v in values):
+        return None
+    return values  # type: ignore[return-value]
+
+
+def string_list(node) -> tuple[str, ...]:
     """`methods: 'GET'` and `methods: ['GET', 'POST']` are both written in this codebase."""
     if node is None:
         return ()
-    single = _string_value(node)
+    single = string_value(node)
     if single is not None:
         return (single,)
-    if not _is_array(node):
+    if not is_array(node):
         return ()
     out = []
     for element in node.children:
-        value = _string_value(element)
+        value = string_value(element)
         if value is None:
             for inner in element.children:
-                value = _string_value(inner)
+                value = string_value(inner)
                 if value is not None:
                     break
         if value is not None:

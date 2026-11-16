@@ -1,0 +1,10 @@
+{
+    "_readme": "Fixture lock: only laravel/framework and its version are read (docs-check laravel B.4).",
+    "packages": [
+        {
+            "name": "laravel/framework",
+            "version": "v13.42.0"
+        }
+    ],
+    "packages-dev": []
+}

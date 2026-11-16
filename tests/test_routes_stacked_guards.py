@@ -14,15 +14,28 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from graphify_php import resolver  # noqa: E402
+from graphify_php.frameworks import symfony  # noqa: E402
+from graphify_php.frameworks.provider import ProviderResult  # noqa: E402
 from graphify_php.graph_adapter import (  # noqa: E402
     GUARD_NODE_KIND,
     GUARD_RELATION,
     ROUTE_NODE_KIND,
     ROUTE_RELATION,
 )
-from graphify_php.sources.route_source import TreeSitterRouteSource  # noqa: E402
+from graphify_php.sources.route_source import TreeSitterRouteSource as _Source  # noqa: E402
 from graphify_php.syntax import routes as routes_module  # noqa: E402
-from graphify_php.syntax.file_scan import scan_source  # noqa: E402
+
+# Attributes match by FQCN, so a fixture without its own `use` lines gets them on the
+# `<?php` line, which keeps every line number of the fixture.
+IMPORTS = (
+    "use Symfony\\Component\\Routing\\Attribute\\Route; "
+    "use Symfony\\Component\\Security\\Http\\Attribute\\IsGranted;"
+)
+
+
+def TreeSitterRouteSource():  # noqa: N802  the name the tests below were written against
+    return _Source(providers=(symfony.PROVIDER,))
+
 
 TEAM_CONTROLLER = r"""<?php
 namespace App\Controller\Front\TimeTracking;
@@ -54,8 +67,10 @@ class TeamController extends AbstractController
 CLASS_FQN = "App\\Controller\\Front\\TimeTracking\\TeamController"
 
 
-def facts(php: str, path: str = "Controller.php"):
-    return scan_source(path, php.encode("utf-8"))
+def facts(php: str, path: str = "Controller.php") -> ProviderResult:
+    if "use Symfony" not in php:
+        php = php.replace("<?php", "<?php " + IMPORTS, 1)
+    return symfony.scan(path, php.encode("utf-8"))
 
 
 def test_stacked_route_groups_each_become_a_route():

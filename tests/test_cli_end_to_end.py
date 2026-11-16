@@ -28,6 +28,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 FIXTURE = {
+    # The route pass runs only for a framework the root manifest requires directly.
+    "composer.json": """
+        {"require": {"symfony/framework-bundle": "^7.0"}}
+    """,
     "src/Emails.php": """
         <?php
         namespace App\\Service;
@@ -268,6 +272,20 @@ def test_the_route_node_is_edged_to_the_controller_method(builds):
     # The path is served by the controller method, which is the connection that makes a route
     # answerable by traversal rather than by grep.
     assert label[edges[0]["target"]] == ".run()"
+
+
+def test_handler_kind_is_method_iff_the_route_has_a_handled_by_edge(builds):
+    """The schema-2 invariant, over the graph.json graphify wrote."""
+    from graphify_php.graph_adapter import ROUTE_RELATION
+
+    (_, _), (registered, _) = builds
+    handled = {e["source"] for e in registered["links"] if e["relation"] == ROUTE_RELATION}
+    routes = [n for n in registered["nodes"] if n.get("_kind") == "http_route"]
+    assert routes
+    for route in routes:
+        assert route["handler_kind"] in ("method", "closure", "unresolved")
+        assert (route["handler_kind"] == "method") == (route["id"] in handled)
+    assert [r["handler_kind"] for r in routes] == ["method"]
 
 
 def test_the_route_pass_reports_its_own_status_record(builds):

@@ -481,6 +481,9 @@ PINNED_SHAPE = {
     # 0.9.105 left _resolve_php_member_calls, _park_unresolved_member_call and
     # resolver_registry.py byte-identical; its extract.py changes are C#, C++ and markdown.
     "0.9.105": {"core_entries": 1, "suffixes": frozenset({".php"})},
+    # 0.9.111 against 0.9.105: the same two functions and resolver_registry.py are
+    # byte-identical, and no changed line of extract.py mentions PHP.
+    "0.9.111": {"core_entries": 1, "suffixes": frozenset({".php"})},
 }
 
 

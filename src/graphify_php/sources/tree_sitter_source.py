@@ -394,7 +394,7 @@ class TreeSitterSource:
             # turns one honest edge into one per subclass, all but one of them wrong.
             return (klass.fqn, Confidence.INFERRED, "static-binding"), ""
 
-        resolver = NameResolver(namespace=facts.namespace, imports=facts.imports)
+        resolver = klass.names or NameResolver(namespace=facts.namespace, imports=facts.imports)
         target = resolver.resolve(written)
         if not target:
             return None, Reason.UNRESOLVABLE_SCOPE

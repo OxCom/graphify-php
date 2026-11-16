@@ -940,42 +940,63 @@ REASON_GUARD_NO_HOLDER = "guard_holder_not_in_graph"
 REASON_CHECK_NO_HANDLER = "check_handler_not_in_graph"
 
 
-def _publish_access_control(record, repo_root: str, route_nodes: dict, sink) -> set:
-    """Edge each route node to the `access_control` rule proved to apply to all its URLs.
+REASON_ROUTE_GUARD_NO_ROUTE = "route_guard_route_not_published"
 
-    Returns the route node ids that received such an edge. A repository with no
-    `config/packages/security.yaml` gets no edges and no reasons.
+# `syntax.routes.GUARD_KIND_*`, restated: this module imports nothing from `syntax/`.
+GUARD_KIND_AUTHORIZATION = "authorization"
+GUARD_KIND_UNKNOWN = "unknown"
+# An `authorization` route guard whose `RouteGuard.decides` is False. Never published.
+GUARD_KIND_NOT_DECIDING = "authorization-not-deciding"
+
+# A route node's `authorization_state` (`graph_adapter.ROUTE_AUTHORIZATION_*`), and the reason
+# this pass adds to the providers' `access-control-*` ones.
+ROUTE_AUTHORIZATION_COVERED = "covered"
+ROUTE_AUTHORIZATION_NOT_PROVEN = "not_proven"
+ROUTE_AUTHORIZATION_UNDECIDED = "undecided"
+AUTHORIZATION_GUARD_KIND_UNKNOWN = "guard-kind-unknown"
+
+
+def _publish_route_guards(
+    record, route_guards, route_keys: dict, sink, published: dict | None = None
+) -> set:
+    """Edge each route node to the route-scoped guards its provider proved for it.
+
+    Returns the route node ids that received an `authorization` guard edge: only those make
+    their handlers guarded. Symfony's `access_control` guards arrive here. `published`, when
+    given, collects route node id -> {guard node id: guard_kind}.
     """
-    from .syntax import access_control
-
-    add = getattr(sink, "add_access_control", None)
-    if not callable(add):
-        return set()
-    rules, why = access_control.load_rules(repo_root)
-    if why:
-        record.unresolvable(why)
-    if rules is None:
-        return set()
-    blocker = access_control.config_blocker(repo_root)
-    if blocker:
-        # The rules or the route paths read here may not be the ones served: no edge at all,
-        # one count per route, as for an undecided route.
-        record.unresolvable(blocker, len(route_nodes))
-        return set()
+    add = getattr(sink, "add_route_guard", None)
     controlled: set = set()
-    for route_nid, declaration in route_nodes.items():
-        if declaration.path is None:
-            record.unresolvable(access_control.REASON_NO_PATH)
+    if not callable(add):
+        return controlled
+    for guard in route_guards:
+        route_nid = route_keys.get(guard.route_key)
+        if route_nid is None:
+            record.unresolvable(REASON_ROUTE_GUARD_NO_ROUTE)
             continue
-        rule, reason = access_control.first_rule(declaration.path, rules)
-        if rule is None:
-            record.unresolvable(reason)
-            if reason == access_control.REASON_UNDECIDED:
-                record.routes_access_control_undecided += 1
+        guard_nid = add(guard, route_nid)
+        if guard_nid is None:
             continue
-        if add(rule, route_nid, access_control.SECURITY_YAML) is not None:
+        kind = guard.guard_kind
+        if kind == GUARD_KIND_AUTHORIZATION and not getattr(guard, "decides", True):
+            # The edge keeps its `guard_kind`; only this pass's decision ignores it.
+            kind = GUARD_KIND_NOT_DECIDING
+        if published is not None:
+            published.setdefault(route_nid, {}).setdefault(guard_nid, kind)
+        if kind == GUARD_KIND_AUTHORIZATION:
             controlled.add(route_nid)
     return controlled
+
+
+def _authorization_state(guard_kinds: dict, undecided_why: str) -> tuple[str, str]:
+    """`(authorization_state, authorization_reason)` of one route from its effective guards."""
+    if GUARD_KIND_AUTHORIZATION in guard_kinds.values():
+        return ROUTE_AUTHORIZATION_COVERED, ""
+    if undecided_why:
+        return ROUTE_AUTHORIZATION_UNDECIDED, undecided_why
+    if GUARD_KIND_UNKNOWN in guard_kinds.values():
+        return ROUTE_AUTHORIZATION_UNDECIDED, AUTHORIZATION_GUARD_KIND_UNKNOWN
+    return ROUTE_AUTHORIZATION_NOT_PROVEN, ""
 
 
 def run_routes(
@@ -987,7 +1008,7 @@ def run_routes(
     repo_root: str = ".",
     index: NodeIndex | None = None,
     sink=None,
-) -> status.ResolverStatus:
+) -> status.RouteStatus:
     """Publish route declarations as nodes, each edged to the controller method that serves it.
 
     A pass of its own rather than a stage of the member-call one, and with its own record, for
@@ -996,7 +1017,7 @@ def run_routes(
     while before anything connected them to the graph, and every test stayed green throughout,
     because the tests checked extraction and nothing checked publication.
     """
-    record = status.ResolverStatus(name=RESOLVER_NAME_ROUTES)
+    record = status.RouteStatus(name=RESOLVER_NAME_ROUTES)
     try:
         if callable(sources):
             # Same contract as `run`: a factory, called inside the try so that it reports.
@@ -1005,7 +1026,7 @@ def run_routes(
             from .graph_adapter import GraphNodeIndex, GraphRouteSink
 
             index = index or GraphNodeIndex(all_nodes, all_edges)
-            sink = sink or GraphRouteSink(all_nodes, all_edges)
+            sink = sink or GraphRouteSink(all_nodes, all_edges, repo_root)
 
         unavailable: list[str] = []
         usable: list[object] = []
@@ -1029,14 +1050,40 @@ def run_routes(
         declarations = []
         guards = []
         checks = []
+        route_guards = []
+        route_undecided: dict[str, str] = {}
+        profile_reasons: list[str] = []
         for source in usable:
             resolution = source.declarations(repo_root, corpus)
+            profile_reason = getattr(resolution, "profile_reason", "")
+            if profile_reason:
+                # No framework selected: the source read nothing, so it reports nothing.
+                profile_reasons.append(profile_reason)
+                continue
             record.files_seen = max(record.files_seen, resolution.files_seen)
             for reason, count in (resolution.unresolved or {}).items():
                 record.unresolvable(f"{source.name}:{reason}", count)
+            for reason, count in (getattr(resolution, "pass_reasons", None) or {}).items():
+                record.unresolvable(reason, count)
             declarations.extend(resolution.declarations)
             guards.extend(getattr(resolution, "guards", None) or [])
             checks.extend(getattr(resolution, "access_checks", None) or [])
+            route_guards.extend(getattr(resolution, "route_guards", None) or [])
+            record.routes_access_control_undecided += getattr(resolution, "undecided", 0)
+            for key, why in (getattr(resolution, "route_undecided", None) or {}).items():
+                route_undecided.setdefault(key, why)
+            for name in getattr(resolution, "providers", ()):
+                if name not in record.providers:
+                    record.providers.append(name)
+            record.attributes_total += getattr(resolution, "attributes_total", 0)
+            record.attributes_mapped += getattr(resolution, "attributes_mapped", 0)
+            record.attributes_short_name_only += getattr(
+                resolution, "attributes_short_name_only", 0
+            )
+        if profile_reasons and len(profile_reasons) == len(usable):
+            record.state = "skipped"
+            record.reason = "; ".join(dict.fromkeys(profile_reasons))
+            return record
 
         record.eligible_sites = len(declarations)
         # The declaration names the file it was read from, and the controller class is declared
@@ -1051,13 +1098,29 @@ def run_routes(
                 nid = index.method_node(class_fqn, method)
             return nid if isinstance(nid, str) else None
 
-        # Route node id -> the first declaration with that node; handler node id -> its class
-        # and route node ids. Both feed the coverage counters and the access_control pass.
-        route_nodes: dict[str, object] = {}
+        # Route node key -> its node id, for the route-scoped guards; handler node id -> its
+        # class and route node ids, for the coverage counters.
+        route_keys: dict[str, str] = {}
         handlers: dict[str, tuple[str, set]] = {}
+        # Route node id -> (handler file, class, method) of its first declaration, and the
+        # route's node key, for `effective_guards`.
+        route_handlers: dict[str, tuple[str, str, str] | None] = {}
+        route_node_keys: dict[str, str] = {}
         for declaration in declarations:
+            handler_file = getattr(declaration, "handler_file", "") or declaration.source_file
+            if getattr(declaration, "has_no_handler", False):
+                # A closure, or a handler the provider declared unresolved: no edge, no
+                # missing-controller count, and only route-scoped guards decide its authorization.
+                route_nid = sink.add_route(declaration, None)
+                if route_nid is None:
+                    record.unresolvable(REASON_ROUTE_NO_PATH)
+                    continue
+                route_keys.setdefault(declaration.node_key, route_nid)
+                route_node_keys.setdefault(route_nid, declaration.node_key)
+                route_handlers.setdefault(route_nid, None)
+                continue
             controller_nid = method_nid(
-                declaration.source_file,
+                handler_file,
                 declaration.controller_class,
                 declaration.controller_method,
             )
@@ -1070,7 +1133,12 @@ def run_routes(
             if route_nid is None:
                 record.unresolvable(REASON_ROUTE_NO_PATH)
                 continue
-            route_nodes.setdefault(route_nid, declaration)
+            route_keys.setdefault(declaration.node_key, route_nid)
+            route_node_keys.setdefault(route_nid, declaration.node_key)
+            route_handlers.setdefault(
+                route_nid,
+                (handler_file, declaration.controller_class, declaration.controller_method),
+            )
             if controller_nid is not None:
                 handler = handlers.setdefault(controller_nid, (declaration.controller_class, set()))
                 handler[1].add(route_nid)
@@ -1081,6 +1149,8 @@ def run_routes(
         add_guard = getattr(sink, "add_guard", None)
         guarded_methods: set = set()
         guarded_classes: set = set()
+        # (file, class, method or None) -> {published guard node id: guard_kind}.
+        holder_guards: dict[tuple, dict] = {}
         for guard in guards:
             if guard.reason or not callable(add_guard):
                 continue
@@ -1096,7 +1166,14 @@ def run_routes(
                 # Unlike a route, no node goes in: a guard node with no edge says nothing.
                 record.unresolvable(REASON_GUARD_NO_HOLDER)
                 continue
-            if add_guard(guard, holder_nid) is None:
+            guard_nid = add_guard(guard, holder_nid)
+            if guard_nid is None:
+                continue
+            guard_kind = getattr(guard, "guard_kind", GUARD_KIND_AUTHORIZATION)
+            holder_key = (guard.source_file, guard.holder_class, guard.holder_method)
+            holder_guards.setdefault(holder_key, {}).setdefault(guard_nid, guard_kind)
+            if guard_kind != GUARD_KIND_AUTHORIZATION:
+                # An authentication or middleware guard is published but proves no authorization.
                 continue
             if guard.holder_method is not None:
                 guarded_methods.add(holder_nid)
@@ -1120,7 +1197,28 @@ def run_routes(
                 # Same rule as the edge's `check_kind`.
                 (framework_checked if check.is_grant_call else pattern_checked).add(handler_nid)
 
-        controlled = _publish_access_control(record, repo_root, route_nodes, sink)
+        scoped_guards: dict[str, dict] = {}
+        controlled = _publish_route_guards(record, route_guards, route_keys, sink, scoped_guards)
+
+        # `effective_guards`: route-scoped guards, plus those on the handler method and on its
+        # class. `checks_access` is not a guard: a call proves the handler asks, not that it
+        # enforces.
+        set_authorization = getattr(sink, "set_route_authorization", None)
+        for route_nid, handler in route_handlers.items():
+            kinds = dict(scoped_guards.get(route_nid, {}))
+            # None: a closure route, with no method or class to hold a guard.
+            holders = () if handler is None else (handler, (*handler[:2], None))
+            for holder in holders:
+                for guard_nid, kind in holder_guards.get(holder, {}).items():
+                    kinds.setdefault(guard_nid, kind)
+            state, why = _authorization_state(
+                kinds, route_undecided.get(route_node_keys[route_nid], "")
+            )
+            record.authorization_state[state] = record.authorization_state.get(state, 0) + 1
+            if why:
+                record.authorization_reason[why] = record.authorization_reason.get(why, 0) + 1
+            if callable(set_authorization):
+                set_authorization(route_nid, sorted(kinds), state, why)
 
         record.handlers_total = len(handlers)
         # A pattern match names a project method whose decision is unknown, so it covers

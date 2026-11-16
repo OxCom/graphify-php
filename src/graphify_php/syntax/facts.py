@@ -16,8 +16,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..ports import Confidence
+from .attributes import AttributeFact
 from .call_sites import CallSiteIndex
-from .routes import AccessCheck, AccessGuard, RouteDeclaration
+from .names import NameResolver
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,9 @@ class ClassScope:
     properties: dict[str, TypeFact] = field(default_factory=dict)
     refusals: dict[str, str] = field(default_factory=dict)
     methods: list[MethodScope] = field(default_factory=list)
+    # The `NameResolver` of the namespace block this class is declared in, or None when the
+    # scope was built by hand. A file may hold several blocks, each with its own imports.
+    names: NameResolver | None = field(default=None, compare=False, repr=False)
 
     def record_property(self, name: str, fact: TypeFact) -> None:
         if name in self.refusals:
@@ -155,13 +159,10 @@ class FileFacts:
     classes: list[ClassScope] = field(default_factory=list)
     # The receivers graphify does not send: see `call_sites` for why they are read here.
     calls: CallSiteIndex = field(default_factory=CallSiteIndex)
-    # Route attributes declared in this file. Not a type fact, carried here because the file
-    # is what owns them and one parse should answer every question about it.
-    routes: list[RouteDeclaration] = field(default_factory=list)
-    # `#[IsGranted]` declarations on classes and methods in this file, for the same reason.
-    guards: list[AccessGuard] = field(default_factory=list)
-    # Access-check calls written directly in route handler bodies in this file.
-    access_checks: list[AccessCheck] = field(default_factory=list)
+    # Every attribute in this file, its name resolved. Not a type fact, carried here because the
+    # file is what owns them and one parse should answer every question about it. What one
+    # means is a framework provider's business (`frameworks/`).
+    attributes: list[AttributeFact] = field(default_factory=list)
     # Line spans of every `new class { ... }`. The walker reads nothing inside one, so a site
     # there has no facts of its own and must not be answered with the enclosing class's.
     anonymous_classes: list[tuple[int, int]] = field(default_factory=list)

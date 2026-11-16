@@ -900,9 +900,40 @@ GUARD_RELATION = "guarded_by"
 GUARD_NODE_KIND = "access_guard"
 # A route handler's direct `$this->isGranted(...)`-style call -> the access guard it names.
 CHECK_RELATION = "checks_access"
-# `guard_attribute` values on guard edges and nodes, beside a check's own method name.
+# `guard_attribute` values on guard edges and nodes, beside a check's own method name. The
+# records carry their own; these name Symfony's for readers of the graph.
 GUARD_ATTRIBUTE_ISGRANTED = "IsGranted"
 GUARD_ATTRIBUTE_ACCESS_CONTROL = "access_control"
+# `route_schema` on every route node this version writes.
+ROUTE_SCHEMA = 2
+# `authorization_state` values of a route node.
+ROUTE_AUTHORIZATION_COVERED = "covered"
+ROUTE_AUTHORIZATION_NOT_PROVEN = "not_proven"
+ROUTE_AUTHORIZATION_UNDECIDED = "undecided"
+# `handler_kind` values of a route node, agreed with the graphify-mesh consumer. "method" iff
+# the node has a `handled_by` edge; "closure" has no handler node by design; "unresolved" names
+# a handler whose node is not in the graph.
+ROUTE_HANDLER_METHOD = "method"
+ROUTE_HANDLER_CLOSURE = "closure"
+ROUTE_HANDLER_UNRESOLVED = "unresolved"
+
+
+def repo_relative(path: str, repo_root: str) -> str:
+    """`path` relative to `repo_root`, or "" when it lies outside it.
+
+    graphify rewrites `source_file` to repo-relative only after the resolvers run, so a field
+    copied from it here would keep the absolute host path. Outside the root, nothing is better
+    than a path that names the machine.
+    """
+    if not path:
+        return ""
+    if not os.path.isabs(path):
+        return os.path.normpath(path)
+    root = os.path.realpath(repo_root or ".")
+    full = os.path.realpath(path)
+    if os.path.commonpath([root, full]) != root:
+        return ""
+    return os.path.relpath(full, root)
 
 
 def _route_nid(node_key: str) -> str:
@@ -937,9 +968,10 @@ class GraphRouteSink:
     `checks_access` edge to the same guard node.
     """
 
-    def __init__(self, all_nodes: list[dict], all_edges: list[dict]) -> None:
+    def __init__(self, all_nodes: list[dict], all_edges: list[dict], repo_root: str = ".") -> None:
         self._all_nodes = all_nodes
         self._all_edges = all_edges
+        self._repo_root = repo_root
         self._by_id = {n.get("id") for n in all_nodes}
         self._pairs = {(e.get("source"), e.get("target"), e.get("relation")) for e in all_edges}
         self.nodes_added = 0
@@ -948,6 +980,24 @@ class GraphRouteSink:
         self.guard_edges_added = 0
         self.checks_access_edges_added = 0
         self.access_control_edges_added = 0
+        # Every route-scoped `guarded_by` edge, `access_control` ones included.
+        self.route_guard_edges_added = 0
+        # Route nodes this sink added, by id, for `set_route_authorization`.
+        self._route_nodes: dict[str, dict] = {}
+
+    def set_route_authorization(
+        self, nid: str, effective_guards: list[str], state: str, reason: str
+    ) -> None:
+        """Write a route node's `effective_guards` and authorization state, computed by the pass.
+
+        A route node this sink did not add is left alone.
+        """
+        node = self._route_nodes.get(nid)
+        if node is None:
+            return
+        node["effective_guards"] = sorted(effective_guards)
+        node["authorization_state"] = state
+        node["authorization_reason"] = reason
 
     def add_route(self, declaration, controller_nid: str | None) -> str | None:
         """Emit the declaration's node, and its edge when the controller method is in the graph.
@@ -979,10 +1029,33 @@ class GraphRouteSink:
                     # The full composed path, "" when it could not be composed; `label` falls
                     # back to the method-level half and cannot tell the two apart.
                     "route_path": declaration.path or "",
+                    "provider": declaration.provider,
+                    # `{name}` / `{name?}` placeholders as the provider normalized them, "" when
+                    # it could not (the reason is counted in the status record).
+                    "route_template": getattr(declaration, "template", None) or "",
+                    # Why the template is "" or only partly trusted; "" when nothing to say.
+                    "route_template_reason": getattr(declaration, "template_reason", "") or "",
+                    "declared_in": repo_relative(declaration.source_file, self._repo_root),
+                    # Filled by `set_route_authorization` once every guard is published.
+                    "effective_guards": [],
+                    "authorization_state": ROUTE_AUTHORIZATION_NOT_PROVEN,
+                    "authorization_reason": "",
+                    "route_schema": ROUTE_SCHEMA,
+                    "handler_kind": (
+                        ROUTE_HANDLER_CLOSURE
+                        if getattr(declaration, "is_closure", False)
+                        else ROUTE_HANDLER_UNRESOLVED
+                    ),
                 }
             )
+            self._route_nodes[nid] = self._all_nodes[-1]
             self.nodes_added += 1
 
+        node = self._route_nodes.get(nid)
+        if controller_nid and node is not None:
+            # The edge below exists after this call, added now or already present. A node shared
+            # by several declarations is "method" when any of them names a handler in the graph.
+            node["handler_kind"] = ROUTE_HANDLER_METHOD
         if controller_nid and self._claim(nid, controller_nid, ROUTE_RELATION):
             self._all_edges.append(
                 {
@@ -996,7 +1069,8 @@ class GraphRouteSink:
                     "source_location": f"L{declaration.line}",
                     "weight": 1.0,
                     EDGE_MARKER: EDGE_ORIGIN,
-                    "_via": "attribute",
+                    "_via": declaration.via,
+                    "provider": declaration.provider,
                 }
             )
             self.edges_added += 1
@@ -1018,9 +1092,12 @@ class GraphRouteSink:
             label=guard.label,
             source_file=guard.source_file,
             source_location=f"L{guard.line}",
-            guard_attribute=GUARD_ATTRIBUTE_ISGRANTED,
+            guard_attribute=guard.guard_attribute,
             guard_literal=guard.literal,
             guard_subject=guard.subject,
+            provider=guard.provider,
+            guard_kind=guard.guard_kind,
+            guard_key=guard.node_key,
         )
         if self._claim(holder_nid, nid, GUARD_RELATION):
             self._all_edges.append(
@@ -1035,9 +1112,11 @@ class GraphRouteSink:
                     "source_location": f"L{guard.line}",
                     "weight": 1.0,
                     EDGE_MARKER: EDGE_ORIGIN,
-                    "_via": "attribute",
+                    "_via": guard.via,
                     "guard_scope": "method" if guard.holder_method is not None else "class",
-                    "guard_attribute": GUARD_ATTRIBUTE_ISGRANTED,
+                    "guard_attribute": guard.guard_attribute,
+                    "provider": guard.provider,
+                    "guard_kind": guard.guard_kind,
                 }
             )
             self.guard_edges_added += 1
@@ -1062,6 +1141,9 @@ class GraphRouteSink:
             guard_attribute=check.check_call if check.is_grant_call else "method",
             guard_literal=check.literal,
             guard_subject=check.subject if check.is_grant_call else "",
+            provider=check.provider,
+            guard_kind=check.guard_kind,
+            guard_key=check.node_key,
         )
         if self._claim(handler_nid, nid, CHECK_RELATION):
             self._all_edges.append(
@@ -1076,36 +1158,41 @@ class GraphRouteSink:
                     "source_location": f"L{check.line}",
                     "weight": 1.0,
                     EDGE_MARKER: EDGE_ORIGIN,
-                    "_via": "call",
+                    "_via": check.via,
                     "check_call": check.check_call,
                     "guard_attribute": check.check_call,
                     "conditional": check.conditional,
                     # Only a framework call reaches a voter; a pattern match is a method name.
                     "check_kind": "framework" if check.is_grant_call else "pattern",
+                    "provider": check.provider,
+                    "guard_kind": check.guard_kind,
                 }
             )
             self.checks_access_edges_added += 1
         return nid
 
-    def add_access_control(self, rule, route_nid: str, source_file: str) -> str | None:
-        """Emit the `access_control` rule's node and `guarded_by` from the route it applies to.
+    def add_route_guard(self, guard, route_nid: str) -> str | None:
+        """Emit a route-scoped guard's node and `guarded_by` from the route it applies to.
 
-        The caller has proved that the rule is the first one Symfony applies to every URL of
-        the route; this method does not check it.
+        The provider has proved that the guard applies to every URL of the route (for Symfony's
+        `access_control`, that the rule is the first one applied); this method does not check
+        it. `guard` is a `frameworks.provider.RouteGuard`.
         """
         if not route_nid:
             return None
-        nid = _guard_nid(rule.node_key)
+        nid = _guard_nid(guard.node_key)
         self._guard_node(
             nid,
-            label=rule.label,
-            source_file=source_file,
-            source_location="",
-            guard_attribute=GUARD_ATTRIBUTE_ACCESS_CONTROL,
-            guard_literal=True,
-            guard_subject="",
-            access_control_path=rule.path if isinstance(rule.path, str) else "",
-            access_control_index=rule.index,
+            label=guard.label,
+            source_file=guard.source_file,
+            source_location=f"L{guard.line}" if guard.line else "",
+            guard_attribute=guard.guard_attribute,
+            guard_literal=guard.literal,
+            guard_subject=guard.subject,
+            **dict(guard.extra_node_fields),
+            provider=guard.provider,
+            guard_kind=guard.guard_kind,
+            guard_key=guard.node_key,
         )
         if self._claim(route_nid, nid, GUARD_RELATION):
             self._all_edges.append(
@@ -1116,16 +1203,20 @@ class GraphRouteSink:
                     "context": "guard",
                     "confidence": Confidence.EXTRACTED.value,
                     "confidence_score": 1.0,
-                    "source_file": source_file,
-                    "source_location": "",
+                    "source_file": guard.source_file,
+                    "source_location": f"L{guard.line}" if guard.line else "",
                     "weight": 1.0,
                     EDGE_MARKER: EDGE_ORIGIN,
-                    "_via": "access_control",
+                    "_via": guard.via,
                     "guard_scope": "route",
-                    "guard_attribute": GUARD_ATTRIBUTE_ACCESS_CONTROL,
+                    "guard_attribute": guard.guard_attribute,
+                    "provider": guard.provider,
+                    "guard_kind": guard.guard_kind,
                 }
             )
-            self.access_control_edges_added += 1
+            self.route_guard_edges_added += 1
+            if guard.via == GUARD_ATTRIBUTE_ACCESS_CONTROL:
+                self.access_control_edges_added += 1
         return nid
 
     def _guard_node(

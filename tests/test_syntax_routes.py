@@ -21,18 +21,18 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from graphify_php.frameworks import symfony  # noqa: E402
 from graphify_php.sources.route_source import (  # noqa: E402
     RouteDeclarationSource,
     TreeSitterRouteSource,
 )
 from graphify_php.syntax import routes as routes_module  # noqa: E402
-from graphify_php.syntax.file_scan import scan_source  # noqa: E402
 
-SOURCE = TreeSitterRouteSource()
+SOURCE = TreeSitterRouteSource(providers=(symfony.PROVIDER,))
 
 
 def scan(php: str, path: str = "Controller.php"):
-    return scan_source(path, php.encode("utf-8")).routes
+    return symfony.scan(path, php.encode("utf-8")).routes
 
 
 def one(php: str):
@@ -48,7 +48,7 @@ def one(php: str):
 
 def test_positional_path():
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     #[Route('/api/v1/storage/upload/small/{id}', name: 'api-storage-upload-small', methods: ['POST'])]
     public function upload() {}
@@ -64,7 +64,7 @@ class C {
 
 def test_named_path_argument():
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     #[Route(path: '/health', name: 'health')]
     public function health() {}
@@ -87,7 +87,7 @@ def test_methods_forms(written, expected):
     extra = ", " + written if written else ""
     route = one(
         f"""<?php
-namespace App\\Controller;
+namespace App\\Controller; use Symfony\\Component\\Routing\\Attribute\\Route;
 class C {{
     #[Route('/x', name: 'x'{extra})]
     public function x() {{}}
@@ -99,7 +99,7 @@ class C {{
 
 def test_double_quoted_strings_read_the_same():
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     #[Route("/x/{id}", name: "x", methods: ["GET"])]
     public function x() {}
@@ -111,7 +111,7 @@ class C {
 def test_route_attribute_is_found_among_other_attributes():
     """Real controllers carry OpenAPI and security attributes around the route."""
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     #[OA\Get(path: '/decoy', summary: 'not a route')]
     #[IsGranted('ROLE_USER')]
@@ -125,7 +125,7 @@ class C {
 
 def test_fully_qualified_attribute_name_is_matched():
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     #[\Symfony\Component\Routing\Attribute\Route('/q', name: 'q')]
     public function q() {}
@@ -139,7 +139,7 @@ class C {
 
 def test_class_prefix_composes_with_the_method_path():
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 #[Route('/api/v1/storage', name: 'api-storage-')]
 class C {
     #[Route('/upload/{id}', name: 'upload', methods: ['POST'])]
@@ -155,7 +155,7 @@ class C {
 def test_methods_are_a_union_of_class_and_method_levels():
     """Symfony does `array_unique(array_merge(...))`; the method level does not override."""
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 #[Route('/api', methods: ['GET'])]
 class C {
     #[Route('/x', name: 'x', methods: ['POST'])]
@@ -167,7 +167,7 @@ class C {
 
 def test_class_level_methods_apply_when_the_method_declares_none():
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 #[Route('/api', methods: ['GET'])]
 class C {
     #[Route('/x', name: 'x')]
@@ -180,7 +180,7 @@ class C {
 def test_invokable_class_takes_its_route_from_the_class_attribute():
     """`resetGlobals()` in the loader: the class attribute is the route, not a prefix."""
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 #[Route('/webhook/stripe', name: 'webhook-stripe', methods: ['POST'])]
 class StripeWebhook {
     public function __invoke() {}
@@ -195,7 +195,7 @@ class StripeWebhook {
 def test_invokable_class_with_a_method_route_does_not_double_count():
     """The class attribute is a prefix once any method declares a route."""
     found = scan(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 #[Route('/hooks', name: 'hooks-')]
 class H {
     #[Route('/stripe', name: 'stripe')]
@@ -209,7 +209,7 @@ def test_abstract_class_declares_nothing():
     """Symfony's loader refuses to read attributes from an abstract class."""
     assert (
         scan(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 #[Route('/base', name: 'base-')]
 abstract class BaseController {
     #[Route('/x', name: 'x')]
@@ -226,7 +226,7 @@ abstract class BaseController {
 def test_two_classes_declaring_the_same_path_are_two_declarations():
     """A route is owned by where it is declared, so `/health` twice is two nodes."""
     found = scan(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class Alpha {
     #[Route('/health', name: 'alpha-health')]
     public function health() {}
@@ -246,7 +246,7 @@ class Beta {
 
 def test_node_key_separates_two_paths_on_one_controller():
     found = scan(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     #[Route('/a', name: 'a')]
     public function a() {}
@@ -263,7 +263,7 @@ class C {
 def test_non_literal_path_emits_the_parts_and_refuses_the_effective_route():
     """A concatenation is not evaluated. Reading it as the literal half invents a path."""
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     #[Route(self::PREFIX . '/x', name: 'x')]
     public function x() {}
@@ -278,7 +278,7 @@ class C {
 
 def test_non_literal_class_prefix_refuses_the_effective_route_but_keeps_the_method_path():
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 #[Route(self::BASE)]
 class C {
     #[Route('/x', name: 'x')]
@@ -292,7 +292,7 @@ class C {
 
 def test_a_route_with_no_path_argument_is_refused():
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     #[Route(name: 'named-only')]
     public function x() {}
@@ -306,7 +306,7 @@ class C {
 def test_a_class_without_route_attributes_declares_nothing():
     assert (
         scan(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     public function notARoute() {}
 }
@@ -330,7 +330,7 @@ def test_available_needs_nothing(tmp_path):
 def test_source_collects_across_files_and_counts_refusals(tmp_path):
     (tmp_path / "A.php").write_text(
         """<?php
-namespace App;
+namespace App; use Symfony\\Component\\Routing\\Attribute\\Route;
 class A {
     #[Route('/a', name: 'a', methods: ['GET'])]
     public function a() {}
@@ -340,7 +340,7 @@ class A {
     )
     (tmp_path / "B.php").write_text(
         """<?php
-namespace App;
+namespace App; use Symfony\\Component\\Routing\\Attribute\\Route;
 class B {
     #[Route(self::P . '/b', name: 'b')]
     public function b() {}
@@ -365,7 +365,7 @@ def test_source_counts_a_file_it_cannot_read(tmp_path):
 def test_source_reads_each_file_once(tmp_path):
     (tmp_path / "A.php").write_text(
         """<?php
-namespace App;
+namespace App; use Symfony\\Component\\Routing\\Attribute\\Route;
 class A {
     #[Route('/a', name: 'a')]
     public function a() {}
@@ -381,7 +381,7 @@ class A {
 def test_only_the_named_fields_are_stored(tmp_path):
     """Nothing from the attribute beyond path, name and methods reaches the declaration."""
     route = one(r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {
     #[Route('/x', name: 'x', methods: ['GET'], requirements: ['id' => 'SECRETPATTERN'],
             defaults: ['token' => 'SECRETDEFAULT'], condition: "request.headers.get('X') == 'SECRETCOND'")]
@@ -406,7 +406,7 @@ def test_route_output_leaks_no_planted_secret(tmp_path):
 
     canary = canaries.canary_values()[0]
     php = f"""<?php
-namespace App\\Controller;
+namespace App\\Controller; use Symfony\\Component\\Routing\\Attribute\\Route;
 class C {{
     #[Route('/x', name: 'x', defaults: ['token' => '{canary}'], condition: "{canary}")]
     public function x() {{}}
@@ -445,7 +445,7 @@ def test_a_string_whose_value_is_not_its_source_text_is_refused_not_truncated(wr
     """The first `string_content` of `'/it\\'s/{id}'` is `/it`, a path nothing serves."""
     route = one(
         rf"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route;
 class C {{
     #[Route({written}, name: 'x')]
     public function x() {{}}

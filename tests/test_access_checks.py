@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from graphify_php import resolver  # noqa: E402
+from graphify_php.frameworks import symfony  # noqa: E402
 from graphify_php.graph_adapter import (  # noqa: E402
     CHECK_RELATION,
     GUARD_NODE_KIND,
@@ -23,10 +24,9 @@ from graphify_php.graph_adapter import (  # noqa: E402
 from graphify_php.sources.route_source import TreeSitterRouteSource  # noqa: E402
 from graphify_php.syntax import access_control as ac  # noqa: E402
 from graphify_php.syntax import routes as routes_module  # noqa: E402
-from graphify_php.syntax.file_scan import scan_source  # noqa: E402
 
 CONTROLLERS = r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route; use Symfony\Component\Security\Http\Attribute\IsGranted;
 class HrController
 {
     #[Route('/hr')]
@@ -66,7 +66,7 @@ class PartialController
     #[Route('/x')]
     public function x() {}
 }
-"""
+"""  # noqa: E501
 
 SECURITY_YAML = """\
 security:
@@ -86,7 +86,10 @@ HR = "App\\Controller\\HrController"
 
 
 def checks(php: str = CONTROLLERS):
-    return scan_source("Controllers.php", php.encode("utf-8")).access_checks
+    if "use Symfony" not in php:
+        # Attributes match by FQCN; on the `<?php` line so no line number moves.
+        php = php.replace("<?php", "<?php use Symfony\\Component\\Routing\\Attribute\\Route;", 1)
+    return symfony.scan("Controllers.php", php.encode("utf-8")).checks
 
 
 def test_direct_this_calls_in_handler_only():
@@ -134,7 +137,9 @@ def test_invalid_pattern_falls_back_to_defaults_and_is_counted(monkeypatch, tmp_
     php.write_text(CONTROLLERS, encoding="utf-8")
 
     names = [c.check_call for c in checks()]
-    resolution = TreeSitterRouteSource().declarations(str(tmp_path), ["Controllers.php"])
+    resolution = TreeSitterRouteSource(providers=(symfony.PROVIDER,)).declarations(
+        str(tmp_path), ["Controllers.php"]
+    )
 
     assert "canView" in names
     assert resolution.unresolved[routes_module.ACCESS_CHECK_PATTERNS_INVALID] == 1
@@ -293,7 +298,7 @@ def _run(
         [{"nodes": [{"source_file": path}]}],
         nodes,
         edges,
-        sources=[TreeSitterRouteSource()],
+        sources=[TreeSitterRouteSource(providers=(symfony.PROVIDER,))],
         repo_root=str(tmp_path),
     )
     return record, nodes, edges
@@ -392,7 +397,7 @@ def test_missing_security_yaml_adds_nothing_and_fails_nothing(tmp_path, monkeypa
 
 
 PATTERN_ONLY = r"""<?php
-namespace App\Controller;
+namespace App\Controller; use Symfony\Component\Routing\Attribute\Route; use Symfony\Component\Security\Http\Attribute\IsGranted;
 class OtherController
 {
     #[Route('/free')]
@@ -400,7 +405,7 @@ class OtherController
     #[Route('/open')]
     public function open() {}
 }
-"""
+"""  # noqa: E501
 
 
 def test_pattern_only_check_leaves_handler_unguarded(tmp_path, monkeypatch):

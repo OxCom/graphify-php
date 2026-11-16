@@ -27,3 +27,7 @@ graphify-out/
 .npmrc
 auth.json
 LICENSE
+
+# Tests are excluded from the graph: they added nodes and edges without
+# answering code questions (2026-11-16).
+/tests/

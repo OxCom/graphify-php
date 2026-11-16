@@ -32,9 +32,12 @@ resolver should treat `reason` the way it treats `Resolution.unresolved`: a coun
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
+from ..frameworks import REGISTRY
+from ..frameworks.detect import select_providers
+from ..frameworks.provider import ProviderContext, RouteGuard, file_reader
 from ..ports import RouteDeclarationSource  # noqa: F401  the port this module implements
 from ..syntax import nodes
 from ..syntax.facts import FileFacts
@@ -46,13 +49,27 @@ UNREADABLE_FILE = "unreadable-file"
 
 @dataclass
 class RouteResolution:
-    """What a source made of the files it was given."""
+    """What a source made of the files it was given.
+
+    `profile_reason` is set when no framework provider was selected; nothing else is then
+    read. `pass_reasons` are recorded on the status record unprefixed.
+    """
 
     declarations: list[RouteDeclaration] = field(default_factory=list)
     guards: list[AccessGuard] = field(default_factory=list)
     access_checks: list[AccessCheck] = field(default_factory=list)
+    route_guards: list[RouteGuard] = field(default_factory=list)
     unresolved: dict[str, int] = field(default_factory=dict)
+    pass_reasons: dict[str, int] = field(default_factory=dict)
     files_seen: int = 0
+    providers: tuple[str, ...] = ()
+    profile_reason: str = ""
+    undecided: int = 0
+    # Route `node_key` -> why its authorization state is undecided (`ProviderResult`).
+    route_undecided: dict[str, str] = field(default_factory=dict)
+    attributes_total: int = 0
+    attributes_mapped: int = 0
+    attributes_short_name_only: int = 0
 
     @property
     def resolved(self) -> list[RouteDeclaration]:
@@ -60,27 +77,44 @@ class RouteResolution:
 
 
 class TreeSitterRouteSource:
-    """Route declarations read from PHP attributes.
+    """Route declarations read by the framework providers a repository selects.
 
     A declaration proves that this codebase declares the path and names this controller method
     to serve it. It does not prove that any deployed ingress sends that path here, nor that a
     given environment loads the route — Symfony filters on `env`, and a reverse proxy or a
     different service may answer first. The graph gains "who in this code claims this path",
     which is the question that has no symbol in it and is therefore unanswerable today.
+
+    `providers` None selects them from the root `composer.json` (`frameworks.detect`); a
+    sequence is used as given.
     """
 
     name = "tree_sitter_routes"
+
+    def __init__(self, providers: Sequence | None = None) -> None:
+        self.providers = tuple(providers) if providers is not None else None
 
     def available(self, repo_root: str) -> tuple[bool, str]:
         return nodes.tree_sitter_available()
 
     def declarations(self, repo_root: str, files: Iterable[str]) -> RouteResolution:
         resolution = RouteResolution()
+        if self.providers is not None:
+            providers = self.providers
+        else:
+            providers, why = select_providers(repo_root, REGISTRY)
+            if not providers:
+                resolution.profile_reason = why
+                return resolution
+        resolution.providers = tuple(p.name for p in providers)
         _, patterns_refused = access_check_patterns()
         if patterns_refused:
             # Once per run, not per file: the override is one setting.
-            _count(resolution, patterns_refused)
+            _count(resolution.unresolved, patterns_refused)
         seen: set[str] = set()
+        corpus: list[str] = []
+        fulls: dict[str, str] = {}
+        cached: dict[str, FileFacts] = {}
         for path in files:
             full = path if os.path.isabs(path) else os.path.join(repo_root, path)
             full = os.path.realpath(full)
@@ -89,21 +123,41 @@ class TreeSitterRouteSource:
             seen.add(full)
             facts = self._facts(path, full)
             if facts is None:
-                _count(resolution, UNREADABLE_FILE)
+                _count(resolution.unresolved, UNREADABLE_FILE)
                 continue
             resolution.files_seen += 1
-            for declaration in facts.routes:
-                resolution.declarations.append(declaration)
-                if declaration.reason:
-                    _count(resolution, declaration.reason)
-            for guard in facts.guards:
-                resolution.guards.append(guard)
-                if guard.reason:
-                    _count(resolution, guard.reason)
-            for check in facts.access_checks:
-                resolution.access_checks.append(check)
-                if check.reason:
-                    _count(resolution, check.reason)
+            resolution.attributes_total += len(facts.attributes)
+            corpus.append(path)
+            fulls[path] = full
+            cached[path] = facts
+        outside = file_reader(repo_root)
+
+        def read(path: str) -> bytes | None:
+            full = fulls.get(path)
+            if full is None:
+                return outside(path)
+            try:
+                with open(full, "rb") as handle:
+                    return handle.read()
+            except OSError:
+                return None
+
+        ctx = ProviderContext(repo_root, tuple(corpus), read, cached)
+        for provider in providers:
+            result = provider.collect(ctx)
+            resolution.declarations.extend(result.routes)
+            resolution.guards.extend(result.guards)
+            resolution.access_checks.extend(result.checks)
+            resolution.route_guards.extend(result.route_guards)
+            for reason, count in result.reasons.items():
+                _count(resolution.unresolved, reason, count)
+            for reason, count in result.pass_reasons.items():
+                _count(resolution.pass_reasons, reason, count)
+            resolution.undecided += result.undecided
+            for key, why in result.route_undecided.items():
+                resolution.route_undecided.setdefault(key, why)
+            resolution.attributes_mapped += result.attributes_mapped
+            resolution.attributes_short_name_only += result.attributes_short_name_only
         return resolution
 
     def _facts(self, path: str, full: str) -> FileFacts | None:
@@ -115,5 +169,5 @@ class TreeSitterRouteSource:
         return scan_source(path, source)
 
 
-def _count(resolution: RouteResolution, reason: str) -> None:
-    resolution.unresolved[reason] = resolution.unresolved.get(reason, 0) + 1
+def _count(table: dict[str, int], reason: str, n: int = 1) -> None:
+    table[reason] = table.get(reason, 0) + n
