@@ -487,6 +487,10 @@ PINNED_SHAPE = {
     # 0.9.111 against 0.9.105: the same two functions and resolver_registry.py are
     # byte-identical, and no changed line of extract.py mentions PHP.
     "0.9.111": {"core_entries": 1, "suffixes": frozenset({".php"})},
+    # 0.9.112 against 0.9.111: _resolve_php_member_calls and resolver_registry.py are
+    # byte-identical. _park_unresolved_member_call adds an `arity` key, which only C# and
+    # Java raw calls carry, so a PHP raw call parks under the old key.
+    "0.9.112": {"core_entries": 1, "suffixes": frozenset({".php"})},
 }
 
 
